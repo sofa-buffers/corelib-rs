@@ -1,0 +1,23 @@
+name: Set up Rust
+description: Install a Rust toolchain (optionally with components / a target) and enable the cargo build cache.
+
+inputs:
+  toolchain:
+    description: Rust release channel or version.
+    default: stable
+  components:
+    description: Comma-separated rustup components (e.g. "rustfmt, clippy").
+    default: ""
+  targets:
+    description: Comma-separated extra compile targets.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+    - uses: Swatinem/rust-cache@v2

@@ -10,131 +10,69 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Formatting + clippy, denying all warnings.
   lint:
-    name: Format & clippy
+    name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust
         with:
           components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
 
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Clippy (all targets)
-        run: cargo clippy --all-targets -- -D warnings
-
+  # Build + full test suite on the two Rust release channels:
+  #   stable = what users build with today; beta = next release, for early warning.
   test:
-    name: Build & test
+    name: Test (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
     strategy:
-      # Two Rust release channels:
-      #   * stable — the current released compiler; what users actually build with.
-      #   * beta   — the next release (~6 weeks out). Testing it gives early warning
-      #              of a regression or a soon-to-stabilize change before it ships,
-      #              so breakage is caught here rather than by users after release.
-      # `fail-fast: false` keeps both legs running so we see every result, not just
-      # the first to fail.
       fail-fast: false
       matrix:
         toolchain: [stable, beta]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (${{ matrix.toolchain }})
-        uses: dtolnay/rust-toolchain@master
+      - uses: ./.github/actions/rust
         with:
           toolchain: ${{ matrix.toolchain }}
+      - run: cargo build --release --verbose
+      - run: cargo test --verbose
 
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build (debug)
-        run: cargo build --verbose
-
-      - name: Build (release)
-        run: cargo build --release --verbose
-
-      - name: Test (unit + integration + doctests, incl. shared vectors)
-        run: cargo test --verbose
-
-  big-endian:
-    name: Big-endian (s390x) tests
+  # Same suite on a big-endian host (IBM Z / s390x) under QEMU, proving the
+  # little-endian wire format round-trips correctly off little-endian hardware.
+  test-big-endian:
+    name: Test (big-endian, s390x)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/rust
+      - uses: taiki-e/install-action@cross
+      - run: cross test --target s390x-unknown-linux-gnu --verbose
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-
-      # `cross` runs the suite for a big-endian target (IBM Z / s390x) inside a
-      # QEMU-emulated container. The wire format is little-endian, so this proves
-      # the `to_le_bytes`/`from_le_bytes` byte handling is correct on a
-      # big-endian host (the shared vectors are LE hex and must still round-trip).
-      - name: Install cross
-        uses: taiki-e/install-action@cross
-
-      - name: Test on s390x (big-endian, under QEMU)
-        run: cross test --target s390x-unknown-linux-gnu --verbose
-
+  # Line coverage via llvm-cov; publishes the README's coverage badge from main.
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # to push the badge JSON to the `badges` branch
+      contents: write   # push the badge JSON to the `badges` branch
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust
         with:
           components: llvm-tools-preview
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Measure coverage
         run: |
-          # Run the instrumented suite once, emitting LCOV (for a Codecov upload
-          # if a token is added later); `report` then re-reads that data for the
-          # JSON summary the badge is built from.
           cargo llvm-cov --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only --json --output-path coverage.json
           PCT=$(jq '.data[0].totals.lines.percent' coverage.json)
           printf 'line coverage: %.1f%%\n' "$PCT"
           echo "COVERAGE_PCT=$PCT" >> "$GITHUB_ENV"
 
-      # Publish a Shields.io endpoint badge driven by the real CI coverage
-      # number. The JSON lives on an orphan `badges` branch so it never clutters
-      # main; the README points Shields at its raw URL.
       - name: Publish coverage badge
         if: github.ref == 'refs/heads/main'
-        run: |
-          PCT_INT=$(printf '%.0f' "$COVERAGE_PCT")
-          if   [ "$PCT_INT" -ge 90 ]; then COLOR=brightgreen
-          elif [ "$PCT_INT" -ge 75 ]; then COLOR=green
-          elif [ "$PCT_INT" -ge 60 ]; then COLOR=yellowgreen
-          elif [ "$PCT_INT" -ge 40 ]; then COLOR=orange
-          else COLOR=red; fi
-          MSG=$(printf '%.1f%%' "$COVERAGE_PCT")
-          mkdir badge-out && cd badge-out
-          printf '{"schemaVersion":1,"label":"coverage","message":"%s","color":"%s"}\n' "$MSG" "$COLOR" > coverage.json
-          git init -q
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -q -b badges
-          git add coverage.json
-          git commit -q -m "chore: update coverage badge ($MSG)"
-          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" badges
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/publish-coverage-badge.sh
