@@ -1,6 +1,6 @@
 //! Behavioural smoke tests: a quick encode → decode for each wire-type family.
 //!
-//! (Originally the per-feature-configuration suite; with feature flags removed
+//! (Originally the per-configuration suite; with the feature flags removed
 //! every wire type is always present, so these just run unconditionally.)
 
 use sofab::{ArrayKind, IStream, OStream, Signed, Unsigned, Visitor};

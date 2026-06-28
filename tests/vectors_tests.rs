@@ -18,14 +18,9 @@
 //!
 //! Roundtrip (encode → decode) falls out of running (1) and (3) on every vector.
 //!
-//! ## `requires`-aware feature gating
-//!
-//! Each vector may carry a top-level `requires` array naming the optional
-//! capabilities it needs (`fixlen` / `array` / `sequence` / `fp64` / `int64`).
-//! This suite honours it: built without a feature, it **skips** the vectors that
-//! need it, so the same vector file runs against every build configuration
-//! (`cargo test --test vectors_tests --no-default-features --features …`). The
-//! `int64` tag maps to this crate's `value64` feature.
+//! This build has every wire type and the 64-bit value width compiled in, so all
+//! shared vectors are representable and run (a vector's `requires` tags are kept
+//! only as a sanity check that the file carries them).
 
 mod common;
 
@@ -69,15 +64,11 @@ fn as_f64(v: &Value) -> f64 {
     }
 }
 
-// The scalar value type is `u64`/`i64` (default) or `u32`/`i32` (`value64` off);
-// the cast is only a no-op in the former, so silence the lint for the latter.
-#[allow(clippy::unnecessary_cast)]
 fn to_unsigned(v: u64) -> Unsigned {
-    v as Unsigned
+    v
 }
-#[allow(clippy::unnecessary_cast)]
 fn to_signed(v: i64) -> Signed {
-    v as Signed
+    v
 }
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
@@ -104,8 +95,7 @@ fn array_kind(element_type: &str) -> ArrayKind {
 
 // --- encode -----------------------------------------------------------------
 
-/// Write a vector's `fields[]` into any stream (buffered or flushing). Feature-
-/// gated per op; vectors needing a disabled op are filtered out by `requires`.
+/// Write a vector's `fields[]` into any stream (buffered or flushing).
 fn write_fields<F: Flush>(os: &mut OStream<F>, fields: &[Value]) {
     for f in fields {
         let op = f["op"].as_str().expect("op");
@@ -508,7 +498,7 @@ fn all_shared_vectors_conform() {
         );
     }
 
-    assert!(ran > 0, "no vectors ran for this feature configuration");
+    assert!(ran > 0, "no vectors ran");
 }
 
 #[test]
