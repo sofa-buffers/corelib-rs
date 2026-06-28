@@ -139,14 +139,14 @@ jobs:
 
       - name: Measure coverage
         run: |
-          cargo llvm-cov --all-features --summary-only --json --output-path coverage.json
+          # Run the instrumented suite once, emitting LCOV (for a Codecov upload
+          # if a token is added later); `report` then re-reads that data for the
+          # JSON summary the badge is built from (`report` takes no `--all-features`).
+          cargo llvm-cov --all-features --lcov --output-path lcov.info
+          cargo llvm-cov report --summary-only --json --output-path coverage.json
           PCT=$(jq '.data[0].totals.lines.percent' coverage.json)
           printf 'line coverage: %.1f%%\n' "$PCT"
           echo "COVERAGE_PCT=$PCT" >> "$GITHUB_ENV"
-
-      # Also emit LCOV so a Codecov upload can be wired in if a token is added.
-      - name: Generate LCOV
-        run: cargo llvm-cov report --all-features --lcov --output-path lcov.info
 
       # Publish a Shields.io endpoint badge driven by the real CI coverage
       # number. The JSON lives on an orphan `badges` branch so it never clutters
