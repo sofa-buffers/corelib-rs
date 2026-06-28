@@ -1,0 +1,15 @@
+# Rust build artifacts
+/target
+
+# Cargo.lock is committed for binaries/benches but a library may omit it; this is
+# a library crate, so keep it out.
+Cargo.lock
+
+# Coverage outputs
+/lcov.info
+/coverage.json
+/*.profraw
+
+# Editor / OS cruft
+*.swp
+.DS_Store

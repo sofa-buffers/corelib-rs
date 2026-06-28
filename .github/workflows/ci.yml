@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (all features, all targets)
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    strategy:
+      # Rust is compiler-versioned: test stable *and* beta so a beta regression
+      # or a soon-to-land change is caught early. All legs must report.
+      fail-fast: false
+      matrix:
+        toolchain: [stable, beta]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.toolchain }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build debug (all features)
+        run: cargo build --all-features --verbose
+
+      - name: Build release (all features)
+        run: cargo build --all-features --release --verbose
+
+      - name: Test (all features)
+        run: cargo test --all-features --verbose
+
+      - name: Test (default features)
+        run: cargo test --verbose
+
+  vectors:
+    name: Shared vectors across feature configs
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The conformance suite is `requires`-aware: it runs the shared vectors a
+        # given build can represent and skips the rest, so the same file validates
+        # every feature configuration (incl. the 32-bit value width = no value64).
+        features:
+          - "--all-features"                                                # full, 64-bit
+          - "--no-default-features"                                         # integers only, 32-bit
+          - "--no-default-features --features fixlen,array,sequence,fp64"   # full wire, 32-bit width
+          - "--no-default-features --features value64"                      # integers only, 64-bit
+          - "--no-default-features --features fixlen,fp64,value64"          # scalars + floats only
+          - "--no-default-features --features array,sequence,value64"       # no fixlen
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run shared vectors
+        run: cargo test --test vectors_tests ${{ matrix.features }} --verbose
+
+  features:
+    name: Feature powerset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@cargo-hack
+
+      # Compile + lint *every* combination of feature flags (catches `cfg`
+      # mistakes that only surface when a feature is off). `--no-dev-deps` keeps
+      # it to the library (the conformance test crates need all wire types).
+      - name: Clippy every feature combination (library)
+        run: cargo hack --feature-powerset --no-dev-deps clippy --lib -- -D warnings
+
+      # Behavioural smoke test (encode -> decode) under every combination. The
+      # config_tests crate is `cfg`-gated so it builds and runs for any subset.
+      - name: Test every feature combination (config smoke tests)
+        run: cargo hack --feature-powerset test --test config_tests
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to push the badge JSON to the `badges` branch
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Measure coverage
+        run: |
+          cargo llvm-cov --all-features --summary-only --json --output-path coverage.json
+          PCT=$(jq '.data[0].totals.lines.percent' coverage.json)
+          printf 'line coverage: %.1f%%\n' "$PCT"
+          echo "COVERAGE_PCT=$PCT" >> "$GITHUB_ENV"
+
+      # Also emit LCOV so a Codecov upload can be wired in if a token is added.
+      - name: Generate LCOV
+        run: cargo llvm-cov report --all-features --lcov --output-path lcov.info
+
+      # Publish a Shields.io endpoint badge driven by the real CI coverage
+      # number. The JSON lives on an orphan `badges` branch so it never clutters
+      # main; the README points Shields at its raw URL.
+      - name: Publish coverage badge
+        if: github.ref == 'refs/heads/main'
+        run: |
+          PCT_INT=$(printf '%.0f' "$COVERAGE_PCT")
+          if   [ "$PCT_INT" -ge 90 ]; then COLOR=brightgreen
+          elif [ "$PCT_INT" -ge 75 ]; then COLOR=green
+          elif [ "$PCT_INT" -ge 60 ]; then COLOR=yellowgreen
+          elif [ "$PCT_INT" -ge 40 ]; then COLOR=orange
+          else COLOR=red; fi
+          MSG=$(printf '%.1f%%' "$COVERAGE_PCT")
+          mkdir badge-out && cd badge-out
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s","color":"%s"}\n' "$MSG" "$COLOR" > coverage.json
+          git init -q
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -q -b badges
+          git add coverage.json
+          git commit -q -m "chore: update coverage badge ($MSG)"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" badges

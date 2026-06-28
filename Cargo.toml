@@ -1,0 +1,85 @@
+[package]
+name = "SofaBuffers"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT"
+description = "SofaBuffers (Sofab) — compact, streaming serialization core tuned for speed on big machines: zero-copy contiguous decoding (advance-a-pointer), std + heap, visitor-driven streaming decode. Wire-compatible with every corelib-* port."
+repository = "https://github.com/sofa-buffers/corelib-rs"
+keywords = ["serialization", "varint", "streaming", "zero-copy", "protobuf"]
+categories = ["encoding", "parsing", "network-programming"]
+
+# The crate is published on the registry as `SofaBuffers` (the name users add to
+# their `Cargo.toml`), but the importable namespace is `sofab` — `use sofab::…`.
+# This matches the language-independent API contract (ARCHITECTURE §6).
+[lib]
+name = "sofab"
+
+[dev-dependencies]
+# Process CPU time (clock_gettime) for the runtime benchmarks, so throughput is
+# measured against CPU time rather than wall-clock — matching the C/C++ tools.
+libc = "0.2"
+
+# Parse the shared `assets/test_vectors.json` (the cross-language source of
+# truth) in the conformance test suite. Test-only.
+serde_json = "1"
+
+# Per-op cost: cycles/op (hardware cycle counter) + throughput MB/s, over a
+# ~1s CPU-time loop. Mirrors corelib-c-cpp bench/perf.
+[[bench]]
+name = "perf"
+harness = false
+
+# Throughput speedtest: MB/s table over a ~1s CPU-time loop per workload.
+[[bench]]
+name = "bench"
+harness = false
+
+# A hand-written stand-in for what the `generator` repo emits: a generated-object
+# layer (dead-simple serialize/deserialize + streaming) built purely on the
+# corelib streaming primitives (ARCHITECTURE §6.1).
+[[example]]
+name = "person"
+
+# ---------------------------------------------------------------------------
+# Feature flags mirror the family-wide build switches (ARCHITECTURE §5.3 / §9).
+# Every capability is ON by default; turn features *off* (via
+# `default-features = false`, then re-enable what you want) to drop whole wire
+# types. Unlike the no_std port, this build targets servers — features exist for
+# API parity and trimming, not for fitting in a few KB.
+# ---------------------------------------------------------------------------
+[features]
+default = ["fixlen", "array", "sequence", "fp64", "value64"]
+# Fixed-length fields: fp32, fp64, string, blob (wire types FIXLEN / FIXLENARRAY).
+fixlen = []
+# Array fields (wire types VARINTARRAY_* and, with `fixlen`, FIXLENARRAY).
+array = []
+# Nested sequences (wire types SEQUENCE_START / SEQUENCE_END).
+sequence = []
+# 64-bit floating point. Implies `fixlen`.
+fp64 = ["fixlen"]
+# 64-bit scalar value type (u64/i64), the default and the natural width on a
+# 64-bit host. Disable it for a 32-bit value type (u32/i32) — kept only for
+# wire/API parity with the no_std port. Because it controls a public type it is
+# *not* additive: guard with `sofab::require!(value64)` / `require!(value32)`.
+value64 = []
+
+# ---------------------------------------------------------------------------
+# Speed-optimized release profile (the whole point of this port). The opposite
+# of the no_std crate's size-tuned `opt-level = "z"`: here we want the fastest
+# code the compiler can produce. For the last few percent, build benchmarks with
+# `RUSTFLAGS="-C target-cpu=native"`.
+# ---------------------------------------------------------------------------
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Benchmark profile: -O3 + fat LTO for a fair comparison with the C/C++ -O3
+# builds. Keep debug info so `perf`/Callgrind can attribute cost.
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true
