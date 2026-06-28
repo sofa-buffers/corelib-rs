@@ -34,8 +34,13 @@ jobs:
     name: Build & test
     runs-on: ubuntu-latest
     strategy:
-      # Rust is compiler-versioned: test stable *and* beta so a beta regression
-      # or a soon-to-land change is caught early. All legs must report.
+      # Two Rust release channels:
+      #   * stable — the current released compiler; what users actually build with.
+      #   * beta   — the next release (~6 weeks out). Testing it gives early warning
+      #              of a regression or a soon-to-stabilize change before it ships,
+      #              so breakage is caught here rather than by users after release.
+      # `fail-fast: false` keeps both legs running so we see every result, not just
+      # the first to fail.
       fail-fast: false
       matrix:
         toolchain: [stable, beta]
@@ -58,6 +63,28 @@ jobs:
 
       - name: Test (unit + integration + doctests, incl. shared vectors)
         run: cargo test --verbose
+
+  big-endian:
+    name: Big-endian (s390x) tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      # `cross` runs the suite for a big-endian target (IBM Z / s390x) inside a
+      # QEMU-emulated container. The wire format is little-endian, so this proves
+      # the `to_le_bytes`/`from_le_bytes` byte handling is correct on a
+      # big-endian host (the shared vectors are LE hex and must still round-trip).
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Test on s390x (big-endian, under QEMU)
+        run: cross test --target s390x-unknown-linux-gnu --verbose
 
   coverage:
     name: Coverage
