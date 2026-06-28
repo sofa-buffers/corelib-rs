@@ -160,6 +160,27 @@ fn perf_decode(buf: &[u8], out: &mut PerfOut) {
 }
 
 // ---------------------------------------------------------------------------
+// large-array workload (identical to bench.rs / bench.c / bench.cpp): a
+// standalone 1000-element u64 array. ARCHITECTURE.md §10 requires both
+// benchmark tools to exercise this large array *and* the typical message.
+// ---------------------------------------------------------------------------
+const PERF_N: usize = 1000;
+
+/// A spread of unsigned values exercising 1..10-byte varints (same generator as
+/// bench.rs's `make_src`, so the encoded bytes match across the two tools).
+fn perf_make_u64() -> Vec<u64> {
+    (0..PERF_N as u64)
+        .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .collect()
+}
+
+fn perf_encode_u64(buf: &mut [u8], src: &[u64]) -> usize {
+    let mut os = OStream::new(buf);
+    os.write_array_unsigned(1, src).unwrap();
+    os.bytes_used()
+}
+
+// ---------------------------------------------------------------------------
 // measurement
 // ---------------------------------------------------------------------------
 struct PerfResult {
@@ -191,10 +212,10 @@ fn perf_report(what: &str, r: &PerfResult, bytes: usize) {
     );
 }
 
-fn measure_encode(buf: &mut [u8]) -> (PerfResult, usize) {
+fn measure_encode(mut encode: impl FnMut() -> usize) -> (PerfResult, usize) {
     let mut msg = 0;
     for _ in 0..1000 {
-        msg = perf_encode(buf); // warmup
+        msg = encode(); // warmup
     }
 
     let mut sink: usize = 0;
@@ -203,7 +224,7 @@ fn measure_encode(buf: &mut [u8]) -> (PerfResult, usize) {
     let t0 = cpu_now();
     let mut el;
     loop {
-        sink = sink.wrapping_add(perf_encode(buf));
+        sink = sink.wrapping_add(encode());
         it += 1;
         el = cpu_now() - t0;
         if el >= 1.0 {
@@ -261,7 +282,7 @@ fn main() {
 
     println!("=== SofaBuffers Rust per-op cost (cycles/op + throughput MB/s) ===");
 
-    let (enc, msg_size) = measure_encode(&mut buffer);
+    let (enc, msg_size) = measure_encode(|| perf_encode(&mut buffer));
     perf_report("serialize (stream API)", &enc, msg_size);
 
     // Sanity check that the decode actually reproduced the data.
@@ -274,6 +295,17 @@ fn main() {
 
     let dec = measure_decode(&buffer[..msg_size]);
     perf_report("deserialize (stream API)", &dec, msg_size);
+
+    // Second reference workload (ARCHITECTURE.md §10): a standalone 1000-element
+    // u64 array, measured with the exact same perf machinery as above.
+    let src = perf_make_u64();
+    let mut u64_buf = vec![0u8; PERF_N * 11 + 16];
+
+    let (enc_u64, u64_size) = measure_encode(|| perf_encode_u64(&mut u64_buf, &src));
+    perf_report("encode u64[1000] (stream API)", &enc_u64, u64_size);
+
+    let dec_u64 = measure_decode(&u64_buf[..u64_size]);
+    perf_report("decode u64[1000] (stream API)", &dec_u64, u64_size);
 
     println!("\ncycles/op tracks code cost; MB/s is this machine's throughput.");
 }
