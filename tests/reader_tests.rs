@@ -27,15 +27,10 @@ fn parse_requires(v: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn vector_supported(requires: &[String]) -> bool {
-    requires.iter().all(|r| match r.as_str() {
-        "fixlen" => cfg!(feature = "fixlen"),
-        "array" => cfg!(feature = "array"),
-        "sequence" => cfg!(feature = "sequence"),
-        "fp64" => cfg!(feature = "fp64"),
-        "int64" => cfg!(feature = "value64"),
-        _ => true,
-    })
+fn vector_supported(_requires: &[String]) -> bool {
+    // This build has every wire type and the 64-bit value width compiled in, so
+    // every shared vector is representable.
+    true
 }
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {

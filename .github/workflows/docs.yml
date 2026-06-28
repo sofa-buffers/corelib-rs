@@ -36,7 +36,7 @@ jobs:
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --all-features --no-deps
+        run: cargo doc --no-deps
 
       # rustdoc emits target/doc/<crate>/index.html; add a root redirect so the
       # Pages site lands on the crate docs instead of a bare directory listing.

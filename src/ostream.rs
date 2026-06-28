@@ -6,11 +6,10 @@
 //! out (ARCHITECTURE §5.1). With no sink, a full buffer yields
 //! [`Error::BufferFull`].
 //!
-//! The public API is identical to the no_std port. For the common server case
-//! where you just want the bytes in a growable `Vec`, drive a small scratch
-//! buffer with a flush closure that appends to the `Vec` (see `examples/person.rs`)
-//! — that is the back end of the generated-object `serialize()` helper
-//! (ARCHITECTURE §6.1).
+//! For the common server case where you just want the bytes in a growable `Vec`,
+//! drive a small scratch buffer with a flush closure that appends to the `Vec`
+//! (see `examples/person.rs`) — that is the back end of the generated-object
+//! `serialize()` helper (ARCHITECTURE §6.1).
 
 use crate::error::{Error, Result};
 use crate::types::*;
@@ -147,7 +146,6 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     /// Copy a raw byte slice out, draining the buffer as needed. Uses a bulk
     /// `copy_from_slice` per buffer-sized run rather than a byte-at-a-time loop.
-    #[cfg_attr(not(feature = "fixlen"), allow(dead_code))]
     fn push_raw(&mut self, mut data: &[u8]) -> Result<()> {
         while !data.is_empty() {
             if self.offset >= self.end {
@@ -210,7 +208,6 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     /// Write a fixed-length field: header, `(len << 3) | subtype` varint, then
     /// the raw `data` bytes (already in wire/little-endian order for floats).
-    #[cfg(feature = "fixlen")]
     pub fn write_fixlen(&mut self, id: Id, data: &[u8], subtype: FixlenType) -> Result<()> {
         self.write_id_type(id, T_FIXLEN)?;
         self.write_varint(((data.len() as Unsigned) << 3) | subtype as Unsigned)?;
@@ -218,28 +215,24 @@ impl<'a, F: Flush> OStream<'a, F> {
     }
 
     /// Write a 32-bit float field.
-    #[cfg(feature = "fixlen")]
     #[inline]
     pub fn write_fp32(&mut self, id: Id, value: f32) -> Result<()> {
         self.write_fixlen(id, &value.to_le_bytes(), FixlenType::Fp32)
     }
 
     /// Write a 64-bit float field.
-    #[cfg(feature = "fp64")]
     #[inline]
     pub fn write_fp64(&mut self, id: Id, value: f64) -> Result<()> {
         self.write_fixlen(id, &value.to_le_bytes(), FixlenType::Fp64)
     }
 
     /// Write a string field (raw UTF-8 bytes, no NUL on the wire).
-    #[cfg(feature = "fixlen")]
     #[inline]
     pub fn write_str(&mut self, id: Id, text: &str) -> Result<()> {
         self.write_fixlen(id, text.as_bytes(), FixlenType::Str)
     }
 
     /// Write a binary blob field.
-    #[cfg(feature = "fixlen")]
     #[inline]
     pub fn write_blob(&mut self, id: Id, data: &[u8]) -> Result<()> {
         self.write_fixlen(id, data, FixlenType::Blob)
@@ -248,7 +241,6 @@ impl<'a, F: Flush> OStream<'a, F> {
     // --- array writers ------------------------------------------------------
 
     /// Write an array of unsigned integers (`u8`/`u16`/`u32`/`u64` elements).
-    #[cfg(feature = "array")]
     pub fn write_array_unsigned<T: UnsignedElem>(&mut self, id: Id, data: &[T]) -> Result<()> {
         if data.is_empty() {
             return Err(Error::Argument);
@@ -262,7 +254,6 @@ impl<'a, F: Flush> OStream<'a, F> {
     }
 
     /// Write an array of signed integers (`i8`/`i16`/`i32`/`i64` elements).
-    #[cfg(feature = "array")]
     pub fn write_array_signed<T: SignedElem>(&mut self, id: Id, data: &[T]) -> Result<()> {
         if data.is_empty() {
             return Err(Error::Argument);
@@ -276,7 +267,6 @@ impl<'a, F: Flush> OStream<'a, F> {
     }
 
     /// Write an array of 32-bit floats.
-    #[cfg(all(feature = "array", feature = "fixlen"))]
     pub fn write_array_fp32(&mut self, id: Id, data: &[f32]) -> Result<()> {
         if data.is_empty() {
             return Err(Error::Argument);
@@ -291,7 +281,6 @@ impl<'a, F: Flush> OStream<'a, F> {
     }
 
     /// Write an array of 64-bit floats.
-    #[cfg(all(feature = "array", feature = "fp64"))]
     pub fn write_array_fp64(&mut self, id: Id, data: &[f64]) -> Result<()> {
         if data.is_empty() {
             return Err(Error::Argument);
@@ -308,14 +297,12 @@ impl<'a, F: Flush> OStream<'a, F> {
     // --- sequence writers ---------------------------------------------------
 
     /// Open a nested sequence with the given field `id`.
-    #[cfg(feature = "sequence")]
     #[inline]
     pub fn write_sequence_begin(&mut self, id: Id) -> Result<()> {
         self.write_id_type(id, T_SEQUENCE_START)
     }
 
     /// Close the most recently opened nested sequence.
-    #[cfg(feature = "sequence")]
     #[inline]
     pub fn write_sequence_end(&mut self) -> Result<()> {
         self.write_id_type(0, T_SEQUENCE_END)
@@ -323,20 +310,17 @@ impl<'a, F: Flush> OStream<'a, F> {
 }
 
 /// Unsigned integer element that can be widened to the wire value type.
-#[cfg(feature = "array")]
 pub trait UnsignedElem: Copy {
     /// Zero-extend to [`Unsigned`].
     fn widen(self) -> Unsigned;
 }
 
 /// Signed integer element that can be widened to the wire value type.
-#[cfg(feature = "array")]
 pub trait SignedElem: Copy {
     /// Sign-extend to [`Signed`].
     fn widen(self) -> Signed;
 }
 
-#[cfg(feature = "array")]
 macro_rules! impl_unsigned_elem {
     ($($t:ty),*) => {$(
         impl UnsignedElem for $t {
@@ -346,7 +330,6 @@ macro_rules! impl_unsigned_elem {
     )*};
 }
 
-#[cfg(feature = "array")]
 macro_rules! impl_signed_elem {
     ($($t:ty),*) => {$(
         impl SignedElem for $t {
@@ -356,11 +339,5 @@ macro_rules! impl_signed_elem {
     )*};
 }
 
-#[cfg(feature = "array")]
-impl_unsigned_elem!(u8, u16, u32);
-#[cfg(all(feature = "array", feature = "value64"))]
-impl_unsigned_elem!(u64);
-#[cfg(feature = "array")]
-impl_signed_elem!(i8, i16, i32);
-#[cfg(all(feature = "array", feature = "value64"))]
-impl_signed_elem!(i64);
+impl_unsigned_elem!(u8, u16, u32, u64);
+impl_signed_elem!(i8, i16, i32, i64);

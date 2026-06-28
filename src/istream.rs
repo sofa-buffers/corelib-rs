@@ -21,12 +21,7 @@
 use crate::error::{Error, Result};
 use crate::types::*;
 use crate::varint::{read_varint, zigzag_decode};
-use crate::{Id, Signed, Unsigned};
-
-#[cfg(feature = "array")]
-use crate::ArrayKind;
-#[cfg(feature = "fixlen")]
-use crate::FixlenType;
+use crate::{ArrayKind, FixlenType, Id, Signed, Unsigned};
 
 /// Receives decoded fields from [`IStream`] / [`decode`].
 ///
@@ -42,11 +37,9 @@ pub trait Visitor {
     fn signed(&mut self, id: Id, value: Signed) {}
 
     /// A 32-bit float field, or an `fp32` array element.
-    #[cfg(feature = "fixlen")]
     fn fp32(&mut self, id: Id, value: f32) {}
 
     /// A 64-bit float field, or an `fp64` array element.
-    #[cfg(feature = "fp64")]
     fn fp64(&mut self, id: Id, value: f64) {}
 
     /// A chunk of a string field. `total` is the full field length; `offset` is
@@ -54,24 +47,19 @@ pub trait Visitor {
     /// this is called once with `total == 0` and an empty `chunk`. The
     /// contiguous [`decode`] path always delivers the whole string in a single
     /// call (`offset == 0`, `chunk.len() == total`).
-    #[cfg(feature = "fixlen")]
     fn string(&mut self, id: Id, total: usize, offset: usize, chunk: &[u8]) {}
 
     /// A chunk of a blob field. See [`Visitor::string`] for the chunking model.
-    #[cfg(feature = "fixlen")]
     fn blob(&mut self, id: Id, total: usize, offset: usize, chunk: &[u8]) {}
 
     /// Start of an array field with `count` elements of the given `kind`. The
     /// elements follow via the scalar / float callbacks with the same `id`.
-    #[cfg(feature = "array")]
     fn array_begin(&mut self, id: Id, kind: ArrayKind, count: usize) {}
 
     /// Start of a nested sequence with the given field `id`.
-    #[cfg(feature = "sequence")]
     fn sequence_begin(&mut self, id: Id) {}
 
     /// End of the current nested sequence.
-    #[cfg(feature = "sequence")]
     fn sequence_end(&mut self) {}
 }
 
@@ -85,7 +73,6 @@ pub trait Visitor {
 enum Resume {
     None,
     /// Mid string/blob payload (delivered incrementally).
-    #[cfg(feature = "fixlen")]
     Payload {
         id: Id,
         is_blob: bool,
@@ -93,14 +80,12 @@ enum Resume {
         remaining: usize,
     },
     /// Mid integer array: `remaining` elements still to read.
-    #[cfg(feature = "array")]
     ArrayInt {
         id: Id,
         signed: bool,
         remaining: usize,
     },
     /// Mid fixlen (float) array: `remaining` elements of `elem_len` bytes each.
-    #[cfg(all(feature = "array", feature = "fixlen"))]
     ArrayFix {
         id: Id,
         fp64: bool,
@@ -117,7 +102,6 @@ pub struct IStream {
     carry: Vec<u8>,
     resume: Resume,
     /// Nested sequence depth, for balanced start/end validation.
-    #[cfg(feature = "sequence")]
     depth: u32,
 }
 
@@ -133,7 +117,6 @@ impl IStream {
         IStream {
             carry: Vec::new(),
             resume: Resume::None,
-            #[cfg(feature = "sequence")]
             depth: 0,
         }
     }
@@ -143,10 +126,7 @@ impl IStream {
     pub fn reset(&mut self) {
         self.carry.clear();
         self.resume = Resume::None;
-        #[cfg(feature = "sequence")]
-        {
-            self.depth = 0;
-        }
+        self.depth = 0;
     }
 
     /// Feed a chunk of encoded bytes, pushing decoded fields to `visitor`.
@@ -174,12 +154,7 @@ impl IStream {
     /// Assert the decoder is at a clean message boundary: no half-read field, no
     /// open sequence. Used by [`decode`] to reject truncated input.
     pub fn finish(&self) -> Result<()> {
-        #[allow(unused_mut)] // `clean` is only re-assigned with the `sequence` feature
-        let mut clean = self.carry.is_empty() && matches!(self.resume, Resume::None);
-        #[cfg(feature = "sequence")]
-        {
-            clean = clean && self.depth == 0;
-        }
+        let clean = self.carry.is_empty() && matches!(self.resume, Resume::None) && self.depth == 0;
         if clean {
             Ok(())
         } else {
@@ -198,7 +173,6 @@ impl IStream {
             // 1) Finish anything left in progress from a previous chunk.
             match self.resume {
                 Resume::None => {}
-                #[cfg(feature = "fixlen")]
                 Resume::Payload { .. } => {
                     pos = self.deliver_payload(buf, pos, v);
                     if matches!(self.resume, Resume::Payload { .. }) {
@@ -206,7 +180,6 @@ impl IStream {
                     }
                     continue;
                 }
-                #[cfg(feature = "array")]
                 Resume::ArrayInt {
                     id,
                     signed,
@@ -237,7 +210,6 @@ impl IStream {
                     self.resume = Resume::None;
                     continue;
                 }
-                #[cfg(all(feature = "array", feature = "fixlen"))]
                 Resume::ArrayFix {
                     id,
                     fp64,
@@ -290,7 +262,6 @@ impl IStream {
                     None => return Ok(field_start),
                 },
 
-                #[cfg(feature = "fixlen")]
                 T_FIXLEN => {
                     let word = match read_varint(buf, &mut pos)? {
                         Some(w) => w,
@@ -312,7 +283,6 @@ impl IStream {
                             emit_fixlen_value(buf, pos, false, id, v);
                             pos += 4;
                         }
-                        #[cfg(feature = "fp64")]
                         FixlenType::Fp64 => {
                             if len != 8 {
                                 return Err(Error::InvalidMsg);
@@ -347,13 +317,12 @@ impl IStream {
                     }
                 }
 
-                #[cfg(feature = "array")]
                 T_VARINTARRAY_UNSIGNED => {
                     let count = match read_varint(buf, &mut pos)? {
                         Some(c) => c,
                         None => return Ok(field_start),
                     };
-                    if count == 0 || count as u64 > ARRAY_MAX {
+                    if count == 0 || count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
                     v.array_begin(id, ArrayKind::Unsigned, count as usize);
@@ -363,13 +332,12 @@ impl IStream {
                         remaining: count as usize,
                     };
                 }
-                #[cfg(feature = "array")]
                 T_VARINTARRAY_SIGNED => {
                     let count = match read_varint(buf, &mut pos)? {
                         Some(c) => c,
                         None => return Ok(field_start),
                     };
-                    if count == 0 || count as u64 > ARRAY_MAX {
+                    if count == 0 || count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
                     v.array_begin(id, ArrayKind::Signed, count as usize);
@@ -379,13 +347,12 @@ impl IStream {
                         remaining: count as usize,
                     };
                 }
-                #[cfg(all(feature = "array", feature = "fixlen"))]
                 T_FIXLENARRAY => {
                     let count = match read_varint(buf, &mut pos)? {
                         Some(c) => c,
                         None => return Ok(field_start),
                     };
-                    if count == 0 || count as u64 > ARRAY_MAX {
+                    if count == 0 || count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
                     let word = match read_varint(buf, &mut pos)? {
@@ -403,7 +370,6 @@ impl IStream {
                             }
                             false
                         }
-                        #[cfg(feature = "fp64")]
                         FixlenType::Fp64 => {
                             if elem_len != 8 {
                                 return Err(Error::InvalidMsg);
@@ -421,7 +387,6 @@ impl IStream {
                     };
                 }
 
-                #[cfg(feature = "sequence")]
                 T_SEQUENCE_START => {
                     if self.depth == u32::MAX {
                         return Err(Error::InvalidMsg);
@@ -429,7 +394,6 @@ impl IStream {
                     self.depth += 1;
                     v.sequence_begin(id);
                 }
-                #[cfg(feature = "sequence")]
                 T_SEQUENCE_END => {
                     if self.depth == 0 {
                         return Err(Error::InvalidMsg);
@@ -445,7 +409,6 @@ impl IStream {
 
     /// Deliver as much of an in-progress string/blob payload as `buf` holds,
     /// updating `self.resume`. Returns the new cursor position.
-    #[cfg(feature = "fixlen")]
     fn deliver_payload<V: Visitor>(&mut self, buf: &[u8], mut pos: usize, v: &mut V) -> usize {
         if let Resume::Payload {
             id,
@@ -483,24 +446,14 @@ impl IStream {
 
 /// Decode `elem_len` (4 or 8) little-endian float bytes at `buf[pos..]` and push
 /// them to the visitor. Caller guarantees the bytes are present.
-#[cfg(feature = "fixlen")]
 #[inline]
 fn emit_fixlen_value<V: Visitor>(buf: &[u8], pos: usize, fp64: bool, id: Id, v: &mut V) {
-    if !fp64 {
+    if fp64 {
+        let b: [u8; 8] = buf[pos..pos + 8].try_into().unwrap();
+        v.fp64(id, f64::from_le_bytes(b));
+    } else {
         let b: [u8; 4] = buf[pos..pos + 4].try_into().unwrap();
         v.fp32(id, f32::from_le_bytes(b));
-    } else {
-        #[cfg(feature = "fp64")]
-        {
-            let b: [u8; 8] = buf[pos..pos + 8].try_into().unwrap();
-            v.fp64(id, f64::from_le_bytes(b));
-        }
-        // `fp64 == true` is only reachable when the `fp64` feature is on.
-        #[cfg(not(feature = "fp64"))]
-        {
-            let _ = (buf, pos, id, v);
-            unreachable!("fp64 element without the fp64 feature");
-        }
     }
 }
 

@@ -87,23 +87,8 @@ fn api_version_is_one() {
 }
 
 #[test]
-fn config_constants_reflect_features() {
-    // The `config` module is the build-time introspection surface that
-    // `require!` is built on; it must mirror how the crate was compiled. This
-    // test runs under the default (all wire features, 64-bit) configuration.
-    assert_eq!(
-        [
-            sofab::config::FIXLEN,
-            sofab::config::ARRAY,
-            sofab::config::SEQUENCE,
-            sofab::config::FP64,
-        ],
-        [true, true, true, true]
-    );
-    assert_eq!(sofab::config::VALUE_BITS, 64);
-    assert_eq!(sofab::config::VALUE_BITS, sofab::Unsigned::BITS);
+fn value_type_is_64_bit() {
+    // This build is always 64-bit; there is no build-time configuration.
+    assert_eq!(sofab::Unsigned::BITS, 64);
+    assert_eq!(sofab::Signed::BITS, 64);
 }
-
-// A satisfied `require!` must compile to nothing. (An unsatisfied one is a
-// compile error, exercised in the macro's `compile_fail` doctest.)
-sofab::require!(fixlen, array, sequence, fp64, value64);

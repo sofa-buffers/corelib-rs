@@ -162,49 +162,25 @@ cargo run --example person
 A `Visitor` method left at its default (empty) implementation transparently skips
 that field — the equivalent of the C decoder's auto-skip.
 
-## Feature flags
+## No build-time configuration
 
-Every capability is **on by default**. Turn features *off* (with
-`default-features = false`) to drop whole wire types — kept mainly for API parity
-with the no_std port and for trimming an unused type, not for fitting in a few KB.
-
-| Feature | Default | Enables |
-|---------|:------:|---------|
-| `fixlen` | ✅ | fp32, fp64, string, blob (`FIXLEN`/`FIXLENARRAY`) |
-| `array` | ✅ | array fields (`VARINTARRAY_*`, `FIXLENARRAY`) |
-| `sequence` | ✅ | nested sequences (`SEQUENCE_START`/`END`) |
-| `fp64` | ✅ | 64-bit floats (implies `fixlen`) |
-| `value64` | ✅ | 64-bit scalar value type (`u64`/`i64`); disable for 32-bit (`u32`/`i32`) |
-
-Minimal build (integers only, 32-bit values):
+There are **no Cargo feature flags**. Every wire type — unsigned/signed
+integers, fp32, fp64, string, blob, integer arrays, float arrays, and nested
+sequences — is always compiled in, and the scalar value type is always 64-bit
+(`u64`/`i64`). This is the high-speed build: it does not trade wire-type
+granularity or value range for footprint. (If you need the trimmable, 32-bit,
+`#![no_std]` build, use [`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std).)
 
 ```toml
-SofaBuffers = { version = "0.1", default-features = false }
+SofaBuffers = "0.1"   # nothing to configure
 ```
-
-### Verifying the build configuration
-
-The wire types are compile-time switches, so a binary built with the wrong
-feature set would silently lack a field type. Assert the capabilities you depend
-on with the [`require!`] macro — a missing one fails the **build**:
-
-```rust
-sofab::require!(fp64, array, value64);
-```
-
-Accepted capabilities: `fixlen`, `array`, `sequence`, `fp64`, `value32`,
-`value64`. The same information is available as plain constants in
-[`sofab::config`] (`FIXLEN`, `ARRAY`, `SEQUENCE`, `FP64`, `VALUE_BITS`).
-
-[`require!`]: https://sofa-buffers.github.io/corelib-rs/sofab/macro.require.html
-[`sofab::config`]: https://sofa-buffers.github.io/corelib-rs/sofab/config/index.html
 
 ## Build & test
 
 ```bash
-cargo build --all-features       # build with every feature enabled
-cargo test  --all-features       # unit + integration + doctests
-cargo test                       # tests with default features
+cargo build                      # debug
+cargo build --release            # optimized
+cargo test                       # unit + integration + doctests (incl. shared vectors)
 ./coverage.sh                    # llvm-cov: terminal summary + HTML + lcov.info
 ```
 
@@ -212,7 +188,7 @@ Tests live in `tests/` as separate integration files:
 
 - `vectors_tests.rs` — replays the shared `assets/test_vectors.json` (encode,
   chunked-encode through 1/3/7-byte flush buffers, decode, chunked-decode, and
-  `skip_ids` auto-skip). `requires`-aware, so it runs under any feature subset.
+  `skip_ids` auto-skip).
 - `reader_tests.rs` — the fast [`decode`] path: matches the streaming path on
   every shared vector, asserts zero-copy single-call string/blob delivery, and
   rejects truncated input.
@@ -220,19 +196,8 @@ Tests live in `tests/` as separate integration files:
 - `istream_tests.rs` — decoder over the same vectors + malformed-input errors.
 - `roundtrip_tests.rs` — encode → decode value preservation.
 - `api_tests.rs` — offset reserve, buffer swap, large chunked streaming, API version.
-- `config_tests.rs` — per-configuration encode → decode smoke tests; `#[cfg]`-gated
-  so they build and run under **any** feature subset.
+- `config_tests.rs` — per-wire-type encode → decode smoke tests.
 - `tests/common/mod.rs` — shared recording [`Visitor`].
-
-### Testing every feature combination
-
-```bash
-cargo install cargo-hack
-cargo hack --feature-powerset --no-dev-deps clippy --lib -- -D warnings  # compile + lint each config
-cargo hack --feature-powerset test --test config_tests                   # run each config's smoke tests
-```
-
-CI runs both of these (see the `features` job in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 ## Benchmarks
 

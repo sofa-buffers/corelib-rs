@@ -41,28 +41,9 @@ harness = false
 [[example]]
 name = "person"
 
-# ---------------------------------------------------------------------------
-# Feature flags mirror the family-wide build switches (ARCHITECTURE §5.3 / §9).
-# Every capability is ON by default; turn features *off* (via
-# `default-features = false`, then re-enable what you want) to drop whole wire
-# types. Unlike the no_std port, this build targets servers — features exist for
-# API parity and trimming, not for fitting in a few KB.
-# ---------------------------------------------------------------------------
-[features]
-default = ["fixlen", "array", "sequence", "fp64", "value64"]
-# Fixed-length fields: fp32, fp64, string, blob (wire types FIXLEN / FIXLENARRAY).
-fixlen = []
-# Array fields (wire types VARINTARRAY_* and, with `fixlen`, FIXLENARRAY).
-array = []
-# Nested sequences (wire types SEQUENCE_START / SEQUENCE_END).
-sequence = []
-# 64-bit floating point. Implies `fixlen`.
-fp64 = ["fixlen"]
-# 64-bit scalar value type (u64/i64), the default and the natural width on a
-# 64-bit host. Disable it for a 32-bit value type (u32/i32) — kept only for
-# wire/API parity with the no_std port. Because it controls a public type it is
-# *not* additive: guard with `sofab::require!(value64)` / `require!(value32)`.
-value64 = []
+# No Cargo feature flags: every wire type is always compiled in and the scalar
+# value type is always 64-bit. This is the high-speed build — it does not trade
+# wire-type granularity or value range for footprint.
 
 # ---------------------------------------------------------------------------
 # Speed-optimized release profile (the whole point of this port). The opposite

@@ -31,7 +31,6 @@ mod common;
 
 use common::{Event, Recorder};
 use serde_json::Value;
-#[cfg(feature = "array")]
 use sofab::ArrayKind;
 use sofab::{Flush, IStream, Id, OStream, Signed, Unsigned, Visitor};
 
@@ -48,23 +47,16 @@ fn parse_requires(v: &Value) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-/// Whether this build supports every capability a vector requires. `int64` maps
-/// to the `value64` feature; unknown tags are assumed supported.
-fn vector_supported(requires: &[&str]) -> bool {
-    requires.iter().all(|r| match *r {
-        "fixlen" => cfg!(feature = "fixlen"),
-        "array" => cfg!(feature = "array"),
-        "sequence" => cfg!(feature = "sequence"),
-        "fp64" => cfg!(feature = "fp64"),
-        "int64" => cfg!(feature = "value64"),
-        _ => true,
-    })
+/// Whether this build supports every capability a vector requires. This build
+/// has every wire type and the 64-bit value width compiled in, so every vector
+/// is supported; `parse_requires` is still exercised by the presence check.
+fn vector_supported(_requires: &[&str]) -> bool {
+    true
 }
 
 // --- helpers ----------------------------------------------------------------
 
 /// A finite float as a JSON number, or `+/-infinity` as the strings `inf`/`-inf`.
-#[cfg(feature = "fixlen")]
 fn as_f64(v: &Value) -> f64 {
     match v {
         Value::Number(n) => n.as_f64().expect("float number"),
@@ -101,12 +93,10 @@ fn bytes_to_hex(b: &[u8]) -> String {
 }
 
 /// Map a vector's `element_type` string to the array kind the decoder reports.
-#[cfg(feature = "array")]
 fn array_kind(element_type: &str) -> ArrayKind {
     match element_type {
         "u8" | "u16" | "u32" | "u64" => ArrayKind::Unsigned,
         "i8" | "i16" | "i32" | "i64" => ArrayKind::Signed,
-        #[cfg(feature = "fixlen")]
         "fp32" | "fp64" => ArrayKind::Fixlen,
         other => panic!("unknown element_type {other:?}"),
     }
@@ -128,28 +118,20 @@ fn write_fields<F: Flush>(os: &mut OStream<F>, fields: &[Value]) {
                 .write_signed(id, to_signed(f["value"].as_i64().unwrap()))
                 .unwrap(),
             "boolean" => os.write_boolean(id, f["value"].as_bool().unwrap()).unwrap(),
-            #[cfg(feature = "fixlen")]
             "fp32" => os.write_fp32(id, as_f64(&f["value"]) as f32).unwrap(),
-            #[cfg(feature = "fp64")]
             "fp64" => os.write_fp64(id, as_f64(&f["value"])).unwrap(),
-            #[cfg(feature = "fixlen")]
             "string" => os.write_str(id, f["value"].as_str().unwrap()).unwrap(),
-            #[cfg(feature = "fixlen")]
             "blob" => os
                 .write_blob(id, &hex_to_bytes(f["value_hex"].as_str().unwrap()))
                 .unwrap(),
-            #[cfg(feature = "array")]
             "array" => encode_array(os, id, f),
-            #[cfg(feature = "sequence")]
             "sequence_begin" => os.write_sequence_begin(id).unwrap(),
-            #[cfg(feature = "sequence")]
             "sequence_end" => os.write_sequence_end().unwrap(),
             other => panic!("unsupported op {other:?} (vector should be `requires`-skipped)"),
         }
     }
 }
 
-#[cfg(feature = "array")]
 fn encode_array<F: Flush>(os: &mut OStream<F>, id: Id, f: &Value) {
     let et = f["element_type"].as_str().unwrap();
     let vals = f["values"].as_array().unwrap();
@@ -157,19 +139,15 @@ fn encode_array<F: Flush>(os: &mut OStream<F>, id: Id, f: &Value) {
         "u8" => os.write_array_unsigned(id, &u_vec::<u8>(vals)).unwrap(),
         "u16" => os.write_array_unsigned(id, &u_vec::<u16>(vals)).unwrap(),
         "u32" => os.write_array_unsigned(id, &u_vec::<u32>(vals)).unwrap(),
-        #[cfg(feature = "value64")]
         "u64" => os.write_array_unsigned(id, &u_vec::<u64>(vals)).unwrap(),
         "i8" => os.write_array_signed(id, &i_vec::<i8>(vals)).unwrap(),
         "i16" => os.write_array_signed(id, &i_vec::<i16>(vals)).unwrap(),
         "i32" => os.write_array_signed(id, &i_vec::<i32>(vals)).unwrap(),
-        #[cfg(feature = "value64")]
         "i64" => os.write_array_signed(id, &i_vec::<i64>(vals)).unwrap(),
-        #[cfg(feature = "fixlen")]
         "fp32" => {
             let a: Vec<f32> = vals.iter().map(|v| as_f64(v) as f32).collect();
             os.write_array_fp32(id, &a).unwrap();
         }
-        #[cfg(feature = "fp64")]
         "fp64" => {
             let a: Vec<f64> = vals.iter().map(as_f64).collect();
             os.write_array_fp64(id, &a).unwrap();
@@ -178,7 +156,6 @@ fn encode_array<F: Flush>(os: &mut OStream<F>, id: Id, f: &Value) {
     }
 }
 
-#[cfg(feature = "array")]
 fn u_vec<T: TryFrom<u64>>(vals: &[Value]) -> Vec<T> {
     vals.iter()
         .map(|v| {
@@ -189,7 +166,6 @@ fn u_vec<T: TryFrom<u64>>(vals: &[Value]) -> Vec<T> {
         .collect()
 }
 
-#[cfg(feature = "array")]
 fn i_vec<T: TryFrom<i64>>(vals: &[Value]) -> Vec<T> {
     vals.iter()
         .map(|v| {
@@ -252,31 +228,23 @@ fn push_field_events(ev: &mut Vec<Event>, f: &Value) {
             to_unsigned(f["value"].as_bool().unwrap() as u64),
         )),
         "signed" => ev.push(Event::Signed(id, to_signed(f["value"].as_i64().unwrap()))),
-        #[cfg(feature = "fixlen")]
         "fp32" => ev.push(Event::Fp32(id, (as_f64(&f["value"]) as f32).to_bits())),
-        #[cfg(feature = "fp64")]
         "fp64" => ev.push(Event::Fp64(id, as_f64(&f["value"]).to_bits())),
-        #[cfg(feature = "fixlen")]
         "string" => ev.push(Event::Str(
             id,
             f["value"].as_str().unwrap().as_bytes().to_vec(),
         )),
-        #[cfg(feature = "fixlen")]
         "blob" => ev.push(Event::Blob(
             id,
             hex_to_bytes(f["value_hex"].as_str().unwrap()),
         )),
-        #[cfg(feature = "array")]
         "array" => expected_array_events(ev, id, f),
-        #[cfg(feature = "sequence")]
         "sequence_begin" => ev.push(Event::SequenceBegin(id)),
-        #[cfg(feature = "sequence")]
         "sequence_end" => ev.push(Event::SequenceEnd),
         other => panic!("unsupported op {other:?}"),
     }
 }
 
-#[cfg(feature = "array")]
 fn expected_array_events(ev: &mut Vec<Event>, id: Id, f: &Value) {
     let et = f["element_type"].as_str().unwrap();
     let vals = f["values"].as_array().unwrap();
@@ -284,14 +252,10 @@ fn expected_array_events(ev: &mut Vec<Event>, id: Id, f: &Value) {
     for v in vals {
         match et {
             "u8" | "u16" | "u32" => ev.push(Event::Unsigned(id, to_unsigned(v.as_u64().unwrap()))),
-            #[cfg(feature = "value64")]
             "u64" => ev.push(Event::Unsigned(id, to_unsigned(v.as_u64().unwrap()))),
             "i8" | "i16" | "i32" => ev.push(Event::Signed(id, to_signed(v.as_i64().unwrap()))),
-            #[cfg(feature = "value64")]
             "i64" => ev.push(Event::Signed(id, to_signed(v.as_i64().unwrap()))),
-            #[cfg(feature = "fixlen")]
             "fp32" => ev.push(Event::Fp32(id, (as_f64(v) as f32).to_bits())),
-            #[cfg(feature = "fp64")]
             "fp64" => ev.push(Event::Fp64(id, as_f64(v).to_bits())),
             other => panic!("unsupported element_type {other:?}"),
         }
@@ -305,7 +269,6 @@ fn expected_array_events(ev: &mut Vec<Event>, id: Id, f: &Value) {
 /// everything inside, and the matching end), and decoding resumes after it.
 fn expected_events_with_skip(fields: &[Value], skip: &[Id]) -> Vec<Event> {
     let mut ev = Vec::new();
-    #[cfg(feature = "sequence")]
     let mut depth: u32 = 0;
     // `Some(d)` while inside a skipped sub-tree opened at depth `d`.
     #[allow(unused_mut)]
@@ -314,7 +277,6 @@ fn expected_events_with_skip(fields: &[Value], skip: &[Id]) -> Vec<Event> {
         let op = f["op"].as_str().unwrap();
         let id = f.get("id").and_then(Value::as_u64).unwrap_or(0) as Id;
         match op {
-            #[cfg(feature = "sequence")]
             "sequence_begin" => {
                 if skip_until.is_none() && skip.contains(&id) {
                     skip_until = Some(depth);
@@ -323,7 +285,6 @@ fn expected_events_with_skip(fields: &[Value], skip: &[Id]) -> Vec<Event> {
                 }
                 depth += 1;
             }
-            #[cfg(feature = "sequence")]
             "sequence_end" => {
                 depth -= 1;
                 match skip_until {
@@ -366,11 +327,8 @@ fn decode_one_byte_at_a_time(bytes: &[u8]) -> Vec<Event> {
 struct SkipRecorder<'a> {
     skip: &'a [Id],
     events: Vec<Event>,
-    #[cfg(feature = "fixlen")]
     pending: Option<(Id, bool, Vec<u8>)>,
-    #[cfg(feature = "sequence")]
     depth: u32,
-    #[cfg(feature = "sequence")]
     skip_until: Option<u32>,
 }
 
@@ -379,31 +337,20 @@ impl<'a> SkipRecorder<'a> {
         SkipRecorder {
             skip,
             events: Vec::new(),
-            #[cfg(feature = "fixlen")]
             pending: None,
-            #[cfg(feature = "sequence")]
             depth: 0,
-            #[cfg(feature = "sequence")]
             skip_until: None,
         }
     }
 
     fn skipping(&self) -> bool {
-        #[cfg(feature = "sequence")]
-        {
-            self.skip_until.is_some()
-        }
-        #[cfg(not(feature = "sequence"))]
-        {
-            false
-        }
+        self.skip_until.is_some()
     }
 
     fn drop_id(&self, id: Id) -> bool {
         self.skipping() || self.skip.contains(&id)
     }
 
-    #[cfg(feature = "fixlen")]
     fn accumulate(&mut self, id: Id, is_blob: bool, total: usize, offset: usize, chunk: &[u8]) {
         if offset == 0 {
             self.pending = Some((id, is_blob, Vec::with_capacity(total)));
@@ -435,31 +382,26 @@ impl Visitor for SkipRecorder<'_> {
             self.events.push(Event::Signed(id, v));
         }
     }
-    #[cfg(feature = "fixlen")]
     fn fp32(&mut self, id: Id, v: f32) {
         if !self.drop_id(id) {
             self.events.push(Event::Fp32(id, v.to_bits()));
         }
     }
-    #[cfg(feature = "fp64")]
     fn fp64(&mut self, id: Id, v: f64) {
         if !self.drop_id(id) {
             self.events.push(Event::Fp64(id, v.to_bits()));
         }
     }
-    #[cfg(feature = "fixlen")]
     fn string(&mut self, id: Id, total: usize, offset: usize, chunk: &[u8]) {
         if !self.drop_id(id) {
             self.accumulate(id, false, total, offset, chunk);
         }
     }
-    #[cfg(feature = "fixlen")]
     fn blob(&mut self, id: Id, total: usize, offset: usize, chunk: &[u8]) {
         if !self.drop_id(id) {
             self.accumulate(id, true, total, offset, chunk);
         }
     }
-    #[cfg(feature = "array")]
     fn array_begin(&mut self, id: Id, kind: ArrayKind, count: usize) {
         // Array elements arrive via the scalar/float callbacks with this id,
         // so a skipped id drops them too — only the header is handled here.
@@ -467,7 +409,6 @@ impl Visitor for SkipRecorder<'_> {
             self.events.push(Event::ArrayBegin(id, kind, count));
         }
     }
-    #[cfg(feature = "sequence")]
     fn sequence_begin(&mut self, id: Id) {
         if !self.skipping() {
             if self.skip.contains(&id) {
@@ -478,7 +419,6 @@ impl Visitor for SkipRecorder<'_> {
         }
         self.depth += 1;
     }
-    #[cfg(feature = "sequence")]
     fn sequence_end(&mut self) {
         self.depth -= 1;
         match self.skip_until {
@@ -614,14 +554,6 @@ fn skip_ids_vectors_conform() {
         );
     }
 
-    // Under the full build every shared skip vector is supported.
-    #[cfg(all(
-        feature = "fixlen",
-        feature = "array",
-        feature = "sequence",
-        feature = "fp64",
-        feature = "value64"
-    ))]
+    // Every shared skip vector is supported in this build.
     assert!(seen >= 8, "expected the shared skip vectors (saw {seen})");
-    let _ = seen;
 }

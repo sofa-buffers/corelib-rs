@@ -1,22 +1,10 @@
-//! Per-configuration behavioural smoke tests.
+//! Behavioural smoke tests: a quick encode → decode for each wire-type family.
 //!
-//! The conformance suites (`vectors_tests`, `ostream_tests`, …) exercise every
-//! wire type and therefore only build with all features on. *This* file is the
-//! opposite: it compiles and runs under **any** feature subset, because each
-//! feature-specific test is `#[cfg]`-gated to exactly the API it uses. That lets
-//! the whole feature powerset be tested for real (encode → decode), not just
-//! compiled. Run the matrix with:
-//!
-//! ```text
-//! cargo hack --feature-powerset test --test config_tests
-//! ```
-//!
-//! (Every [`Visitor`] method has a default no-op impl, so each tiny recorder
-//! below overrides only the callbacks for the type it checks.)
+//! (Originally the per-feature-configuration suite; with feature flags removed
+//! every wire type is always present, so these just run unconditionally.)
 
-use sofab::{IStream, OStream, Signed, Unsigned, Visitor};
+use sofab::{ArrayKind, IStream, OStream, Signed, Unsigned, Visitor};
 
-// Scalars (unsigned / signed / boolean) are always available — no feature gate.
 #[test]
 fn scalars_roundtrip() {
     #[derive(Default)]
@@ -48,16 +36,12 @@ fn scalars_roundtrip() {
 }
 
 #[test]
-fn value_width_matches_config() {
-    #[cfg(feature = "value64")]
-    assert_eq!(sofab::config::VALUE_BITS, 64);
-    #[cfg(not(feature = "value64"))]
-    assert_eq!(sofab::config::VALUE_BITS, 32);
-    assert_eq!(sofab::config::VALUE_BITS, Unsigned::BITS);
+fn value_type_is_64_bit() {
+    assert_eq!(Unsigned::BITS, 64);
+    assert_eq!(Signed::BITS, 64);
 }
 
-/// With 64-bit values, a value above `u32::MAX` round-trips.
-#[cfg(feature = "value64")]
+/// A value above `u32::MAX` round-trips (the value type is 64-bit).
 #[test]
 fn wide_value_roundtrips() {
     #[derive(Default)]
@@ -81,20 +65,6 @@ fn wide_value_roundtrips() {
     assert_eq!(v.u, [big]);
 }
 
-/// With 32-bit values, a varint whose continuation runs past 32 bits is rejected
-/// (matching a 32-bit `sofab_value_t` build of the C reference).
-#[cfg(not(feature = "value64"))]
-#[test]
-fn over_wide_varint_is_rejected() {
-    struct Ignore;
-    impl Visitor for Ignore {}
-    // id 0, unsigned wire type, then five 0x.. continuation bytes (35 bits).
-    let bytes = [0x00u8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
-    let mut is = IStream::new();
-    assert!(is.feed(&bytes, &mut Ignore).is_err());
-}
-
-#[cfg(feature = "fixlen")]
 #[test]
 fn fixlen_roundtrip() {
     #[derive(Default)]
@@ -151,7 +121,6 @@ fn fixlen_roundtrip() {
     assert_eq!(v.blobs, [(3, vec![9, 8, 7])]);
 }
 
-#[cfg(feature = "fp64")]
 #[test]
 fn fp64_roundtrip() {
     #[derive(Default)]
@@ -174,10 +143,8 @@ fn fp64_roundtrip() {
     assert_eq!(v.fp64, [(1, 2.5f64.to_bits())]);
 }
 
-#[cfg(feature = "array")]
 #[test]
 fn integer_array_roundtrip() {
-    use sofab::ArrayKind;
     #[derive(Default)]
     struct V {
         begins: Vec<(u32, usize)>,
@@ -209,7 +176,6 @@ fn integer_array_roundtrip() {
     assert_eq!(v.s, [-1, -2]);
 }
 
-#[cfg(all(feature = "array", feature = "fixlen"))]
 #[test]
 fn float_array_roundtrip() {
     #[derive(Default)]
@@ -232,13 +198,11 @@ fn float_array_roundtrip() {
     assert_eq!(v.fp32, [1.0f32.to_bits(), 2.0f32.to_bits()]);
 }
 
-#[cfg(feature = "sequence")]
 #[test]
 fn sequence_roundtrip() {
     #[derive(Default)]
     struct V {
-        // Some(id) = begin, None = end
-        frames: Vec<Option<u32>>,
+        frames: Vec<Option<u32>>, // Some(id) = begin, None = end
         u: Vec<(u32, Unsigned)>,
     }
     impl Visitor for V {

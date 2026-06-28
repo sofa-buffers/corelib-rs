@@ -27,8 +27,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Clippy (all features, all targets)
-        run: cargo clippy --all-features --all-targets -- -D warnings
+      - name: Clippy (all targets)
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Build & test
@@ -50,73 +50,14 @@ jobs:
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
 
-      - name: Build debug (all features)
-        run: cargo build --all-features --verbose
+      - name: Build (debug)
+        run: cargo build --verbose
 
-      - name: Build release (all features)
-        run: cargo build --all-features --release --verbose
+      - name: Build (release)
+        run: cargo build --release --verbose
 
-      - name: Test (all features)
-        run: cargo test --all-features --verbose
-
-      - name: Test (default features)
+      - name: Test (unit + integration + doctests, incl. shared vectors)
         run: cargo test --verbose
-
-  vectors:
-    name: Shared vectors across feature configs
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # The conformance suite is `requires`-aware: it runs the shared vectors a
-        # given build can represent and skips the rest, so the same file validates
-        # every feature configuration (incl. the 32-bit value width = no value64).
-        features:
-          - "--all-features"                                                # full, 64-bit
-          - "--no-default-features"                                         # integers only, 32-bit
-          - "--no-default-features --features fixlen,array,sequence,fp64"   # full wire, 32-bit width
-          - "--no-default-features --features value64"                      # integers only, 64-bit
-          - "--no-default-features --features fixlen,fp64,value64"          # scalars + floats only
-          - "--no-default-features --features array,sequence,value64"       # no fixlen
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run shared vectors
-        run: cargo test --test vectors_tests ${{ matrix.features }} --verbose
-
-  features:
-    name: Feature powerset
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-hack
-        uses: taiki-e/install-action@cargo-hack
-
-      # Compile + lint *every* combination of feature flags (catches `cfg`
-      # mistakes that only surface when a feature is off). `--no-dev-deps` keeps
-      # it to the library (the conformance test crates need all wire types).
-      - name: Clippy every feature combination (library)
-        run: cargo hack --feature-powerset --no-dev-deps clippy --lib -- -D warnings
-
-      # Behavioural smoke test (encode -> decode) under every combination. The
-      # config_tests crate is `cfg`-gated so it builds and runs for any subset.
-      - name: Test every feature combination (config smoke tests)
-        run: cargo hack --feature-powerset test --test config_tests
 
   coverage:
     name: Coverage
@@ -141,8 +82,8 @@ jobs:
         run: |
           # Run the instrumented suite once, emitting LCOV (for a Codecov upload
           # if a token is added later); `report` then re-reads that data for the
-          # JSON summary the badge is built from (`report` takes no `--all-features`).
-          cargo llvm-cov --all-features --lcov --output-path lcov.info
+          # JSON summary the badge is built from.
+          cargo llvm-cov --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only --json --output-path coverage.json
           PCT=$(jq '.data[0].totals.lines.percent' coverage.json)
           printf 'line coverage: %.1f%%\n' "$PCT"
