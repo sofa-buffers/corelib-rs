@@ -236,22 +236,23 @@ implement the **same SofaBuffers API** and run the **identical** `perf` and
 `bench` tools, so every difference below comes purely from the two encode/decode
 implementations — not from the benchmark.
 
-One run on a single 6-core x86-64 host (stable `rustc`, default
+Average of 7 runs on a single 6-core x86-64 host (stable `rustc`, default
 `[profile.bench]`, no `target-cpu=native`). Numbers are machine-specific;
 `cycles/op` is the more host-independent figure (lower is better), MB/s is this
 machine's throughput (higher is better).
 
 | Workload | `std` cycles/op | `no_std` cycles/op | `std` MB/s | `no_std` MB/s |
 | --- | ---: | ---: | ---: | ---: |
-| serialize — typical message (170 B)   |  3,126 |  3,249 | 152.0 | 146.2 |
-| deserialize — typical message (170 B) |  3,604 |  4,583 | 131.8 | 103.7 |
-| encode — `u64` array ×1000 (9,491 B)  | 38,590 | 44,544 | 687.5 | 595.5 |
-| decode — `u64` array ×1000 (9,491 B)  | 31,175 | 92,822 | 852.2 | 285.8 |
+| serialize — typical message (170 B)   |  3,471 |  3,670 | 138.8 | 131.6 |
+| deserialize — typical message (170 B) |  4,383 |  5,116 | 112.7 |  95.4 |
+| encode — `u64` array ×1000 (9,491 B)  | 41,486 | 38,958 | 642.0 | 684.7 |
+| decode — `u64` array ×1000 (9,491 B)  | 34,159 | 95,217 | 782.3 | 280.5 |
 
-**In plain terms:** the `std` build is faster on every workload. The two are
-within a few percent on the small typical message, but the gap widens on the
-bulk `u64` array — most dramatically on **decode**, where `std` is roughly **3×**
-faster (≈850 vs ≈290 MB/s). So for small mixed messages the choice barely
-matters; for high-volume array decoding `std` is the clear pick, while
-`no_std` trades that throughput for running in freestanding / embedded targets
-that have no allocator or operating system.
+**In plain terms:** the two ports are close on most workloads — within a few
+percent on the small typical message, and effectively tied on bulk `u64`-array
+*encode* (`no_std` is even marginally ahead there). The one big, consistent gap
+is bulk-array **decode**, where `std` is roughly **2.8×** faster (≈780 vs ≈280
+MB/s). So for small mixed messages or array encoding the choice barely matters;
+for high-volume array *decoding* the `std` crate is the clear pick, while
+`no_std` trades that decode throughput for running in freestanding / embedded
+targets that have no allocator or operating system.
