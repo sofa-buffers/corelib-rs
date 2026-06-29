@@ -228,33 +228,6 @@ For the last few percent of throughput, build with native codegen:
 RUSTFLAGS="-C target-cpu=native" cargo bench
 ```
 
-### Sample results
-
-Illustrative numbers from one CI runner (`cargo bench`, no `target-cpu=native`).
-They are machine-specific — run the tools yourself for figures on your hardware;
-the cross-language harness uses these same outputs to build comparison tables.
-
-```text
-=== SofaBuffers Rust throughput (CPU time, MB/s) ===
-Workload                           MB/s
---------                           ----
-encode: u64 array (1000)         546.73
-encode: typical message           28.02
-decode: u64 array (1000)         799.63
-decode: typical message           34.37
-```
-
-```text
---- perf: serialize (stream API) ---      --- perf: deserialize (stream API) ---
-  message size  : 170 bytes                 message size  : 170 bytes
-  cycles/op     : 3144.6                     cycles/op     : 3393.6
-  CPU time/op   : 1124.9 ns                  CPU time/op   : 1214.2 ns
-  throughput    : 151.1 MB/s                 throughput    : 140.0 MB/s
-```
-
-The `perf` message encodes to **170 bytes** on every implementation — a quick
-cross-language parity check on the encoding.
-
 ### `std` vs `no_std`: how the two Rust ports compare
 
 `corelib-rs` (this crate, built on `std`) and the freestanding
