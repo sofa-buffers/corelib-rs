@@ -233,26 +233,30 @@ RUSTFLAGS="-C target-cpu=native" cargo bench
 `corelib-rs` (this crate, built on `std`) and the freestanding
 [`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std) port
 implement the **same SofaBuffers API** and run the **identical** `perf` and
-`bench` tools, so every difference below comes purely from the two encode/decode
-implementations — not from the benchmark.
+`bench` tools — so the numbers reflect the two implementations, not the
+benchmark. Crucially, each is built **the way it is meant to ship**, which is
+the comparison that actually matters:
 
-Average of 7 runs on a single 6-core x86-64 host (stable `rustc`, default
-`[profile.bench]`, no `target-cpu=native`). Numbers are machine-specific;
-`cycles/op` is the more host-independent figure (lower is better), MB/s is this
-machine's throughput (higher is better).
+- **`corelib-rs` — tuned for raw speed:** `opt-level = 3`, fat LTO,
+  `codegen-units = 1`.
+- **`corelib-rs-no-std` — full features, tuned for a small `.text`:**
+  `opt-level = "z"`, LTO, `codegen-units = 1` (its release profile).
 
-| Workload | `std` cycles/op | `no_std` cycles/op | `std` MB/s | `no_std` MB/s |
-| --- | ---: | ---: | ---: | ---: |
-| serialize — typical message (170 B)   |  3,471 |  3,670 | 138.8 | 131.6 |
-| deserialize — typical message (170 B) |  4,383 |  5,116 | 112.7 |  95.4 |
-| encode — `u64` array ×1000 (9,491 B)  | 41,486 | 38,958 | 642.0 | 684.7 |
-| decode — `u64` array ×1000 (9,491 B)  | 34,159 | 95,217 | 782.3 | 280.5 |
+So this is a **speed-optimized vs size-optimized** comparison, by design.
+Median of 15 runs on a single 6-core x86-64 VM (median is robust to the VM's
+run-to-run jitter); `cycles/op` lower is better, MB/s higher is better.
 
-**In plain terms:** the two ports are close on most workloads — within a few
-percent on the small typical message, and effectively tied on bulk `u64`-array
-*encode* (`no_std` is even marginally ahead there). The one big, consistent gap
-is bulk-array **decode**, where `std` is roughly **2.8×** faster (≈780 vs ≈280
-MB/s). So for small mixed messages or array encoding the choice barely matters;
-for high-volume array *decoding* the `std` crate is the clear pick, while
-`no_std` trades that decode throughput for running in freestanding / embedded
-targets that have no allocator or operating system.
+| Workload | `std` cycles/op | `no_std` cycles/op | `std` MB/s | `no_std` MB/s | `std` faster |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| serialize — typical message (170 B)   |  3,178 |   4,835 | 149.5 |  98.3 | 1.5× |
+| deserialize — typical message (170 B) |  3,600 |   5,636 | 132.2 |  84.3 | 1.6× |
+| encode — `u64` array ×1000 (9,491 B)  | 39,614 |  91,272 | 670.7 | 290.6 | 2.3× |
+| decode — `u64` array ×1000 (9,491 B)  | 32,152 | 178,368 | 825.1 | 148.7 | 5.5× |
+
+**In plain terms:** the speed-tuned `std` build is faster on every workload, and
+the lead **grows with payload size** — about 1.5× on a small typical message,
+2.3× encoding a 1000-element `u64` array, and up to **5.5×** decoding one. That
+is exactly the intended trade-off: `corelib-rs` spends code size to go fast,
+while `corelib-rs-no-std` gives up that throughput for a tiny, allocator-free
+binary that runs on microcontrollers where `std` cannot build at all. Pick this
+crate for servers and throughput; pick `no_std` for embedded and footprint.
