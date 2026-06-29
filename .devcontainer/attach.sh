@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-docker exec -it rust-devcontainer bash
+docker exec -it sofa-rust-dev bash
