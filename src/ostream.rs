@@ -119,6 +119,7 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     // --- primitives ---------------------------------------------------------
 
+    /// Append a single byte, draining the buffer to the sink first if it is full.
     #[inline]
     fn push_byte(&mut self, b: u8) -> Result<()> {
         if self.offset >= self.end {
@@ -159,6 +160,8 @@ impl<'a, F: Flush> OStream<'a, F> {
         Ok(())
     }
 
+    /// Encode `value` as a base-128 (LEB128) varint: 7 payload bits per byte,
+    /// low byte first, with the high bit set on every byte but the last.
     #[inline]
     fn write_varint(&mut self, mut value: Unsigned) -> Result<()> {
         loop {
@@ -174,6 +177,8 @@ impl<'a, F: Flush> OStream<'a, F> {
         }
     }
 
+    /// Write a field header: the `(id << 3) | wire_type` tag as a varint.
+    /// Returns [`Error::Argument`] for an `id` above [`ID_MAX`].
     #[inline]
     fn write_id_type(&mut self, id: Id, wire_type: u8) -> Result<()> {
         if id > ID_MAX {
