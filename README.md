@@ -137,30 +137,104 @@ cargo run --example person
 
 ## API summary
 
-**Encoder — [`OStream`]** (writes into a caller buffer):
+### Write operations
 
-| Operation | Purpose |
-|-----------|---------|
-| `new` / `with_offset` / `with_flush` | construct over a buffer; reserve a header offset; attach a flush sink |
-| `write_unsigned` / `write_signed` / `write_boolean` | scalar integers (varint / zig-zag) and booleans |
-| `write_fp32` / `write_fp64` / `write_str` / `write_blob` / `write_fixlen` | fixed-length values (LE floats, UTF-8 text, raw bytes) |
-| `write_array_unsigned` / `write_array_signed` / `write_array_fp32` / `write_array_fp64` | arrays with a single shared descriptor |
-| `write_sequence_begin` / `write_sequence_end` | open / close a nested sequence |
-| `flush` / `buffer_set` / `bytes_used` | drain pending bytes; swap the output buffer mid-stream; bytes written |
+**Encoder — [`OStream`]** (writes into a caller buffer). Field ids are `u32` in
+`0..=ID_MAX` (`i32::MAX`); every writer returns `Result<()>` and never allocates:
 
-**Decoder — [`decode`] / [`IStream`] + [`Visitor`]:**
+| Operation | Signature (value parameter) | Purpose |
+|-----------|------------------------------|---------|
+| `new` / `with_offset` / `with_flush` | `&mut [u8]` (`+ offset`, `+ sink`) | construct over a buffer; reserve a header offset; attach a flush sink |
+| `write_unsigned` / `write_signed` / `write_boolean` | `Unsigned` (`u64`) / `Signed` (`i64`) / `bool` | scalar integers (varint / zig-zag) and booleans |
+| `write_fp32` / `write_fp64` | `f32` / `f64` | little-endian IEEE-754 floats |
+| `write_str` / `write_blob` | `&str` / `&[u8]` | UTF-8 text (no NUL on the wire) / raw bytes |
+| `write_fixlen` | `&[u8]`, [`FixlenType`] | low-level fixed-length write (the primitive the four above build on) |
+| `write_array_unsigned` / `write_array_signed` | `&[T: UnsignedElem]` / `&[T: SignedElem]` | integer arrays — element type generic (see [Allowed types](#allowed-types)) |
+| `write_array_fp32` / `write_array_fp64` | `&[f32]` / `&[f64]` | float arrays with a single shared descriptor |
+| `write_sequence_begin` / `write_sequence_end` | `Id` / — | open / close a nested sequence |
+| `flush` / `buffer_set` / `bytes_used` | — / `&mut [u8]` / — | drain pending bytes; swap the output buffer mid-stream; bytes written |
+
+Empty integer/float arrays are rejected (`Error::Argument`); empty strings/blobs
+are valid.
+
+### Read operations
+
+Decoding is **push-based**: there is no `read_xxx()` that returns a value.
+Instead you implement [`Visitor`] and the decoder calls one method per decoded
+field. Two entry points drive the same `Visitor`:
 
 | Operation | Purpose |
 |-----------|---------|
 | `decode(bytes, visitor)` | one-shot, zero-copy decode of a complete message |
-| `IStream::new` / `feed` / `finish` / `reset` | streaming decode: feed any-size chunks; assert a clean end; reuse the decoder |
-| `Visitor::unsigned` / `signed` / `fp32` / `fp64` | scalar fields and array elements |
-| `Visitor::string` / `blob` | fixed-length payloads (`total` / `offset` / `chunk`; one call on the fast path) |
-| `Visitor::array_begin` | start of an array (`kind`, `count`); elements follow via the scalar/float callbacks |
-| `Visitor::sequence_begin` / `sequence_end` | nested-sequence framing |
+| `IStream::new` / `feed(chunk, visitor)` / `finish` / `reset` | streaming decode: feed any-size chunks; assert a clean end; reuse the decoder |
 
-A `Visitor` method left at its default (empty) implementation transparently skips
-that field — the equivalent of the C decoder's auto-skip.
+Every value reaches the caller through one of these `Visitor` callbacks (all have
+a default empty body, so overriding only the ones you care about **skips** the
+rest — the equivalent of the C decoder's auto-skip):
+
+| Callback | Destination type handed to you | Delivers |
+|----------|--------------------------------|----------|
+| `unsigned(id, value)` | `Unsigned` (`u64`), by value | an unsigned scalar **or** an unsigned-array element |
+| `signed(id, value)` | `Signed` (`i64`), by value | a signed scalar **or** a signed-array element |
+| `fp32(id, value)` | `f32`, by value | an `fp32` scalar **or** an `fp32`-array element |
+| `fp64(id, value)` | `f64`, by value | an `fp64` scalar **or** an `fp64`-array element |
+| `string(id, total, offset, chunk)` | `chunk: &[u8]`, **borrowed** | a slice of a string field (raw bytes; not validated as UTF-8 by the library) |
+| `blob(id, total, offset, chunk)` | `chunk: &[u8]`, **borrowed** | a slice of a blob field |
+| `array_begin(id, kind, count)` | [`ArrayKind`], `count: usize` | the header of an array; its `count` elements then arrive via the scalar/float callbacks above, all with the same `id` |
+| `sequence_begin(id)` / `sequence_end()` | `Id` / — | nested-sequence framing (open / close) |
+
+`total` is the full field length and `offset` is this chunk's byte position
+within the field; on the contiguous [`decode`] path a string/blob always arrives
+in a **single** call (`offset == 0`, `chunk.len() == total`). There is no
+distinct "skip" call — a field whose callback is left at the default is simply
+not delivered.
+
+### Allowed types
+
+The scalar API is fixed-width: `write_unsigned`/`Visitor::unsigned` are always
+`u64` and `write_signed`/`Visitor::signed` always `i64` (`Unsigned` / `Signed`);
+this build does not parameterize the scalar width. Floats are `f32` / `f64`.
+
+Only the **integer-array writers are generic**, over the element width:
+
+- `write_array_unsigned<T: UnsignedElem>` — `T ∈ {u8, u16, u32, u64}`
+- `write_array_signed<T: SignedElem>` — `T ∈ {i8, i16, i32, i64}`
+
+These are the only impls of the sealed-by-construction `UnsignedElem` /
+`SignedElem` traits, so any other element type is a compile error. Elements are
+zero-/sign-extended to 64-bit on the wire, so the *decode* side always reports
+array elements as `u64` / `i64` (the original narrower width is not carried).
+Float arrays are not generic: `write_array_fp32` / `write_array_fp64` take
+`&[f32]` / `&[f64]`.
+
+Fixed-length fields ([`FixlenType`]) are `Fp32`, `Fp64`, `Str`, `Blob`. A
+**fixlen array may only hold `Fp32` or `Fp64` elements** — a `Str`/`Blob`
+element width is rejected as `Error::InvalidMsg` on decode (variable-length
+subtypes are not representable as fixed-stride array elements; use a nested
+sequence of string/blob fields instead). Array element counts and fixlen byte
+lengths are capped at `i32::MAX`.
+
+### Memory handling
+
+The high-speed `std` build allocates freely for *speed*, but the encode/decode
+hot path is deliberately allocation-free and **never owns your payload memory**:
+
+| Path | Who owns the buffer | Copy vs. borrow |
+|------|---------------------|-----------------|
+| **Encode** | The **caller** owns the output buffer (`&mut [u8]`). The library never allocates or grows it. | Bytes are written straight into your buffer. With no flush sink, overflow is `Error::BufferFull`; with a [`Flush`] sink the full buffer is drained to the sink and writing resumes at the start (`buffer_set` can even swap in a fresh buffer mid-stream). To collect into a growable `Vec`, drive a small scratch buffer with a flush closure that appends — *you* own the `Vec`. |
+| **Decode — scalars/floats** | n/a (passed by value) | `unsigned`/`signed`/`fp32`/`fp64` receive a copied value; nothing is retained by the decoder. |
+| **Decode — string/blob** | The **caller's `Visitor`** owns any retained bytes. The library allocates **no** `String`/`Vec` for payloads. | The `chunk: &[u8]` is a **borrow**, valid only for the duration of the callback. On the [`decode`] / self-contained-chunk fast path it borrows directly from your input buffer (zero copy); across a `feed` chunk boundary it borrows from a small internal carry buffer. If you want to keep the data, **copy it out inside the callback** (e.g. `String::push_str`, `Vec::extend_from_slice`). |
+| **Decode — arrays/sequences** | n/a | Array elements stream through the scalar/float callbacks one at a time; the decoder holds only `O(1)` resume state, never a materialized array. |
+
+This is a **push / visitor** model, **not** lazy binding: the decoder hands each
+value to your `Visitor` as it is parsed, rather than recording a destination
+pointer to be filled by a later `feed()`. Consequently there is no
+address-stability requirement on any destination beyond the `&mut Visitor` you
+pass in (which must, of course, outlive the `decode` / `feed` call). The only
+memory the decoder itself owns is `IStream`'s internal carry `Vec`, which holds
+just the few bytes of a small item (header / varint / float) that straddled a
+chunk boundary; long string/blob payloads are streamed, never buffered, and
+`reset` reuses the carry allocation across messages.
 
 ## No build-time configuration
 
