@@ -10,8 +10,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// Invalid caller argument (e.g. a field id greater than [`crate::ID_MAX`],
-    /// or an empty array). Corresponds to `SOFAB_RET_E_ARGUMENT`.
+    /// Invalid caller argument (e.g. a field id greater than [`crate::ID_MAX`], a
+    /// length/count above the maximum, or more than [`crate::MAX_DEPTH`] nested
+    /// sequences). Corresponds to `SOFAB_RET_E_ARGUMENT`.
     Argument,
 
     /// Invalid API usage (e.g. a decoded value does not fit the requested type).
@@ -23,7 +24,8 @@ pub enum Error {
     BufferFull,
 
     /// The input bytes are not a valid Sofab message (varint overflow, bad type
-    /// tag, zero-length array, dangling sequence end, truncated message, …).
+    /// tag, oversized length/count, dangling sequence end, nesting past
+    /// [`crate::MAX_DEPTH`], truncated message, …).
     /// Corresponds to `SOFAB_RET_E_INVALID_MSG`.
     InvalidMsg,
 }

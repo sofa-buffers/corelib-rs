@@ -301,11 +301,43 @@ fn buffer_full_without_sink() {
 }
 
 #[test]
-fn empty_array_is_argument_error() {
-    let mut buf = [0u8; 16];
+fn zero_count_arrays_encode_to_header_plus_count() {
+    // A zero-count array is exactly [ header ][ count = 0 ] (§4.7/§4.8); a
+    // zero-count fixlen array writes NO fixlen_word and NO payload (§4.8).
+    let empty_u: [u32; 0] = [];
+    assert_eq!(
+        encode(|os| os.write_array_unsigned(0, &empty_u).unwrap()),
+        [0x03, 0x00]
+    );
+    let empty_i: [i32; 0] = [];
+    assert_eq!(
+        encode(|os| os.write_array_signed(0, &empty_i).unwrap()),
+        [0x04, 0x00]
+    );
+    let empty_f32: [f32; 0] = [];
+    assert_eq!(
+        encode(|os| os.write_array_fp32(0, &empty_f32).unwrap()),
+        [0x05, 0x00]
+    );
+    let empty_f64: [f64; 0] = [];
+    assert_eq!(
+        encode(|os| os.write_array_fp64(0, &empty_f64).unwrap()),
+        [0x05, 0x00]
+    );
+}
+
+#[test]
+fn sequence_depth_over_max_is_argument_error() {
+    let mut buf = [0u8; 512];
     let mut os = OStream::new(&mut buf);
-    let empty: [u32; 0] = [];
-    assert_eq!(os.write_array_unsigned(0, &empty), Err(Error::Argument));
+    // 255 nested sequences are allowed; the 256th must be rejected (§4.9).
+    for _ in 0..sofab::MAX_DEPTH {
+        os.write_sequence_begin(0).unwrap();
+    }
+    assert_eq!(os.write_sequence_begin(0), Err(Error::Argument));
+    // After closing one, opening one more is allowed again.
+    os.write_sequence_end().unwrap();
+    os.write_sequence_begin(0).unwrap();
 }
 
 // --- streaming flush sink ---------------------------------------------------

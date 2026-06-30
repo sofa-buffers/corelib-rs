@@ -322,7 +322,7 @@ impl IStream {
                         Some(c) => c,
                         None => return Ok(field_start),
                     };
-                    if count == 0 || count > ARRAY_MAX {
+                    if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
                     v.array_begin(id, ArrayKind::Unsigned, count as usize);
@@ -337,7 +337,7 @@ impl IStream {
                         Some(c) => c,
                         None => return Ok(field_start),
                     };
-                    if count == 0 || count > ARRAY_MAX {
+                    if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
                     v.array_begin(id, ArrayKind::Signed, count as usize);
@@ -352,43 +352,51 @@ impl IStream {
                         Some(c) => c,
                         None => return Ok(field_start),
                     };
-                    if count == 0 || count > ARRAY_MAX {
+                    if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
-                    let word = match read_varint(buf, &mut pos)? {
-                        Some(w) => w,
-                        None => return Ok(field_start),
-                    };
-                    let subtype = FixlenType::from_raw((word & 0x07) as u8)?;
-                    let elem_len = (word >> 3) as usize;
-                    // Only fixed-width float subtypes are valid in a fixlen array;
-                    // string/blob must use a sequence instead.
-                    let fp64 = match subtype {
-                        FixlenType::Fp32 => {
-                            if elem_len != 4 {
-                                return Err(Error::InvalidMsg);
+                    if count == 0 {
+                        // A zero-count fixlen array carries no fixlen_word and no
+                        // payload — the field ends at the count (§4.8).
+                        v.array_begin(id, ArrayKind::Fixlen, 0);
+                    } else {
+                        let word = match read_varint(buf, &mut pos)? {
+                            Some(w) => w,
+                            None => return Ok(field_start),
+                        };
+                        let subtype = FixlenType::from_raw((word & 0x07) as u8)?;
+                        let elem_len = (word >> 3) as usize;
+                        // Only fixed-width float subtypes are valid in a fixlen
+                        // array; string/blob must use a sequence instead.
+                        let fp64 = match subtype {
+                            FixlenType::Fp32 => {
+                                if elem_len != 4 {
+                                    return Err(Error::InvalidMsg);
+                                }
+                                false
                             }
-                            false
-                        }
-                        FixlenType::Fp64 => {
-                            if elem_len != 8 {
-                                return Err(Error::InvalidMsg);
+                            FixlenType::Fp64 => {
+                                if elem_len != 8 {
+                                    return Err(Error::InvalidMsg);
+                                }
+                                true
                             }
-                            true
-                        }
-                        _ => return Err(Error::InvalidMsg),
-                    };
-                    v.array_begin(id, ArrayKind::Fixlen, count as usize);
-                    self.resume = Resume::ArrayFix {
-                        id,
-                        fp64,
-                        elem_len,
-                        remaining: count as usize,
-                    };
+                            _ => return Err(Error::InvalidMsg),
+                        };
+                        v.array_begin(id, ArrayKind::Fixlen, count as usize);
+                        self.resume = Resume::ArrayFix {
+                            id,
+                            fp64,
+                            elem_len,
+                            remaining: count as usize,
+                        };
+                    }
                 }
 
                 T_SEQUENCE_START => {
-                    if self.depth == u32::MAX {
+                    // Reject nesting beyond MAX_DEPTH (255) rather than risk
+                    // unbounded recursion / stack growth (§4.9, §6.2).
+                    if self.depth >= MAX_DEPTH {
                         return Err(Error::InvalidMsg);
                     }
                     self.depth += 1;
