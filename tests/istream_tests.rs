@@ -184,10 +184,45 @@ fn streaming_chunked_feed_matches_oneshot() {
 // --- error cases ------------------------------------------------------------
 
 #[test]
-fn array_count_zero_is_invalid() {
+fn decode_zero_count_arrays() {
+    // A zero-count array is a valid empty array on the wire (§4.7/§4.8): exactly
+    // [ header ][ count = 0 ], with no fixlen_word for the fixlen kind.
+    assert_eq!(
+        decode(&[0x03, 0x00]),
+        [Event::ArrayBegin(0, ArrayKind::Unsigned, 0)]
+    );
+    assert_eq!(
+        decode(&[0x04, 0x00]),
+        [Event::ArrayBegin(0, ArrayKind::Signed, 0)]
+    );
+    assert_eq!(
+        decode(&[0x05, 0x00]),
+        [Event::ArrayBegin(0, ArrayKind::Fixlen, 0)]
+    );
+    // A zero-count fixlen array is followed directly by the next field — no
+    // fixlen_word is consumed.
+    assert_eq!(
+        decode(&[0x05, 0x00, 0x00, 0x2A]),
+        [
+            Event::ArrayBegin(0, ArrayKind::Fixlen, 0),
+            Event::Unsigned(0, 42),
+        ]
+    );
+}
+
+#[test]
+fn nesting_beyond_max_depth_is_invalid() {
+    // 255 nested sequence-start bytes (id 0 -> 0x06) are accepted; the 256th
+    // exceeds MAX_DEPTH and must be rejected (§4.9, §6.2).
+    let ok: Vec<u8> = vec![0x06; sofab::MAX_DEPTH as usize];
     let mut rec = Recorder::new();
     let mut is = IStream::new();
-    assert_eq!(is.feed(&[0x03, 0x00], &mut rec), Err(Error::InvalidMsg));
+    assert!(is.feed(&ok, &mut rec).is_ok());
+
+    let too_deep: Vec<u8> = vec![0x06; sofab::MAX_DEPTH as usize + 1];
+    let mut rec2 = Recorder::new();
+    let mut is2 = IStream::new();
+    assert_eq!(is2.feed(&too_deep, &mut rec2), Err(Error::InvalidMsg));
 }
 
 #[test]

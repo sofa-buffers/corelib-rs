@@ -48,6 +48,8 @@ pub struct OStream<'a, F: Flush = NoFlush> {
     buffer: &'a mut [u8],
     end: usize,
     offset: usize,
+    /// Number of nested sequences currently open, capped at [`MAX_DEPTH`].
+    depth: u32,
     /// `None` means "no sink": a full buffer is an error rather than a flush.
     flush: Option<F>,
 }
@@ -69,6 +71,7 @@ impl<'a> OStream<'a, NoFlush> {
             buffer,
             end,
             offset,
+            depth: 0,
             flush: None,
         }
     }
@@ -85,6 +88,7 @@ impl<'a, F: Flush> OStream<'a, F> {
             buffer,
             end,
             offset,
+            depth: 0,
             flush: Some(sink),
         }
     }
@@ -214,6 +218,9 @@ impl<'a, F: Flush> OStream<'a, F> {
     /// Write a fixed-length field: header, `(len << 3) | subtype` varint, then
     /// the raw `data` bytes (already in wire/little-endian order for floats).
     pub fn write_fixlen(&mut self, id: Id, data: &[u8], subtype: FixlenType) -> Result<()> {
+        if data.len() as u64 > FIXLEN_MAX {
+            return Err(Error::Argument);
+        }
         self.write_id_type(id, T_FIXLEN)?;
         self.write_varint(((data.len() as Unsigned) << 3) | subtype as Unsigned)?;
         self.push_raw(data)
@@ -246,8 +253,11 @@ impl<'a, F: Flush> OStream<'a, F> {
     // --- array writers ------------------------------------------------------
 
     /// Write an array of unsigned integers (`u8`/`u16`/`u32`/`u64` elements).
+    ///
+    /// A zero-count array is a valid empty array on the wire — it encodes as
+    /// exactly `[ header ][ element_count = 0 ]` with no elements (§4.7).
     pub fn write_array_unsigned<T: UnsignedElem>(&mut self, id: Id, data: &[T]) -> Result<()> {
-        if data.is_empty() {
+        if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
         self.write_id_type(id, T_VARINTARRAY_UNSIGNED)?;
@@ -259,8 +269,11 @@ impl<'a, F: Flush> OStream<'a, F> {
     }
 
     /// Write an array of signed integers (`i8`/`i16`/`i32`/`i64` elements).
+    ///
+    /// A zero-count array encodes as exactly `[ header ][ element_count = 0 ]`
+    /// with no elements (§4.7).
     pub fn write_array_signed<T: SignedElem>(&mut self, id: Id, data: &[T]) -> Result<()> {
-        if data.is_empty() {
+        if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
         self.write_id_type(id, T_VARINTARRAY_SIGNED)?;
@@ -272,12 +285,18 @@ impl<'a, F: Flush> OStream<'a, F> {
     }
 
     /// Write an array of 32-bit floats.
+    ///
+    /// A zero-count fixlen array carries **no `fixlen_word` and no payload** — it
+    /// encodes as exactly `[ header ][ element_count = 0 ]` (§4.8).
     pub fn write_array_fp32(&mut self, id: Id, data: &[f32]) -> Result<()> {
-        if data.is_empty() {
+        if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
         self.write_id_type(id, T_FIXLENARRAY)?;
         self.write_varint(data.len() as Unsigned)?;
+        if data.is_empty() {
+            return Ok(());
+        }
         self.write_varint((4 << 3) | FixlenType::Fp32 as Unsigned)?;
         for &e in data {
             self.push_raw(&e.to_le_bytes())?;
@@ -286,12 +305,18 @@ impl<'a, F: Flush> OStream<'a, F> {
     }
 
     /// Write an array of 64-bit floats.
+    ///
+    /// A zero-count fixlen array carries **no `fixlen_word` and no payload** — it
+    /// encodes as exactly `[ header ][ element_count = 0 ]` (§4.8).
     pub fn write_array_fp64(&mut self, id: Id, data: &[f64]) -> Result<()> {
-        if data.is_empty() {
+        if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
         self.write_id_type(id, T_FIXLENARRAY)?;
         self.write_varint(data.len() as Unsigned)?;
+        if data.is_empty() {
+            return Ok(());
+        }
         self.write_varint((8 << 3) | FixlenType::Fp64 as Unsigned)?;
         for &e in data {
             self.push_raw(&e.to_le_bytes())?;
@@ -302,15 +327,25 @@ impl<'a, F: Flush> OStream<'a, F> {
     // --- sequence writers ---------------------------------------------------
 
     /// Open a nested sequence with the given field `id`.
+    ///
+    /// Returns [`Error::Argument`] if more than [`MAX_DEPTH`] (255) sequences
+    /// would be open at once (§4.9).
     #[inline]
     pub fn write_sequence_begin(&mut self, id: Id) -> Result<()> {
-        self.write_id_type(id, T_SEQUENCE_START)
+        if self.depth >= MAX_DEPTH {
+            return Err(Error::Argument);
+        }
+        self.write_id_type(id, T_SEQUENCE_START)?;
+        self.depth += 1;
+        Ok(())
     }
 
     /// Close the most recently opened nested sequence.
     #[inline]
     pub fn write_sequence_end(&mut self) -> Result<()> {
-        self.write_id_type(0, T_SEQUENCE_END)
+        self.write_id_type(0, T_SEQUENCE_END)?;
+        self.depth = self.depth.saturating_sub(1);
+        Ok(())
     }
 }
 

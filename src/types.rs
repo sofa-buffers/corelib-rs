@@ -18,8 +18,17 @@ pub type Unsigned = u64;
 /// Signed value type used by the scalar API — always 64-bit.
 pub type Signed = i64;
 
-/// Maximum number of elements in an array / bytes in a fixlen field (`INT32_MAX`).
+/// Maximum number of elements in an array (`INT32_MAX`).
 pub(crate) const ARRAY_MAX: u64 = i32::MAX as u64;
+
+/// Maximum number of bytes in a fixlen field / per fixlen-array element
+/// (`INT32_MAX`).
+pub(crate) const FIXLEN_MAX: u64 = i32::MAX as u64;
+
+/// Maximum nested-sequence depth. An encoder must not open more than this many
+/// nested sequences, and a decoder rejects a message that nests deeper with
+/// [`crate::Error::InvalidMsg`] (normative per the architecture spec, §6.2).
+pub const MAX_DEPTH: u32 = 255;
 
 // --- 3-bit wire field type tags (low 3 bits of the field header varint) ------
 pub(crate) const T_VARINT_UNSIGNED: u8 = 0x0;

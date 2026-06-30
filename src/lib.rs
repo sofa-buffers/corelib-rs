@@ -61,4 +61,4 @@ mod varint;
 pub use error::{Error, Result};
 pub use istream::{decode, IStream, Visitor};
 pub use ostream::{Flush, NoFlush, OStream, SignedElem, UnsignedElem};
-pub use types::{ArrayKind, FixlenType, Id, Signed, Unsigned, API_VERSION, ID_MAX};
+pub use types::{ArrayKind, FixlenType, Id, Signed, Unsigned, API_VERSION, ID_MAX, MAX_DEPTH};

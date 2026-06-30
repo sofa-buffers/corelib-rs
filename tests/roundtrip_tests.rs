@@ -84,6 +84,29 @@ fn arrays_roundtrip() {
 }
 
 #[test]
+fn zero_count_arrays_roundtrip() {
+    let ev = roundtrip(|os| {
+        let eu: [u32; 0] = [];
+        let ei: [i32; 0] = [];
+        let e32: [f32; 0] = [];
+        let e64: [f64; 0] = [];
+        os.write_array_unsigned(1, &eu).unwrap();
+        os.write_array_signed(2, &ei).unwrap();
+        os.write_array_fp32(3, &e32).unwrap();
+        os.write_array_fp64(4, &e64).unwrap();
+    });
+    assert_eq!(
+        ev,
+        [
+            Event::ArrayBegin(1, ArrayKind::Unsigned, 0),
+            Event::ArrayBegin(2, ArrayKind::Signed, 0),
+            Event::ArrayBegin(3, ArrayKind::Fixlen, 0),
+            Event::ArrayBegin(4, ArrayKind::Fixlen, 0),
+        ]
+    );
+}
+
+#[test]
 fn deep_nested_sequences_roundtrip() {
     let ev = roundtrip(|os| {
         os.write_unsigned(0, 1).unwrap();

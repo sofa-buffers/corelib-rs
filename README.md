@@ -236,18 +236,27 @@ just the few bytes of a small item (header / varint / float) that straddled a
 chunk boundary; long string/blob payloads are streamed, never buffered, and
 `reset` reuses the carry allocation across messages.
 
-## No build-time configuration
+## Feature flags
 
-There are **no Cargo feature flags**. Every wire type — unsigned/signed
-integers, fp32, fp64, string, blob, integer arrays, float arrays, and nested
-sequences — is always compiled in, and the scalar value type is always 64-bit
-(`u64`/`i64`). This is the high-speed build: it does not trade wire-type
-granularity or value range for footprint. (If you need the trimmable, 32-bit,
-`#![no_std]` build, use [`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std).)
+This is the **high-speed `std` build**: every wire type is always compiled in and
+the scalar value type is always 64-bit (`u64`/`i64`), so it never trades wire-type
+granularity or value range for footprint. There are therefore **no Cargo feature
+flags** to set — the toggle set described in the spec (§5.3) lives in the
+trimmable, `#![no_std]` sibling crate instead.
+
+| Feature flag | Default | Effect |
+|--------------|---------|--------|
+| *(none)* | — | All wire types (unsigned/signed integers, fp32, fp64, string, blob, integer arrays, float arrays, nested sequences) are always on; the value type is always 64-bit. |
 
 ```toml
 SofaBuffers = "0.1"   # nothing to configure
 ```
+
+For the trimmable build — drop fixlen / fp64 / array / sequence support, switch to
+a 32-bit value type, or disable overflow checks to shrink the footprint for
+constrained targets — use
+[`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std), whose
+Cargo features cover those toggles.
 
 ## Build & test
 
