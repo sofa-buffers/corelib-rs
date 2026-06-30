@@ -47,6 +47,11 @@ unsafe fn read_varint_unchecked(
     loop {
         let byte = *base.add(i);
         i += 1;
+        // On the final byte that can still fit, reject payload bits that would
+        // not survive the shift (an overlong varint that overflows the value).
+        if shift + 7 >= Unsigned::BITS && (byte & 0x7F) >> (Unsigned::BITS - shift) != 0 {
+            return Err(Error::InvalidMsg);
+        }
         value |= ((byte & 0x7F) as Unsigned) << shift;
         if byte & 0x80 == 0 {
             *pos = i;
@@ -69,6 +74,11 @@ fn read_varint_checked(buf: &[u8], pos: &mut usize) -> Result<Option<Unsigned>> 
     while i < buf.len() {
         let byte = buf[i];
         i += 1;
+        // On the final byte that can still fit, reject payload bits that would
+        // not survive the shift (an overlong varint that overflows the value).
+        if shift + 7 >= Unsigned::BITS && (byte & 0x7F) >> (Unsigned::BITS - shift) != 0 {
+            return Err(Error::InvalidMsg);
+        }
         value |= ((byte & 0x7F) as Unsigned) << shift;
         if byte & 0x80 == 0 {
             *pos = i;
