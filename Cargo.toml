@@ -1,5 +1,5 @@
 [package]
-name = "SofaBuffers"
+name = "sofa-buffers-corelib"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
@@ -9,9 +9,10 @@ repository = "https://github.com/sofa-buffers/corelib-rs"
 keywords = ["serialization", "varint", "streaming", "zero-copy", "protobuf"]
 categories = ["encoding", "parsing", "network-programming"]
 
-# The crate is published on the registry as `SofaBuffers` (the name users add to
-# their `Cargo.toml`), but the importable namespace is `sofab` — `use sofab::…`.
-# This matches the language-independent API contract (ARCHITECTURE §6).
+# The crate is published on crates.io as `sofa-buffers-corelib` (the name users
+# add to their `Cargo.toml`), but the importable namespace is `sofab` —
+# `use sofab::…`. This matches the language-independent API contract
+# (ARCHITECTURE §6).
 [lib]
 name = "sofab"
 
