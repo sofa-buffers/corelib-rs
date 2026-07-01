@@ -31,7 +31,7 @@ other `corelib-*` port.
 **Minimum Rust version:** 1.70. **Install:**
 
 ```bash
-cargo add SofaBuffers        # the registry package name…
+cargo add sofa-buffers-corelib   # the crates.io package name…
 ```
 
 ```rust
@@ -249,7 +249,7 @@ trimmable, `#![no_std]` sibling crate instead.
 | *(none)* | — | All wire types (unsigned/signed integers, fp32, fp64, string, blob, integer arrays, float arrays, nested sequences) are always on; the value type is always 64-bit. |
 
 ```toml
-SofaBuffers = "0.1"   # nothing to configure
+sofa-buffers-corelib = "0.1"   # nothing to configure (import as `use sofab::…`)
 ```
 
 For the trimmable build — drop fixlen / fp64 / array / sequence support, switch to
