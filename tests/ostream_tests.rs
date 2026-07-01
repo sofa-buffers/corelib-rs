@@ -302,8 +302,9 @@ fn buffer_full_without_sink() {
 
 #[test]
 fn zero_count_arrays_encode_to_header_plus_count() {
-    // A zero-count array is exactly [ header ][ count = 0 ] (§4.7/§4.8); a
-    // zero-count fixlen array writes NO fixlen_word and NO payload (§4.8).
+    // A zero-count integer array is exactly [ header ][ count = 0 ] (§4.7). A
+    // zero-count fixlen array still writes its fixlen_word (but no payload), so
+    // an empty fp32 array is distinguishable from an empty fp64 array (§4.8).
     let empty_u: [u32; 0] = [];
     assert_eq!(
         encode(|os| os.write_array_unsigned(0, &empty_u).unwrap()),
@@ -317,12 +318,12 @@ fn zero_count_arrays_encode_to_header_plus_count() {
     let empty_f32: [f32; 0] = [];
     assert_eq!(
         encode(|os| os.write_array_fp32(0, &empty_f32).unwrap()),
-        [0x05, 0x00]
+        [0x05, 0x00, 0x20]
     );
     let empty_f64: [f64; 0] = [];
     assert_eq!(
         encode(|os| os.write_array_fp64(0, &empty_f64).unwrap()),
-        [0x05, 0x00]
+        [0x05, 0x00, 0x41]
     );
 }
 

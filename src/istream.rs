@@ -355,35 +355,35 @@ impl IStream {
                     if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
-                    if count == 0 {
-                        // A zero-count fixlen array carries no fixlen_word and no
-                        // payload — the field ends at the count (§4.8).
-                        v.array_begin(id, ArrayKind::Fixlen, 0);
-                    } else {
-                        let word = match read_varint(buf, &mut pos)? {
-                            Some(w) => w,
-                            None => return Ok(field_start),
-                        };
-                        let subtype = FixlenType::from_raw((word & 0x07) as u8)?;
-                        let elem_len = (word >> 3) as usize;
-                        // Only fixed-width float subtypes are valid in a fixlen
-                        // array; string/blob must use a sequence instead.
-                        let fp64 = match subtype {
-                            FixlenType::Fp32 => {
-                                if elem_len != 4 {
-                                    return Err(Error::InvalidMsg);
-                                }
-                                false
+                    // A fixlen array **always** carries its `fixlen_word`, even
+                    // when empty (count == 0) — this is what distinguishes an
+                    // empty fp32 array from an empty fp64 array on the wire
+                    // (§4.8).
+                    let word = match read_varint(buf, &mut pos)? {
+                        Some(w) => w,
+                        None => return Ok(field_start),
+                    };
+                    let subtype = FixlenType::from_raw((word & 0x07) as u8)?;
+                    let elem_len = (word >> 3) as usize;
+                    // Only fixed-width float subtypes are valid in a fixlen
+                    // array; string/blob must use a sequence instead.
+                    let fp64 = match subtype {
+                        FixlenType::Fp32 => {
+                            if elem_len != 4 {
+                                return Err(Error::InvalidMsg);
                             }
-                            FixlenType::Fp64 => {
-                                if elem_len != 8 {
-                                    return Err(Error::InvalidMsg);
-                                }
-                                true
+                            false
+                        }
+                        FixlenType::Fp64 => {
+                            if elem_len != 8 {
+                                return Err(Error::InvalidMsg);
                             }
-                            _ => return Err(Error::InvalidMsg),
-                        };
-                        v.array_begin(id, ArrayKind::Fixlen, count as usize);
+                            true
+                        }
+                        _ => return Err(Error::InvalidMsg),
+                    };
+                    v.array_begin(id, ArrayKind::Fixlen, count as usize);
+                    if count > 0 {
                         self.resume = Resume::ArrayFix {
                             id,
                             fp64,
