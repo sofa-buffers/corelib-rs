@@ -286,17 +286,17 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     /// Write an array of 32-bit floats.
     ///
-    /// A zero-count fixlen array carries **no `fixlen_word` and no payload** — it
-    /// encodes as exactly `[ header ][ element_count = 0 ]` (§4.8).
+    /// A fixlen array **always** carries its `fixlen_word` (the shared element
+    /// subtype/width word), even when the array is empty — a zero-count fixlen
+    /// array encodes as `[ header ][ element_count = 0 ][ fixlen_word ]` with no
+    /// payload, so an empty fp32 array is distinguishable from an empty fp64
+    /// array on the wire (§4.8).
     pub fn write_array_fp32(&mut self, id: Id, data: &[f32]) -> Result<()> {
         if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
         self.write_id_type(id, T_FIXLENARRAY)?;
         self.write_varint(data.len() as Unsigned)?;
-        if data.is_empty() {
-            return Ok(());
-        }
         self.write_varint((4 << 3) | FixlenType::Fp32 as Unsigned)?;
         for &e in data {
             self.push_raw(&e.to_le_bytes())?;
@@ -306,17 +306,17 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     /// Write an array of 64-bit floats.
     ///
-    /// A zero-count fixlen array carries **no `fixlen_word` and no payload** — it
-    /// encodes as exactly `[ header ][ element_count = 0 ]` (§4.8).
+    /// A fixlen array **always** carries its `fixlen_word` (the shared element
+    /// subtype/width word), even when the array is empty — a zero-count fixlen
+    /// array encodes as `[ header ][ element_count = 0 ][ fixlen_word ]` with no
+    /// payload, so an empty fp64 array is distinguishable from an empty fp32
+    /// array on the wire (§4.8).
     pub fn write_array_fp64(&mut self, id: Id, data: &[f64]) -> Result<()> {
         if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
         self.write_id_type(id, T_FIXLENARRAY)?;
         self.write_varint(data.len() as Unsigned)?;
-        if data.is_empty() {
-            return Ok(());
-        }
         self.write_varint((8 << 3) | FixlenType::Fp64 as Unsigned)?;
         for &e in data {
             self.push_raw(&e.to_le_bytes())?;

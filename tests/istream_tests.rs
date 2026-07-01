@@ -185,8 +185,7 @@ fn streaming_chunked_feed_matches_oneshot() {
 
 #[test]
 fn decode_zero_count_arrays() {
-    // A zero-count array is a valid empty array on the wire (§4.7/§4.8): exactly
-    // [ header ][ count = 0 ], with no fixlen_word for the fixlen kind.
+    // A zero-count integer array is exactly [ header ][ count = 0 ] (§4.7).
     assert_eq!(
         decode(&[0x03, 0x00]),
         [Event::ArrayBegin(0, ArrayKind::Unsigned, 0)]
@@ -195,14 +194,20 @@ fn decode_zero_count_arrays() {
         decode(&[0x04, 0x00]),
         [Event::ArrayBegin(0, ArrayKind::Signed, 0)]
     );
+    // A zero-count fixlen array still carries its fixlen_word (0x20 = fp32,
+    // 0x41 = fp64), but no payload (§4.8).
     assert_eq!(
-        decode(&[0x05, 0x00]),
+        decode(&[0x05, 0x00, 0x20]),
         [Event::ArrayBegin(0, ArrayKind::Fixlen, 0)]
     );
-    // A zero-count fixlen array is followed directly by the next field — no
+    assert_eq!(
+        decode(&[0x05, 0x00, 0x41]),
+        [Event::ArrayBegin(0, ArrayKind::Fixlen, 0)]
+    );
+    // A zero-count fixlen array is followed directly by the next field once its
     // fixlen_word is consumed.
     assert_eq!(
-        decode(&[0x05, 0x00, 0x00, 0x2A]),
+        decode(&[0x05, 0x00, 0x20, 0x00, 0x2A]),
         [
             Event::ArrayBegin(0, ArrayKind::Fixlen, 0),
             Event::Unsigned(0, 42),
