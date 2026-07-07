@@ -36,12 +36,6 @@ harness = false
 name = "bench"
 harness = false
 
-# A hand-written stand-in for what the `generator` repo emits: a generated-object
-# layer (dead-simple serialize/deserialize + streaming) built purely on the
-# corelib streaming primitives (ARCHITECTURE §6.1).
-[[example]]
-name = "person"
-
 # No Cargo feature flags: every wire type is always compiled in and the scalar
 # value type is always 64-bit. This is the high-speed build — it does not trade
 # wire-type granularity or value range for footprint.
