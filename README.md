@@ -26,16 +26,33 @@ other `corelib-*` port.
 > [`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std) is
 > `#![no_std]`, heap-free and size-optimized for microcontrollers. **This** crate
 > is the opposite trade-off: `std`, allocate freely, go as fast as possible. The
-> public API is the same, so code moves between them with at most a profile change.
+> public API mirrors the no_std crate, so code moves between them with at most a
+> profile change. See [Choosing between the two Rust corelibs](#choosing-between-the-two-rust-corelibs).
 
-**Minimum Rust version:** 1.70. **Install:**
+### Requirements
+
+- **Rust 1.70 or newer** (crate `rust-version`), Rust **edition 2021**.
+- Builds on `std`. No embedded / `no_std` target is supported here — use
+  `corelib-rs-no-std` for that.
+
+### Dependencies
+
+**None at runtime** — the library depends only on the standard library. The only
+external crates are dev-only: `libc` (process CPU clock for the benchmarks) and
+`serde_json` (parsing the shared cross-language test vectors). Neither is pulled
+into a build that merely depends on this crate.
+
+### Package name
+
+The crate is published on crates.io as **`sofa-buffers-corelib`**, but the
+importable namespace is **`sofab`**:
 
 ```bash
 cargo add sofa-buffers-corelib   # the crates.io package name…
 ```
 
 ```rust
-use sofab::{OStream, decode}; // …the importable namespace is `sofab`
+use sofab::{OStream, decode};    // …the importable namespace is `sofab`
 ```
 
 The wire format is specified, language-neutrally, in the
@@ -54,25 +71,28 @@ This library implements SofaBuffers **API version 1** (exposed as
 
 | Goal | How |
 |------|-----|
-| Streaming **out** | [`OStream`] writes into a caller buffer and calls a [`Flush`] sink whenever it fills, so a message can far exceed the buffer; `buffer_set` swaps the buffer mid-stream. |
-| Streaming **in** | [`IStream::feed`] takes arbitrarily small chunks and suspends/resumes at *any* byte boundary; string/blob payloads are delivered incrementally so they too can exceed RAM. |
-| Zero unnecessary copies | The one-shot [`decode`] path parses straight from the input buffer and hands string/blob fields back as **borrowed slices** (no copy). `feed` only ever copies the few bytes of a field that genuinely straddles a chunk boundary. |
-| Low allocation on the hot path | Per-field encode/decode allocates nothing; the encoder writes into a caller buffer, and the decoder dispatches into a monomorphized [`Visitor`] (no `dyn`, no boxing). |
-| Raw speed | `unsafe` pointer-advancing varint decode with an unchecked fast region, bulk `copy_from_slice`, native little-endian loads, `#[inline]` hot path / `#[cold]` error path, and an `-O3` + fat-LTO release profile. |
+| Streaming **out** | `OStream` writes into a caller buffer and calls a `Flush` sink whenever it fills, so a message can far exceed the buffer; `buffer_set` swaps the buffer mid-stream. |
+| Streaming **in** | `IStream::feed` takes arbitrarily small chunks and suspends/resumes at *any* byte boundary; string/blob payloads are delivered incrementally so they too can exceed RAM. |
+| Zero unnecessary copies | The one-shot `decode` path parses straight from the input buffer and hands string/blob fields back as **borrowed slices** (no copy). `feed` only ever copies the few bytes of a field that genuinely straddles a chunk boundary. |
+| Low allocation on the hot path | Per-field encode/decode allocates nothing; the encoder writes into a caller buffer, and the decoder dispatches into a monomorphized `Visitor` (no `dyn`, no boxing). |
+| Raw speed | `unsafe` pointer-advancing varint decode with an unchecked fast region, bulk `copy_from_slice`, native little-endian loads, `#[inline]` hot path / `#[cold]` error path, and an `opt-level = 3` + fat-LTO release profile. |
 | Type safety | Wire types and value widths are encoded in the Rust type system; array element widths are generic, so an invalid element size is unrepresentable. |
 | Cross-language compatibility | The shared `assets/test_vectors.json` is replayed by the test suite — the same bytes every other port produces. |
 
-## API documentation
-
-Full API docs are published to **GitHub Pages** on every push to `main` (see the
-**Docs** badge above): <https://sofa-buffers.github.io/corelib-rs/>.
-
 ## Usage
 
-```rust
-use sofab::{OStream, decode, Visitor, Id, Unsigned, Signed};
+Full API docs are published to **GitHub Pages** on every push to `main` (the
+**Docs** badge above): <https://sofa-buffers.github.io/corelib-rs/>.
 
-// ---- encode (into a caller buffer) ----
+### Simple encode
+
+`OStream::new` wraps a caller-owned buffer. Each typed `write_*` returns
+`Result<()>` and never allocates; `bytes_used()` reports how many bytes were
+written.
+
+```rust
+use sofab::OStream;
+
 let mut buf = [0u8; 64];
 let used = {
     let mut os = OStream::new(&mut buf);
@@ -81,8 +101,17 @@ let used = {
     os.write_str(3, "hi").unwrap();
     os.bytes_used()
 };
+let message = &buf[..used];
+```
 
-// ---- decode (one-shot, zero-copy: push to your Visitor) ----
+### Simple decode
+
+Decoding is **push-based**: you implement `Visitor` and the decoder calls one
+method per field. `decode` runs the zero-copy fast path over a complete message.
+
+```rust
+use sofab::{decode, Visitor, Id, Unsigned, Signed};
+
 #[derive(Default)]
 struct My { a: Unsigned, b: Signed, s: String }
 impl Visitor for My {
@@ -91,36 +120,70 @@ impl Visitor for My {
     fn string(&mut self, id: Id, _total: usize, _off: usize, c: &[u8]) {
         if id == 3 { self.s.push_str(std::str::from_utf8(c).unwrap()); }
     }
-    // blob(), fp32(), fp64(), array_begin(), sequence_begin(), ... as needed
+    // blob(), fp32(), fp64(), array_begin(), sequence_begin(), … as needed
 }
+
 let mut sink = My::default();
-decode(&buf[..used], &mut sink).unwrap();
+decode(message, &mut sink).unwrap();
 assert_eq!((sink.a, sink.b, sink.s.as_str()), (42, -7, "hi"));
 ```
 
 ### Streaming a message larger than the buffer
 
+Attach a `Flush` sink (any `FnMut(&[u8])`) with `OStream::with_flush`. When the
+scratch buffer fills, its bytes are drained to the sink and writing resumes at
+the start — so the message can be arbitrarily larger than the buffer. Call
+`flush()` at the end to push the tail.
+
 ```rust
 use sofab::OStream;
-let mut scratch = [0u8; 16];                 // tiny buffer
-let mut out = Vec::new();                     // or a socket / file
-let mut os = OStream::with_flush(&mut scratch, 0, |chunk: &[u8]| out.extend_from_slice(chunk));
-for i in 0..1000u32 { os.write_unsigned(i, i as u64).unwrap(); }
-os.flush();                                   // push the tail
+
+let mut scratch = [0u8; 16];              // tiny buffer
+let mut out = Vec::new();                  // or a socket / file
+{
+    let mut os = OStream::with_flush(&mut scratch, 0, |chunk: &[u8]| {
+        out.extend_from_slice(chunk);
+    });
+    for i in 0..1000u32 { os.write_unsigned(i, i as u64).unwrap(); }
+    os.flush();                            // push whatever is still buffered
+}
 ```
 
-The decode side is symmetric — feed [`IStream`] chunks of any size:
+### OStream — the streaming output primitive
+
+`OStream<'a, F: Flush>` **is** the encoder; it always writes into a
+caller-provided `&mut [u8]`. Three constructors cover the cases:
+
+- `OStream::new(buf)` — no sink; overflow is `Error::BufferFull`.
+- `OStream::with_offset(buf, n)` — reserve `n` header bytes for a lower layer.
+- `OStream::with_flush(buf, offset, sink)` — attach a drain sink for streaming.
+
+`buffer_set(new_buf, offset)` (typically called from inside the sink) swaps the
+active buffer mid-stream, and `flush()` drains any pending bytes. `Flush` is
+implemented for every `FnMut(&[u8])` closure, and `NoFlush` is the default
+zero-sized sink.
+
+### IStream — the streaming input primitive
+
+`IStream` is the pull decoder: feed it chunks of *any* size and it
+suspends/resumes at any byte boundary, driving the same `Visitor` as `decode`.
+`finish()` asserts a clean message boundary (no half-read field, no open
+sequence); `reset()` reuses the decoder — and its carry allocation — for the
+next message.
 
 ```rust
 use sofab::{IStream, Visitor};
-# #[derive(Default)] struct Sink; impl Visitor for Sink {}
+
+#[derive(Default)] struct Sink;
+impl Visitor for Sink { /* override the callbacks you care about */ }
+
 let mut sink = Sink::default();
 let mut is = IStream::new();
-for chunk in some_byte_stream().chunks(7) {   // 7 bytes at a time, or 1, or 64k
+for chunk in some_byte_stream.chunks(7) {  // 7 bytes at a time, or 1, or 64k
     is.feed(chunk, &mut sink).unwrap();
 }
-is.finish().unwrap();                          // assert a clean message boundary
-# fn some_byte_stream() -> Vec<u8> { vec![] }
+is.finish().unwrap();                       // clean message boundary
+# let some_byte_stream: Vec<u8> = Vec::new();
 ```
 
 ### Generated objects
@@ -128,8 +191,11 @@ is.finish().unwrap();                          // assert a clean message boundar
 In the common case you never touch the raw API: the
 [`generator`](https://github.com/sofa-buffers/generator) turns a schema into
 plain typed objects with a dead-simple `serialize()` / `deserialize()` — that
-also stream in chunks. [`examples/person.rs`](examples/person.rs) is a hand-written
-stand-in showing the generated layer is buildable purely from these primitives:
+also stream in chunks. [`examples/person.rs`](examples/person.rs) is a
+hand-written stand-in showing the generated layer is buildable purely from these
+primitives (the generated `serialize()` drives an `OStream` over a small scratch
+buffer with a `Vec`-appending flush sink; `deserialize()` runs `decode` into a
+field-assembling `Visitor`):
 
 ```bash
 cargo run --example person
@@ -137,162 +203,133 @@ cargo run --example person
 
 ## API summary
 
-### Write operations
+### Encoding API
 
-**Encoder — [`OStream`]** (writes into a caller buffer). Field ids are `u32` in
-`0..=ID_MAX` (`i32::MAX`); every writer returns `Result<()>` and never allocates:
+The encoder is `OStream`. All writers follow one shape — `write_<kind>(id,
+value) -> Result<()>` — and never allocate:
 
-| Operation | Signature (value parameter) | Purpose |
-|-----------|------------------------------|---------|
-| `new` / `with_offset` / `with_flush` | `&mut [u8]` (`+ offset`, `+ sink`) | construct over a buffer; reserve a header offset; attach a flush sink |
-| `write_unsigned` / `write_signed` / `write_boolean` | `Unsigned` (`u64`) / `Signed` (`i64`) / `bool` | scalar integers (varint / zig-zag) and booleans |
-| `write_fp32` / `write_fp64` | `f32` / `f64` | little-endian IEEE-754 floats |
-| `write_str` / `write_blob` | `&str` / `&[u8]` | UTF-8 text (no NUL on the wire) / raw bytes |
-| `write_fixlen` | `&[u8]`, [`FixlenType`] | low-level fixed-length write (the primitive the four above build on) |
-| `write_array_unsigned` / `write_array_signed` | `&[T: UnsignedElem]` / `&[T: SignedElem]` | integer arrays — element type generic (see [Allowed types](#allowed-types)) |
-| `write_array_fp32` / `write_array_fp64` | `&[f32]` / `&[f64]` | float arrays with a single shared descriptor |
-| `write_sequence_begin` / `write_sequence_end` | `Id` / — | open / close a nested sequence |
-| `flush` / `buffer_set` / `bytes_used` | — / `&mut [u8]` / — | drain pending bytes; swap the output buffer mid-stream; bytes written |
+- **Scalars:** `write_unsigned` (`u64`, varint), `write_signed` (`i64`,
+  zig-zag varint), `write_boolean`, `write_fp32` / `write_fp64` (little-endian
+  IEEE-754).
+- **Length-delimited:** `write_str` (`&str`, UTF-8, no NUL on the wire),
+  `write_blob` (`&[u8]`). `write_fixlen` is the low-level primitive the four
+  float/text writers build on.
+- **Arrays:** `write_array_unsigned` / `write_array_signed` are generic over the
+  element width; `write_array_fp32` / `write_array_fp64` take float slices. A
+  **zero-count array is valid** and encodes as an empty array on the wire.
+- **Nested sequences:** `write_sequence_begin(id)` / `write_sequence_end()`,
+  balanced and capped at `MAX_DEPTH` (255).
 
-Empty integer/float arrays are rejected (`Error::Argument`); empty strings/blobs
-are valid.
+Field ids are `u32` in `0..=ID_MAX` (`i32::MAX`); an out-of-range id, an
+over-`MAX_DEPTH` sequence, or a length/count above `i32::MAX` returns
+`Error::Argument`. The scalar API is fixed-width — always `u64`/`i64` and
+`f32`/`f64`; this build does not parameterize the scalar width. Only the integer
+arrays are generic, over the sealed-by-construction `UnsignedElem`
+(`u8`/`u16`/`u32`/`u64`) and `SignedElem` (`i8`/`i16`/`i32`/`i64`) traits, so any
+other element type is a compile error. Narrow elements are zero-/sign-extended to
+64-bit on the wire, so the decode side always reports array elements as
+`u64`/`i64` (the original width is not carried). A fixlen array may hold only
+`Fp32`/`Fp64` elements; a `Str`/`Blob` element width is rejected on decode
+(`Error::InvalidMsg`) — use a nested sequence of string/blob fields instead.
 
-### Read operations
+### Decoding API
 
-Decoding is **push-based**: there is no `read_xxx()` that returns a value.
-Instead you implement [`Visitor`] and the decoder calls one method per decoded
-field. Two entry points drive the same `Visitor`:
+Decoding is **push / visitor** based — there is no `read_xxx()` that returns a
+value. You implement `Visitor` (every method has a default no-op body, so
+overriding only the ones you care about **auto-skips** the rest) and drive it
+through one of two entry points onto the **same** visitor:
 
-| Operation | Purpose |
-|-----------|---------|
-| `decode(bytes, visitor)` | one-shot, zero-copy decode of a complete message |
-| `IStream::new` / `feed(chunk, visitor)` / `finish` / `reset` | streaming decode: feed any-size chunks; assert a clean end; reuse the decoder |
+- `decode(bytes, &mut visitor)` — one-shot, zero-copy decode of a complete,
+  contiguous message.
+- `IStream::new()` + `feed(chunk, &mut visitor)` + `finish()` (+ `reset()`) —
+  streaming decode of any-size chunks, with a clean-boundary assertion and reuse.
 
-Every value reaches the caller through one of these `Visitor` callbacks (all have
-a default empty body, so overriding only the ones you care about **skips** the
-rest — the equivalent of the C decoder's auto-skip):
-
-| Callback | Destination type handed to you | Delivers |
-|----------|--------------------------------|----------|
-| `unsigned(id, value)` | `Unsigned` (`u64`), by value | an unsigned scalar **or** an unsigned-array element |
-| `signed(id, value)` | `Signed` (`i64`), by value | a signed scalar **or** a signed-array element |
-| `fp32(id, value)` | `f32`, by value | an `fp32` scalar **or** an `fp32`-array element |
-| `fp64(id, value)` | `f64`, by value | an `fp64` scalar **or** an `fp64`-array element |
-| `string(id, total, offset, chunk)` | `chunk: &[u8]`, **borrowed** | a slice of a string field (raw bytes; not validated as UTF-8 by the library) |
-| `blob(id, total, offset, chunk)` | `chunk: &[u8]`, **borrowed** | a slice of a blob field |
-| `array_begin(id, kind, count)` | [`ArrayKind`], `count: usize` | the header of an array; its `count` elements then arrive via the scalar/float callbacks above, all with the same `id` |
-| `sequence_begin(id)` / `sequence_end()` | `Id` / — | nested-sequence framing (open / close) |
-
-`total` is the full field length and `offset` is this chunk's byte position
-within the field; on the contiguous [`decode`] path a string/blob always arrives
-in a **single** call (`offset == 0`, `chunk.len() == total`). There is no
-distinct "skip" call — a field whose callback is left at the default is simply
-not delivered.
-
-### Allowed types
-
-The scalar API is fixed-width: `write_unsigned`/`Visitor::unsigned` are always
-`u64` and `write_signed`/`Visitor::signed` always `i64` (`Unsigned` / `Signed`);
-this build does not parameterize the scalar width. Floats are `f32` / `f64`.
-
-Only the **integer-array writers are generic**, over the element width:
-
-- `write_array_unsigned<T: UnsignedElem>` — `T ∈ {u8, u16, u32, u64}`
-- `write_array_signed<T: SignedElem>` — `T ∈ {i8, i16, i32, i64}`
-
-These are the only impls of the sealed-by-construction `UnsignedElem` /
-`SignedElem` traits, so any other element type is a compile error. Elements are
-zero-/sign-extended to 64-bit on the wire, so the *decode* side always reports
-array elements as `u64` / `i64` (the original narrower width is not carried).
-Float arrays are not generic: `write_array_fp32` / `write_array_fp64` take
-`&[f32]` / `&[f64]`.
-
-Fixed-length fields ([`FixlenType`]) are `Fp32`, `Fp64`, `Str`, `Blob`. A
-**fixlen array may only hold `Fp32` or `Fp64` elements** — a `Str`/`Blob`
-element width is rejected as `Error::InvalidMsg` on decode (variable-length
-subtypes are not representable as fixed-stride array elements; use a nested
-sequence of string/blob fields instead). Array element counts and fixlen byte
-lengths are capped at `i32::MAX`.
+The callbacks are `unsigned` / `signed` / `fp32` / `fp64` (by value),
+`string` / `blob` (a **borrowed** `&[u8]` chunk, with `total` field length and
+`offset` within the field), `array_begin(id, kind, count)` followed by the
+element values through the scalar/float callbacks under the same `id`, and
+`sequence_begin` / `sequence_end`. On the contiguous `decode` path a string/blob
+always arrives in a **single** call (`offset == 0`, `chunk.len() == total`); over
+`feed` it may be delivered in pieces.
 
 ### Memory handling
 
 The high-speed `std` build allocates freely for *speed*, but the encode/decode
-hot path is deliberately allocation-free and **never owns your payload memory**:
+hot path is deliberately allocation-free and **never owns your payload memory**.
 
-| Path | Who owns the buffer | Copy vs. borrow |
-|------|---------------------|-----------------|
-| **Encode** | The **caller** owns the output buffer (`&mut [u8]`). The library never allocates or grows it. | Bytes are written straight into your buffer. With no flush sink, overflow is `Error::BufferFull`; with a [`Flush`] sink the full buffer is drained to the sink and writing resumes at the start (`buffer_set` can even swap in a fresh buffer mid-stream). To collect into a growable `Vec`, drive a small scratch buffer with a flush closure that appends — *you* own the `Vec`. |
-| **Decode — scalars/floats** | n/a (passed by value) | `unsigned`/`signed`/`fp32`/`fp64` receive a copied value; nothing is retained by the decoder. |
-| **Decode — string/blob** | The **caller's `Visitor`** owns any retained bytes. The library allocates **no** `String`/`Vec` for payloads. | The `chunk: &[u8]` is a **borrow**, valid only for the duration of the callback. On the [`decode`] / self-contained-chunk fast path it borrows directly from your input buffer (zero copy); across a `feed` chunk boundary it borrows from a small internal carry buffer. If you want to keep the data, **copy it out inside the callback** (e.g. `String::push_str`, `Vec::extend_from_slice`). |
-| **Decode — arrays/sequences** | n/a | Array elements stream through the scalar/float callbacks one at a time; the decoder holds only `O(1)` resume state, never a materialized array. |
+| Item | Owner / lifetime | Copy vs. borrow |
+|------|------------------|-----------------|
+| **Input buffer** | The **caller** owns it; it must outlive the `decode` / `feed` call. | Read in place. On the `decode` fast path and self-contained `feed` chunks, string/blob slices borrow directly from it (zero copy). |
+| **Output buffer** | The **caller** owns the `&mut [u8]`; the library never allocates or grows it. | Written in place. With no sink, overflow is `Error::BufferFull`; with a `Flush` sink the buffer is drained and reused (`buffer_set` can swap in a fresh one). To collect into a growable `Vec`, drive a small scratch buffer with a flush closure that appends — *you* own the `Vec`. |
+| **Message object** | Your **`Visitor`** owns whatever it retains. The library allocates **no** `String`/`Vec` for payloads. | Scalars/floats are passed by value. A `string`/`blob` `&[u8]` chunk is a **borrow valid only during the callback** — copy it out (`String::push_str`, `Vec::extend_from_slice`) to keep it. |
 
-This is a **push / visitor** model, **not** lazy binding: the decoder hands each
-value to your `Visitor` as it is parsed, rather than recording a destination
-pointer to be filled by a later `feed()`. Consequently there is no
-address-stability requirement on any destination beyond the `&mut Visitor` you
-pass in (which must, of course, outlive the `decode` / `feed` call). The only
-memory the decoder itself owns is `IStream`'s internal carry `Vec`, which holds
-just the few bytes of a small item (header / varint / float) that straddled a
-chunk boundary; long string/blob payloads are streamed, never buffered, and
-`reset` reuses the carry allocation across messages.
+This is a **push / visitor** model, not lazy binding: the decoder hands each
+value to your `Visitor` as it is parsed rather than recording a destination
+pointer to be filled later, so there is no address-stability requirement beyond
+the `&mut Visitor` outliving the call. The only memory the decoder itself owns is
+`IStream`'s internal carry `Vec`, which holds just the few bytes of a small item
+(header / varint / float) that straddled a chunk boundary; long string/blob
+payloads are streamed, never buffered, and `reset` reuses the carry allocation
+across messages.
 
 ## Feature flags
 
-This is the **high-speed `std` build**: every wire type is always compiled in and
-the scalar value type is always 64-bit (`u64`/`i64`), so it never trades wire-type
-granularity or value range for footprint. There are therefore **no Cargo feature
-flags** to set — the toggle set described in the spec (§5.3) lives in the
-trimmable, `#![no_std]` sibling crate instead.
-
-| Feature flag | Default | Effect |
-|--------------|---------|--------|
-| *(none)* | — | All wire types (unsigned/signed integers, fp32, fp64, string, blob, integer arrays, float arrays, nested sequences) are always on; the value type is always 64-bit. |
+**No Cargo feature flags — always the full format.** Every wire type
+(unsigned/signed integers, fp32, fp64, string, blob, integer arrays, float
+arrays, nested sequences) is always compiled in, and the scalar value type is
+always 64-bit (`u64`/`i64`). This is the high-speed build: it never trades
+wire-type granularity or value range for footprint.
 
 ```toml
 sofa-buffers-corelib = "0.1"   # nothing to configure (import as `use sofab::…`)
 ```
 
-For the trimmable build — drop fixlen / fp64 / array / sequence support, switch to
-a 32-bit value type, or disable overflow checks to shrink the footprint for
-constrained targets — use
-[`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std), whose
-Cargo features cover those toggles.
+The trimmable toggles — drop fixlen / fp64 / array / sequence support, switch to
+a 32-bit value type, or disable overflow checks to shrink the footprint — live in
+the sibling [`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std)
+crate, whose Cargo features cover them.
 
 ## Build & test
 
 ```bash
 cargo build                      # debug
-cargo build --release            # optimized
+cargo build --release            # optimized (opt-level 3, fat LTO)
 cargo test                       # unit + integration + doctests (incl. shared vectors)
 ./coverage.sh                    # llvm-cov: terminal summary + HTML + lcov.info
 ```
+
+CI (`.github/workflows/ci.yml`) runs fmt + clippy (`-D warnings`), the full test
+suite on **stable** and **beta**, the same suite on a **big-endian** s390x host
+under QEMU (proving the little-endian wire format round-trips off little-endian
+hardware), and llvm-cov line coverage (which publishes the coverage badge).
 
 Tests live in `tests/` as separate integration files:
 
 - `vectors_tests.rs` — replays the shared `assets/test_vectors.json` (encode,
   chunked-encode through 1/3/7-byte flush buffers, decode, chunked-decode, and
   `skip_ids` auto-skip).
-- `reader_tests.rs` — the fast [`decode`] path: matches the streaming path on
-  every shared vector, asserts zero-copy single-call string/blob delivery, and
-  rejects truncated input.
+- `reader_tests.rs` — the fast `decode` path: matches the streaming path on every
+  shared vector, asserts zero-copy single-call string/blob delivery, and rejects
+  truncated input.
 - `ostream_tests.rs` — encoder, byte-exact vs. reference vectors.
 - `istream_tests.rs` — decoder over the same vectors + malformed-input errors.
 - `roundtrip_tests.rs` — encode → decode value preservation.
 - `api_tests.rs` — offset reserve, buffer swap, large chunked streaming, API version.
 - `config_tests.rs` — per-wire-type encode → decode smoke tests.
-- `tests/common/mod.rs` — shared recording [`Visitor`].
+- `tests/common/mod.rs` — shared recording `Visitor`.
 
 ## Benchmarks
 
-Two tools mirror the cross-language benchmark suite
+Two `cargo bench` tools mirror the cross-language benchmark suite
 ([`BENCH_SPEC.md`](https://github.com/sofa-buffers/documentation/blob/main/BENCH_SPEC.md))
-and run the **same** reference workloads (a 1000-element `u64` array and a
-typical composite message), printing the exact shared output grammar so results
-are comparable across ports. This repo's tools are the **golden reference** for
-that format.
+and run the **same** reference workloads (a 1000-element `u64` array and a typical
+composite message), printing the exact shared output grammar so results are
+comparable across ports. This repo's tools are the **golden reference** for that
+format.
 
-`perf` — CPU-speed-independent per-operation cost: hardware cycles/op (x86 TSC /
-AArch64 counter) plus CPU ns/op and throughput, over a ~1 s CPU-time loop:
+`perf` — CPU-speed-independent per-operation cost: hardware cycles/op (x86 TSC via
+`_rdtsc`, AArch64 virtual count register) plus CPU ns/op and throughput, over a
+~1 s CPU-time loop:
 
 ```bash
 cargo bench --bench perf
@@ -311,35 +348,37 @@ For the last few percent of throughput, build with native codegen:
 RUSTFLAGS="-C target-cpu=native" cargo bench
 ```
 
-### `std` vs `no_std`: how the two Rust ports compare
+## Choosing between the two Rust corelibs
 
-`corelib-rs` (this crate, built on `std`) and the freestanding
-[`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std) port
-implement the **same SofaBuffers API** and run the **identical** `perf` and
-`bench` tools — so the numbers reflect the two implementations, not the
-benchmark. Crucially, each is built **the way it is meant to ship**, which is
-the comparison that actually matters:
+SofaBuffers ships **two** Rust corelibs with the **same API** and the **same wire
+format**, each built the way it is meant to ship:
 
-- **`corelib-rs` — tuned for raw speed:** `opt-level = 3`, fat LTO,
-  `codegen-units = 1`.
-- **`corelib-rs-no-std` — full features, tuned for a small `.text`:**
-  `opt-level = "z"`, LTO, `codegen-units = 1` (its release profile).
+- **`corelib-rs` (this crate)** — `std`, heap-using, `opt-level = 3` + fat LTO.
+  For **desktop and server** workloads where throughput is the goal and an
+  allocator is a given. It is the golden reference for the benchmark tools and,
+  in the multi-language benchmark arena, runs at roughly **1.4× prost
+  throughput**.
+- **[`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std)** —
+  `#![no_std]`, **no allocator**, `opt-level = "z"` + LTO, size-tuned for
+  **bare-metal firmware** on microcontrollers where `std` cannot build at all. In
+  the arena it runs at about **1.13× micropb throughput** at a bare-metal
+  Cortex-M flash footprint of roughly **6.0 KB vs micropb's ~8.5 KB**.
 
-So this is a **speed-optimized vs size-optimized** comparison, by design.
-Median of 15 runs on a single 6-core x86-64 VM (median is robust to the VM's
-run-to-run jitter); `cycles/op` lower is better, MB/s higher is better.
+Because both implement the identical API and run the identical `perf` / `bench`
+tools, the choice is purely the deployment target — throughput vs footprint, not
+features:
 
-| Workload | `std` cycles/op | `no_std` cycles/op | `std` MB/s | `no_std` MB/s | `std` faster |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| serialize — typical message (170 B)   |  3,178 |   4,835 | 149.5 |  98.3 | 1.5× |
-| deserialize — typical message (170 B) |  3,600 |   5,636 | 132.2 |  84.3 | 1.6× |
-| encode — `u64` array ×1000 (9,491 B)  | 39,614 |  91,272 | 670.7 | 290.6 | 2.3× |
-| decode — `u64` array ×1000 (9,491 B)  | 32,152 | 178,368 | 825.1 | 148.7 | 5.5× |
+| | `corelib-rs` (this crate) | `corelib-rs-no-std` |
+|---|---|---|
+| Target | desktop / server | microcontroller / firmware |
+| `std` / allocator | requires `std`, uses the heap | `#![no_std]`, **no** allocation |
+| Release profile | `opt-level = 3`, fat LTO | `opt-level = "z"`, LTO (size-tuned) |
+| Optimized for | raw throughput | small `.text` footprint |
+| Configurable format | no — always full format | Cargo features trim wire types / value width |
+| Arena reference | ~1.4× prost throughput | ~1.13× micropb throughput; Cortex-M flash ~6.0 KB vs ~8.5 KB |
 
-**In plain terms:** the speed-tuned `std` build is faster on every workload, and
-the lead **grows with payload size** — about 1.5× on a small typical message,
-2.3× encoding a 1000-element `u64` array, and up to **5.5×** decoding one. That
-is exactly the intended trade-off: `corelib-rs` spends code size to go fast,
-while `corelib-rs-no-std` gives up that throughput for a tiny, allocator-free
-binary that runs on microcontrollers where `std` cannot build at all. Pick this
-crate for servers and throughput; pick `no_std` for embedded and footprint.
+Pick **this crate** for servers and throughput; pick **`corelib-rs-no-std`** for
+embedded and footprint. Because the public API mirrors between them, moving code
+across is at most a profile change. The head-to-head figures above come from the
+multi-language benchmark arena (best-of-5, comparable only within a language) and
+are approximate.
