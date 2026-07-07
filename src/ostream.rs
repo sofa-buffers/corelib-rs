@@ -8,8 +8,8 @@
 //!
 //! For the common server case where you just want the bytes in a growable `Vec`,
 //! drive a small scratch buffer with a flush closure that appends to the `Vec`
-//! (see `examples/person.rs`) — that is the back end of the generated-object
-//! `serialize()` helper (ARCHITECTURE §6.1).
+//! — that is the back end of the generated-object `serialize()` helper
+//! (ARCHITECTURE §6.1).
 
 use crate::error::{Error, Result};
 use crate::types::*;
