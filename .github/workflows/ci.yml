@@ -15,7 +15,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
         with:
           components: rustfmt, clippy
@@ -32,7 +32,7 @@ jobs:
       matrix:
         toolchain: [stable, beta]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
         with:
           toolchain: ${{ matrix.toolchain }}
@@ -45,7 +45,7 @@ jobs:
     name: Test (big-endian, s390x)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
       - uses: taiki-e/install-action@cross
       - run: cross test --target s390x-unknown-linux-gnu --verbose
@@ -57,7 +57,7 @@ jobs:
     permissions:
       contents: write   # push the badge JSON to the `badges` branch
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
         with:
           components: llvm-tools-preview
