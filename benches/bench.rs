@@ -85,6 +85,49 @@ fn encode_typical(os: &mut OStream) {
     os.write_sequence_end().unwrap();
 }
 
+// ---- Callgrind workload entry points --------------------------------------
+// Each function performs *exactly one* operation and is `#[inline(never)]` +
+// `#[unsafe(no_mangle)]`, so `bench/run_callgrind.sh` can run
+//   valgrind --tool=callgrind --collect-atstart=no --toggle-collect=run_<w>
+// and collect the instructions retired (Ir) for a single op — a deterministic,
+// machine-independent per-op cost. `black_box` keeps the op from being elided
+// or const-folded. Setup (encoding the decode inputs) happens in `main` before
+// the call, so it stays outside the collected region.
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+pub fn run_encode_u64_array(src: &[u64], out: &mut [u8]) -> usize {
+    let mut os = OStream::new(out);
+    os.write_array_unsigned(1, black_box(src)).unwrap();
+    black_box(os.bytes_used())
+}
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+pub fn run_encode_typical(out: &mut [u8]) -> usize {
+    let mut os = OStream::new(out);
+    encode_typical(&mut os);
+    black_box(os.bytes_used())
+}
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+pub fn run_decode_u64_array(wire: &[u8]) -> u64 {
+    let mut sink = Checksum::default();
+    let mut is = IStream::new();
+    is.feed(black_box(wire), &mut sink).unwrap();
+    black_box(sink.acc)
+}
+
+#[inline(never)]
+#[unsafe(no_mangle)]
+pub fn run_decode_typical(wire: &[u8]) -> u64 {
+    let mut sink = Checksum::default();
+    let mut is = IStream::new();
+    is.feed(black_box(wire), &mut sink).unwrap();
+    black_box(sink.acc)
+}
+
 /// Run `body` repeatedly until ~1 s of CPU time has elapsed (after one warm-up
 /// call) and return throughput in MB/s for a message of `bytes` bytes.
 fn measure(bytes: usize, mut body: impl FnMut()) -> f64 {
@@ -125,6 +168,33 @@ fn main() {
 
     let ba = enc_u64_used;
     let bt = typ_used;
+
+    // Callgrind mode: `bench <workload>` performs exactly one op of <workload>
+    // and exits, so run_callgrind.sh can toggle collection around the run_*
+    // symbol. `BYTES=<n>` on stderr feeds the table's size column. The decode
+    // inputs (u64_buf/typ_buf) were encoded above — outside the collected op.
+    if let Some(w) = std::env::args().nth(1) {
+        let mut enc_u64_out = vec![0u8; N * 11 + 16];
+        let mut enc_typ_out = [0u8; 256];
+        let bytes = match w.as_str() {
+            "encode_u64_array" => run_encode_u64_array(&src, &mut enc_u64_out),
+            "encode_typical" => run_encode_typical(&mut enc_typ_out),
+            "decode_u64_array" => {
+                run_decode_u64_array(&u64_buf);
+                u64_buf.len()
+            }
+            "decode_typical" => {
+                run_decode_typical(&typ_buf);
+                typ_buf.len()
+            }
+            other => {
+                eprintln!("unknown workload: {other}");
+                std::process::exit(2);
+            }
+        };
+        eprintln!("BYTES={bytes}");
+        return;
+    }
 
     // Encode targets (reused across iterations; allocation is outside the loop).
     let mut enc_u64_out = vec![0u8; N * 11 + 16];
