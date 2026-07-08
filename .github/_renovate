@@ -1,0 +1,33 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "timezone": "Europe/Berlin",
+  "schedule": ["before 6am on monday"],
+  "labels": ["dependencies"],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"]
+  },
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions bumps (workflows + .github/actions/rust composite) into one PR.",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Group the Cargo dev-dependencies (libc, serde_json); the library itself is dependency-free.",
+      "matchManagers": ["cargo"],
+      "matchDepTypes": ["dev-dependencies"],
+      "groupName": "cargo dev-dependencies"
+    },
+    {
+      "description": "Devcontainer base image (.devcontainer/Dockerfile -> ubuntu).",
+      "matchManagers": ["dockerfile"],
+      "groupName": "devcontainer image"
+    }
+  ]
+}
