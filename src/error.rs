@@ -41,6 +41,25 @@ pub enum Error {
     /// A streaming [`crate::IStream::feed`] returns this whenever a chunk ends
     /// mid-field; the one-shot [`crate::decode`] returns it for truncated input.
     Incomplete,
+
+    /// A receiver-configured decode limit was exceeded — a dynamic (unbounded)
+    /// field carried more than the maximum element count or byte length the
+    /// receiver is willing to accept (`max_dyn_array_count`, `max_dyn_string_len`,
+    /// `max_dyn_blob_len`). Corresponds to `SOFAB_RET_E_LIMIT_EXCEEDED` and the
+    /// no_std port's `Error::LimitExceeded`.
+    ///
+    /// This is **policy, not wire malformation**, and is therefore deliberately
+    /// distinct from [`Error::InvalidMsg`]: the same bytes are perfectly valid for
+    /// a receiver with a higher (or no) limit. Two backends configured with
+    /// different limits must not read a limit rejection as a wire-conformance
+    /// divergence. It is a hard decode error — the message is rejected, never
+    /// clamped or truncated — and this crate never sets a default limit.
+    ///
+    /// This corelib itself does **not** enforce any limit: the values are
+    /// configured in sofabgen and baked into the generated decode visitor, which
+    /// checks the count/length exposed by the decode callbacks *before* allocating
+    /// and reports a violation as this category. See sofa-buffers/generator#102.
+    LimitExceeded,
 }
 
 impl core::fmt::Display for Error {
@@ -51,6 +70,7 @@ impl core::fmt::Display for Error {
             Error::BufferFull => "output buffer full and no flush sink set",
             Error::InvalidMsg => "malformed SofaBuffers message",
             Error::Incomplete => "incomplete SofaBuffers message (ends mid-field)",
+            Error::LimitExceeded => "receiver-configured decode limit exceeded",
         };
         f.write_str(msg)
     }

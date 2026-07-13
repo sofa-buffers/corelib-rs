@@ -140,6 +140,37 @@ fn three_outcomes_are_distinct() {
     assert_eq!(dec(&[0x00, 0x2A]), Ok(()));
 }
 
+/// A receiver-configured decode-limit violation (`LimitExceeded`) is policy, not
+/// wire malformation, so it must be a category of its own — distinguishable from
+/// every other outcome and, above all, from `InvalidMsg`. Enforcement lives in
+/// generated code (sofa-buffers/generator#102); this corelib only owns the
+/// category, so the guarantee under test is purely that the variant is distinct.
+#[test]
+fn limit_exceeded_is_distinct_from_invalid_msg() {
+    // The whole point: exceeding a receiver limit is not malformation. The same
+    // bytes are valid for a receiver with a higher (or no) limit, so a differential
+    // fuzzer must never conflate the two.
+    assert_ne!(Error::LimitExceeded, Error::InvalidMsg);
+
+    // And distinct from every other decode outcome, too.
+    for other in [
+        Error::Argument,
+        Error::Usage,
+        Error::BufferFull,
+        Error::InvalidMsg,
+        Error::Incomplete,
+    ] {
+        assert_ne!(Error::LimitExceeded, other);
+    }
+
+    // Its Display text is its own, so logs/telemetry can tell a policy rejection
+    // apart from a malformed message.
+    assert_ne!(
+        Error::LimitExceeded.to_string(),
+        Error::InvalidMsg.to_string()
+    );
+}
+
 /// `Error` renders via `Display` and is a `std::error::Error` (the std-only
 /// addition over the no_std port).
 #[test]
@@ -150,6 +181,7 @@ fn error_display_and_std_error() {
         Error::BufferFull,
         Error::InvalidMsg,
         Error::Incomplete,
+        Error::LimitExceeded,
     ] {
         let s = format!("{e}");
         assert!(!s.is_empty(), "{e:?} has empty Display");
