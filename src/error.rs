@@ -23,11 +23,24 @@ pub enum Error {
     /// Corresponds to `SOFAB_RET_E_BUFFER_FULL`.
     BufferFull,
 
-    /// The input bytes are not a valid Sofab message (varint overflow, bad type
-    /// tag, oversized length/count, dangling sequence end, nesting past
-    /// [`crate::MAX_DEPTH`], truncated message, …).
+    /// The input bytes are not a valid Sofab message *regardless of what follows*
+    /// (varint overflow, bad type tag, oversized length/count, dangling sequence
+    /// end, nesting past [`crate::MAX_DEPTH`], wrong fixlen length/subtype,
+    /// invalid UTF-8, …).
     /// Corresponds to `SOFAB_RET_E_INVALID_MSG`.
+    ///
+    /// This is distinct from [`Error::Incomplete`]: a truncated message is *not*
+    /// malformed, it is merely unfinished. See MESSAGE_SPEC §7.
     InvalidMsg,
+
+    /// The consumed bytes end **inside** a field — a partial varint (continuation
+    /// bit set with no terminating byte), a fixlen/array payload shorter than
+    /// declared, or an open (unclosed) sequence. This is the third decode outcome
+    /// (MESSAGE_SPEC §7): not an error in the sense of malformed input — the
+    /// caller owns end-of-input and may feed more bytes to complete the message.
+    /// A streaming [`crate::IStream::feed`] returns this whenever a chunk ends
+    /// mid-field; the one-shot [`crate::decode`] returns it for truncated input.
+    Incomplete,
 }
 
 impl core::fmt::Display for Error {
@@ -37,6 +50,7 @@ impl core::fmt::Display for Error {
             Error::Usage => "invalid API usage",
             Error::BufferFull => "output buffer full and no flush sink set",
             Error::InvalidMsg => "malformed SofaBuffers message",
+            Error::Incomplete => "incomplete SofaBuffers message (ends mid-field)",
         };
         f.write_str(msg)
     }

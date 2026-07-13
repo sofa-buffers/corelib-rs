@@ -139,10 +139,15 @@ assert_eq!((sink.a, sink.b, sink.s.as_str()), (42, -7, "hi"));
 
 `IStream::feed` takes chunks of any size, suspends/resumes at any byte boundary,
 and drives the same `Visitor` — so it decodes whatever the transport hands you,
-wherever it comes from. `finish()` asserts a clean message boundary:
+wherever it comes from. It reports one of three outcomes for the bytes seen so
+far (MESSAGE_SPEC §7), with **no separate finalize step**: `Ok(())` when the
+stream ends exactly at a field boundary, `Err(Error::Incomplete)` when a chunk
+ends mid-field (feed more — this is not an error), and `Err(Error::InvalidMsg)`
+for malformed bytes. `finish()` just re-reports that outcome; the caller owns
+end-of-input, so a truncated tail is `Incomplete`, never promoted to a rejection:
 
 ```rust
-use sofab::{IStream, Visitor};
+use sofab::{Error, IStream, Visitor};
 
 #[derive(Default)] struct Sink;
 impl Visitor for Sink { /* override the callbacks you care about */ }
@@ -150,9 +155,12 @@ impl Visitor for Sink { /* override the callbacks you care about */ }
 let mut sink = Sink::default();
 let mut is = IStream::new();
 for chunk in some_byte_stream.chunks(7) {  // 7 bytes at a time, or 1, or 64k
-    is.feed(chunk, &mut sink).unwrap();
+    match is.feed(chunk, &mut sink) {
+        Ok(()) | Err(Error::Incomplete) => {}   // more may follow
+        Err(e) => panic!("malformed: {e}"),
+    }
 }
-is.finish().unwrap();
+is.finish().unwrap();  // Ok only if the stream ended at a clean boundary
 # let some_byte_stream: Vec<u8> = Vec::new();
 ```
 

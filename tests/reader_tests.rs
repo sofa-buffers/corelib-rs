@@ -92,23 +92,52 @@ fn strings_delivered_zero_copy_single_call() {
     assert!(v.ok, "whole string delivered at offset 0");
 }
 
-/// A message cut off mid-field is rejected by the strict one-shot decoder, even
-/// though feeding the same bytes to a streaming decoder is fine (it just waits).
+/// A message cut off mid-field is **incomplete**, not malformed (MESSAGE_SPEC
+/// §7). The one-shot decoder surfaces `Incomplete` — distinct from `InvalidMsg` —
+/// and feeding the same prefix to a streaming decoder yields the same outcome
+/// (the caller simply feeds more).
 #[test]
-fn truncated_input_is_rejected() {
+fn truncated_input_is_incomplete_not_invalid() {
     fn dec(bytes: &[u8]) -> Result<(), Error> {
         decode(bytes, &mut Recorder::new())
     }
     // header (id0, unsigned) present, value varint missing.
-    assert_eq!(dec(&[0x00]), Err(Error::InvalidMsg));
+    assert_eq!(dec(&[0x00]), Err(Error::Incomplete));
     // string header says 5 bytes, only 2 follow.
-    assert_eq!(dec(&[0x02, 0x2A, 0x41, 0x42]), Err(Error::InvalidMsg));
+    assert_eq!(dec(&[0x02, 0x2A, 0x41, 0x42]), Err(Error::Incomplete));
     // sequence opened, never closed.
-    assert_eq!(dec(&[0x0E, 0x00, 0x2A]), Err(Error::InvalidMsg));
+    assert_eq!(dec(&[0x0E, 0x00, 0x2A]), Err(Error::Incomplete));
 
-    // ...but the streaming decoder accepts the prefix and simply waits for more.
+    // The streaming decoder reports the same outcome on the bare prefix — it is
+    // not accepted (Ok) and not rejected (InvalidMsg): it waits for more.
     let mut sink = Recorder::new();
-    assert!(IStream::new().feed(&[0x00], &mut sink).is_ok());
+    assert_eq!(
+        IStream::new().feed(&[0x00], &mut sink),
+        Err(Error::Incomplete)
+    );
+}
+
+/// The three decode outcomes (MESSAGE_SPEC §7) are distinct: a lone dangling
+/// continuation byte is Incomplete, an over-long (>64-bit) varint is InvalidMsg,
+/// and a whole message is Complete (`Ok`).
+#[test]
+fn three_outcomes_are_distinct() {
+    fn dec(bytes: &[u8]) -> Result<(), Error> {
+        decode(bytes, &mut Recorder::new())
+    }
+    // A lone 0x80: a varint header with the continuation bit set and no
+    // terminating byte — ends mid-field → INCOMPLETE.
+    assert_eq!(dec(&[0x80]), Err(Error::Incomplete));
+
+    // 0x00 header (id0, unsigned) then 11 continuation bytes: the value varint
+    // exceeds 64 bits → malformed regardless of what follows → INVALID.
+    assert_eq!(
+        dec(&[0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80]),
+        Err(Error::InvalidMsg)
+    );
+
+    // id0 unsigned = 42, ending exactly at a field boundary → COMPLETE.
+    assert_eq!(dec(&[0x00, 0x2A]), Ok(()));
 }
 
 /// `Error` renders via `Display` and is a `std::error::Error` (the std-only
@@ -120,6 +149,7 @@ fn error_display_and_std_error() {
         Error::Usage,
         Error::BufferFull,
         Error::InvalidMsg,
+        Error::Incomplete,
     ] {
         let s = format!("{e}");
         assert!(!s.is_empty(), "{e:?} has empty Display");

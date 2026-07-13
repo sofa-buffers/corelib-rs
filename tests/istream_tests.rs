@@ -164,20 +164,29 @@ fn streaming_chunked_feed_matches_oneshot() {
     ];
     let oneshot = decode(&msg);
 
-    // Feed one byte at a time.
+    // Feed one byte at a time. Intermediate chunks end mid-field and so return
+    // Incomplete; only a malformed byte would be an error.
     let mut rec = Recorder::new();
     let mut is = IStream::new();
     for b in msg {
-        is.feed(&[b], &mut rec).unwrap();
+        match is.feed(&[b], &mut rec) {
+            Ok(()) | Err(Error::Incomplete) => {}
+            Err(e) => panic!("feed failed: {e}"),
+        }
     }
+    is.finish().unwrap();
     assert_eq!(rec.events, oneshot);
 
     // Feed in awkward 3-byte chunks.
     let mut rec2 = Recorder::new();
     let mut is2 = IStream::new();
     for chunk in msg.chunks(3) {
-        is2.feed(chunk, &mut rec2).unwrap();
+        match is2.feed(chunk, &mut rec2) {
+            Ok(()) | Err(Error::Incomplete) => {}
+            Err(e) => panic!("feed failed: {e}"),
+        }
     }
+    is2.finish().unwrap();
     assert_eq!(rec2.events, oneshot);
 }
 
@@ -218,11 +227,12 @@ fn decode_zero_count_arrays() {
 #[test]
 fn nesting_beyond_max_depth_is_invalid() {
     // 255 nested sequence-start bytes (id 0 -> 0x06) are accepted; the 256th
-    // exceeds MAX_DEPTH and must be rejected (§4.9, §6.2).
+    // exceeds MAX_DEPTH and must be rejected (§4.9, §6.2). 255 *open* sequences
+    // is a valid-but-unfinished message: Incomplete, not an error.
     let ok: Vec<u8> = vec![0x06; sofab::MAX_DEPTH as usize];
     let mut rec = Recorder::new();
     let mut is = IStream::new();
-    assert!(is.feed(&ok, &mut rec).is_ok());
+    assert_eq!(is.feed(&ok, &mut rec), Err(Error::Incomplete));
 
     let too_deep: Vec<u8> = vec![0x06; sofab::MAX_DEPTH as usize + 1];
     let mut rec2 = Recorder::new();

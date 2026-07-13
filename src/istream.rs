@@ -131,8 +131,20 @@ impl IStream {
 
     /// Feed a chunk of encoded bytes, pushing decoded fields to `visitor`.
     ///
-    /// Returns [`Error::InvalidMsg`] on malformed input. Decoding can continue
-    /// across many `feed` calls; the decoder keeps all state internally.
+    /// Surfaces the three decode outcomes of MESSAGE_SPEC §7 for the bytes
+    /// consumed so far — **there is no separate finalize step**:
+    ///
+    /// * `Ok(())` — **complete**: the consumed bytes end exactly at a field
+    ///   boundary (a whole, valid message so far).
+    /// * [`Err(Error::Incomplete)`](Error::Incomplete) — the bytes end **inside**
+    ///   a field: a partial varint, a payload shorter than declared, or an open
+    ///   sequence. This is *not* a rejection; the decoder keeps all state
+    ///   internally, so the caller simply feeds the next chunk to continue.
+    /// * [`Err(Error::InvalidMsg)`](Error::InvalidMsg) — the bytes are malformed
+    ///   regardless of what follows and decoding cannot continue.
+    ///
+    /// The distinction matters: a truncated tail returns `Incomplete`, never
+    /// `InvalidMsg`. The caller — not the decoder — owns end-of-input.
     pub fn feed<V: Visitor>(&mut self, chunk: &[u8], visitor: &mut V) -> Result<()> {
         if self.carry.is_empty() {
             // Fast path: parse straight from the caller's slice, no copy.
@@ -148,17 +160,35 @@ impl IStream {
             buf.drain(..consumed);
             self.carry = buf;
         }
-        Ok(())
-    }
-
-    /// Assert the decoder is at a clean message boundary: no half-read field, no
-    /// open sequence. Used by [`decode`] to reject truncated input.
-    pub fn finish(&self) -> Result<()> {
-        let clean = self.carry.is_empty() && matches!(self.resume, Resume::None) && self.depth == 0;
-        if clean {
+        if self.at_boundary() {
             Ok(())
         } else {
-            Err(Error::InvalidMsg)
+            // Ended mid-field / mid-payload / inside an open sequence: distinct
+            // from both COMPLETE (Ok) and INVALID (InvalidMsg). Not a rejection.
+            Err(Error::Incomplete)
+        }
+    }
+
+    /// True when the decoder sits at a clean message boundary: no half-read
+    /// field carried over, no in-progress payload/array, no open sequence.
+    fn at_boundary(&self) -> bool {
+        self.carry.is_empty() && matches!(self.resume, Resume::None) && self.depth == 0
+    }
+
+    /// Report the current decode outcome without consuming more input.
+    ///
+    /// Returns `Ok(())` when the decoder is at a clean message boundary, or
+    /// [`Err(Error::Incomplete)`](Error::Incomplete) when the stream so far ends
+    /// mid-field or inside an open sequence. It is a pure accessor of the current
+    /// state and **never** promotes an unfinished message to
+    /// [`Error::InvalidMsg`]: truncation is not malformed, and the caller owns
+    /// end-of-input (MESSAGE_SPEC §7). `feed` already exposes the same outcome, so
+    /// calling `finish` is optional.
+    pub fn finish(&self) -> Result<()> {
+        if self.at_boundary() {
+            Ok(())
+        } else {
+            Err(Error::Incomplete)
         }
     }
 
@@ -465,11 +495,18 @@ fn emit_fixlen_value<V: Visitor>(buf: &[u8], pos: usize, fp64: bool, id: Id, v: 
     }
 }
 
-/// Decode a complete, contiguous message in one shot — the fast zero-copy path.
+/// Decode a contiguous message in one shot — the fast zero-copy path.
 ///
-/// `buf` must contain the entire message. Every field is pushed to `visitor`;
-/// string/blob payloads are delivered as a single borrowed slice with no copy.
-/// Returns [`Error::InvalidMsg`] if the bytes are truncated or malformed.
+/// `buf` is treated as the bytes available so far. Every field is pushed to
+/// `visitor`; string/blob payloads are delivered as a single borrowed slice with
+/// no copy. Surfaces the three outcomes of MESSAGE_SPEC §7 — there is no separate
+/// finalize step:
+///
+/// * `Ok(())` — the buffer is a complete message ending at a field boundary.
+/// * [`Err(Error::Incomplete)`](Error::Incomplete) — the buffer ends inside a
+///   field or with an open sequence (truncated). Not malformed; more bytes would
+///   complete it.
+/// * [`Err(Error::InvalidMsg)`](Error::InvalidMsg) — the bytes are malformed.
 ///
 /// ```
 /// use sofab::{OStream, decode, Visitor, Id, Unsigned};
@@ -484,7 +521,8 @@ fn emit_fixlen_value<V: Visitor>(buf: &[u8], pos: usize, fp64: bool, id: Id, v: 
 /// assert_eq!(sink.0, 42);
 /// ```
 pub fn decode<V: Visitor>(buf: &[u8], visitor: &mut V) -> Result<()> {
-    let mut is = IStream::new();
-    is.feed(buf, visitor)?;
-    is.finish()
+    // `feed` itself surfaces all three outcomes for the bytes consumed, so a
+    // single feed of the whole buffer is the complete verdict — no separate
+    // finish step (which would only re-report the same state).
+    IStream::new().feed(buf, visitor)
 }
