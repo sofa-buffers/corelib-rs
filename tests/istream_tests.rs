@@ -278,3 +278,48 @@ fn fp32_with_wrong_length_is_invalid() {
     let mut is = IStream::new();
     assert_eq!(is.feed(&bytes, &mut rec), Err(Error::InvalidMsg));
 }
+
+#[test]
+fn reserved_fixlen_subtype_is_invalid() {
+    // A FIXLEN field (wire tag 2) whose fixlen word carries a reserved subtype
+    // tag (0x4). Only 0x0..=0x3 are defined; FixlenType::from_raw rejects
+    // 0x4..=0x7 with InvalidMsg (§7). Word = (len 4 << 3) | subtype 0x4 = 0x24.
+    let mut rec = Recorder::new();
+    let mut is = IStream::new();
+    assert_eq!(
+        is.feed(&[0x02, (4 << 3) | 0x04], &mut rec),
+        Err(Error::InvalidMsg)
+    );
+
+    // Mirror inside a FIXLENARRAY (wire tag 5): header, count = 1, then the
+    // reserved fixlen word. The array's fixlen_word must decode to a valid
+    // float subtype; a reserved tag is rejected the same way.
+    let mut rec2 = Recorder::new();
+    let mut is2 = IStream::new();
+    assert_eq!(
+        is2.feed(&[0x05, 0x01, (4 << 3) | 0x04], &mut rec2),
+        Err(Error::InvalidMsg)
+    );
+}
+
+#[test]
+fn oversized_count_or_length_is_invalid() {
+    // An unsigned varint array (wire tag 3) whose count exceeds ARRAY_MAX
+    // (i32::MAX): count = i32::MAX + 1 must be rejected before any element is
+    // read (the `count > ARRAY_MAX` guard), not treated as Incomplete.
+    let mut bytes = vec![0x03];
+    push_varint(&mut bytes, i32::MAX as u64 + 1); // one past ARRAY_MAX
+    let mut rec = Recorder::new();
+    let mut is = IStream::new();
+    assert_eq!(is.feed(&bytes, &mut rec), Err(Error::InvalidMsg));
+
+    // A FIXLEN string (wire tag 2) whose declared length exceeds ARRAY_MAX:
+    // fixlen word = (len << 3) | Str(0x2), len = i32::MAX + 1. Rejected by the
+    // `(word >> 3) > ARRAY_MAX` guard, again distinct from Incomplete.
+    let mut bytes2 = vec![0x02];
+    let word = ((i32::MAX as u64 + 1) << 3) | 0x02; // Str subtype, oversized len
+    push_varint(&mut bytes2, word);
+    let mut rec2 = Recorder::new();
+    let mut is2 = IStream::new();
+    assert_eq!(is2.feed(&bytes2, &mut rec2), Err(Error::InvalidMsg));
+}
