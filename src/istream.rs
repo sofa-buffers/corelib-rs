@@ -171,25 +171,15 @@ impl IStream {
 
     /// True when the decoder sits at a clean message boundary: no half-read
     /// field carried over, no in-progress payload/array, no open sequence.
+    ///
+    /// There is deliberately **no** public `finish`/`finalize`: the three-valued
+    /// verdict is obtained solely from [`feed`](Self::feed)'s return value at
+    /// every byte boundary, keeping the decode surface identical across every
+    /// `corelib-*` port (MESSAGE_SPEC §7). To probe end-of-input without more
+    /// bytes, feed an empty chunk — `feed(&[], v)` returns `Ok(())` iff the
+    /// stream ended at a clean boundary, `Err(Incomplete)` otherwise.
     fn at_boundary(&self) -> bool {
         self.carry.is_empty() && matches!(self.resume, Resume::None) && self.depth == 0
-    }
-
-    /// Report the current decode outcome without consuming more input.
-    ///
-    /// Returns `Ok(())` when the decoder is at a clean message boundary, or
-    /// [`Err(Error::Incomplete)`](Error::Incomplete) when the stream so far ends
-    /// mid-field or inside an open sequence. It is a pure accessor of the current
-    /// state and **never** promotes an unfinished message to
-    /// [`Error::InvalidMsg`]: truncation is not malformed, and the caller owns
-    /// end-of-input (MESSAGE_SPEC §7). `feed` already exposes the same outcome, so
-    /// calling `finish` is optional.
-    pub fn finish(&self) -> Result<()> {
-        if self.at_boundary() {
-            Ok(())
-        } else {
-            Err(Error::Incomplete)
-        }
     }
 
     /// Parse as many complete fields as possible from `buf`, returning the number

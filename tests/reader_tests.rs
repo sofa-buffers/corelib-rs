@@ -196,12 +196,12 @@ fn istream_reset_reuses_decoder() {
     let mut is = IStream::new();
     let mut a = Recorder::new();
     is.feed(&[0x00, 0x2A], &mut a).unwrap(); // id0 unsigned 42
-    is.finish().unwrap();
+    is.feed(&[], &mut a).unwrap(); // clean boundary => Ok
 
     is.reset();
     let mut b = Recorder::new();
     is.feed(&[0x08, 0x07], &mut b).unwrap(); // id1 unsigned 7
-    is.finish().unwrap();
+    is.feed(&[], &mut b).unwrap(); // clean boundary => Ok
 
     assert_eq!(a.events.len(), 1);
     assert_eq!(b.events.len(), 1);
