@@ -143,8 +143,10 @@ wherever it comes from. It reports one of three outcomes for the bytes seen so
 far (MESSAGE_SPEC §7), with **no separate finalize step**: `Ok(())` when the
 stream ends exactly at a field boundary, `Err(Error::Incomplete)` when a chunk
 ends mid-field (feed more — this is not an error), and `Err(Error::InvalidMsg)`
-for malformed bytes. `finish()` just re-reports that outcome; the caller owns
-end-of-input, so a truncated tail is `Incomplete`, never promoted to a rejection:
+for malformed bytes. There is no separate finalize step; the caller owns
+end-of-input, so a truncated tail is `Incomplete`, never promoted to a rejection.
+To probe whether the stream ended cleanly, feed an empty chunk: `feed(&[], …)`
+returns `Ok(())` iff the last byte landed on a field boundary:
 
 ```rust
 use sofab::{Error, IStream, Visitor};
@@ -160,7 +162,7 @@ for chunk in some_byte_stream.chunks(7) {  // 7 bytes at a time, or 1, or 64k
         Err(e) => panic!("malformed: {e}"),
     }
 }
-is.finish().unwrap();  // Ok only if the stream ended at a clean boundary
+is.feed(&[], &mut sink).unwrap();  // Ok only if the stream ended at a clean boundary
 # let some_byte_stream: Vec<u8> = Vec::new();
 ```
 

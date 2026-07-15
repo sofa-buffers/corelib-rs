@@ -67,7 +67,8 @@ fn large_blob_streams_in_small_chunks() {
             Err(e) => panic!("blob stream feed failed: {e}"),
         }
     }
-    is.finish().expect("blob stream ended mid-message");
+    is.feed(&[], &mut rec)
+        .expect("blob stream ended mid-message");
     assert_eq!(rec.events, [Event::Blob(7, data)]);
 }
 

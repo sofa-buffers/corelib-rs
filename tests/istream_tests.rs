@@ -174,7 +174,7 @@ fn streaming_chunked_feed_matches_oneshot() {
             Err(e) => panic!("feed failed: {e}"),
         }
     }
-    is.finish().unwrap();
+    is.feed(&[], &mut rec).unwrap(); // clean boundary => Ok
     assert_eq!(rec.events, oneshot);
 
     // Feed in awkward 3-byte chunks.
@@ -186,7 +186,7 @@ fn streaming_chunked_feed_matches_oneshot() {
             Err(e) => panic!("feed failed: {e}"),
         }
     }
-    is2.finish().unwrap();
+    is2.feed(&[], &mut rec2).unwrap(); // clean boundary => Ok
     assert_eq!(rec2.events, oneshot);
 }
 

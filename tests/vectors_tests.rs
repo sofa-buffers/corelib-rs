@@ -313,7 +313,7 @@ fn decode_one_byte_at_a_time(bytes: &[u8]) -> Vec<Event> {
             Err(e) => panic!("chunked decode failed: {e}"),
         }
     }
-    is.finish().expect("stream ended mid-message");
+    is.feed(&[], &mut rec).expect("stream ended mid-message"); // clean boundary
     rec.events
 }
 
@@ -441,7 +441,7 @@ fn decode_with_skip_chunked(bytes: &[u8], skip: &[Id]) -> Vec<Event> {
             Err(e) => panic!("skip chunked decode failed: {e}"),
         }
     }
-    is.finish().expect("stream ended mid-message");
+    is.feed(&[], &mut rec).expect("stream ended mid-message"); // clean boundary
     rec.events
 }
 
