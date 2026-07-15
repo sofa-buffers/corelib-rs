@@ -13,20 +13,17 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Cover all feature-gated code paths.
-FEATURES="--all-features"
-
-echo ">> Running tests with coverage instrumentation ($FEATURES) ..."
+echo ">> Running tests with coverage instrumentation ..."
 cargo llvm-cov clean --workspace
-cargo llvm-cov $FEATURES --html        # detailed HTML report
-cargo llvm-cov $FEATURES --summary-only # text summary to stdout
+cargo llvm-cov --html        # detailed HTML report
+cargo llvm-cov --summary-only # text summary to stdout
 
 # Machine-readable LCOV for CI upload (Codecov/Coveralls/etc.).
-cargo llvm-cov $FEATURES --no-run >/dev/null 2>&1 || true
-cargo llvm-cov report $FEATURES --lcov --output-path lcov.info
+cargo llvm-cov --no-run >/dev/null 2>&1 || true
+cargo llvm-cov report --lcov --output-path lcov.info
 echo ">> HTML report: target/llvm-cov/html/index.html"
 echo ">> LCOV:        lcov.info"
 
 if [[ "${1:-}" == "--open" ]]; then
-  cargo llvm-cov $FEATURES --open
+  cargo llvm-cov --open
 fi
