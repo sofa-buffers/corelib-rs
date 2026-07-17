@@ -47,6 +47,13 @@ pub trait Visitor {
     /// this is called once with `total == 0` and an empty `chunk`. The
     /// contiguous [`decode`] path always delivers the whole string in a single
     /// call (`offset == 0`, `chunk.len() == total`).
+    ///
+    /// The bytes are delivered **raw**: the corelib does not validate UTF-8 or
+    /// build a `str`/`String`. A strict consumer (generated code) materializes
+    /// the field with `core::str::from_utf8` and reports invalid bytes as
+    /// [`Error::InvalidMsg`] — never replacing them with `U+FFFD` or truncating
+    /// (MESSAGE_SPEC §8, CORELIB_PLAN §6.4). `blob` payloads (below) are opaque
+    /// and never UTF-8-checked.
     fn string(&mut self, id: Id, total: usize, offset: usize, chunk: &[u8]) {}
 
     /// A chunk of a blob field. See [`Visitor::string`] for the chunking model.

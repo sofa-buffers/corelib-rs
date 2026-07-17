@@ -64,6 +64,28 @@ use sofab::{OStream, decode};
 | Type safety | Wire types and value widths live in the type system; array element widths are generic, so an invalid element size is unrepresentable. |
 | Cross-language compatibility | The shared `assets/test_vectors.json` is replayed — the same bytes every other port produces. |
 
+### String validity (strict UTF-8)
+
+A `string` field is UTF-8. Rust's `str`/`String` is a **Unicode string type**,
+so this port is **always strict** — the `SOFAB_STRICT_UTF8` option
+(CORELIB_PLAN §6.4) is a **no-op here, pinned ON**, and there is no primitive to
+expose (only byte-container targets need one):
+
+- **Encode is strict by construction.** `OStream::write_str` takes `&str`, which
+  is already guaranteed valid UTF-8 by the type system, so a `string` field can
+  never carry invalid bytes — no runtime check is possible or needed. Put
+  arbitrary bytes in a `blob` (`write_blob`).
+- **Decode strictness lives in generated code.** The corelib hands a `string`
+  field's **raw bytes** to `Visitor::string` and never builds a `String`;
+  generated code materializes it with `core::str::from_utf8`, turning invalid
+  bytes into `Error::InvalidMsg` (the `INVALID` decode outcome). Invalid UTF-8 is
+  **rejected, never replaced** with `U+FFFD` or truncated. Embedded `U+0000` is
+  valid UTF-8 and round-trips byte-exact. This matches `corelib-rs-no-std`
+  exactly (subsumes generator #80).
+
+The shared `invalid_utf8` negative vectors in `assets/test_vectors.json`
+(tracking corelib-c-cpp#97) are exercised by `tests/utf8_tests.rs`.
+
 ## Usage
 
 The codec has four use cases — serialize a message that fits in one buffer,
