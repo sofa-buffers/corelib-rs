@@ -239,6 +239,12 @@ impl<'a, F: Flush> OStream<'a, F> {
     }
 
     /// Write a string field (raw UTF-8 bytes, no NUL on the wire).
+    ///
+    /// The input is `&str`, so it is **already valid UTF-8** by the type system
+    /// — encode is strict by construction and can never emit non-UTF-8 bytes
+    /// (MESSAGE_SPEC §8, CORELIB_PLAN §6.4). For arbitrary bytes use
+    /// [`OStream::write_blob`]. Embedded `U+0000` is permitted and written
+    /// verbatim (the wire is length-framed, no NUL terminator).
     #[inline]
     pub fn write_str(&mut self, id: Id, text: &str) -> Result<()> {
         self.write_fixlen(id, text.as_bytes(), FixlenType::Str)
