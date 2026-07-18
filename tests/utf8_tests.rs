@@ -26,7 +26,7 @@ mod common;
 
 use common::{Event, Recorder};
 use serde_json::Value;
-use sofab::{decode, IStream, Error, OStream};
+use sofab::{decode, Error, IStream, OStream};
 
 /// The shared vectors, embedded from the verbatim asset copy.
 const VECTORS_JSON: &str = include_str!("../assets/test_vectors.json");
