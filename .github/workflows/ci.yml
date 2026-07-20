@@ -22,15 +22,16 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
 
-  # Build + full test suite on the two Rust release channels:
-  #   stable = what users build with today; beta = next release, for early warning.
+  # Build + full test suite against stable compilers only — no beta, no nightly.
+  #   stable             = whatever is current on the day the job runs
+  #   1.97 / 1.96 / 1.95 = the three most recent releases, pinned
   test:
     name: Test (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        toolchain: [stable, beta]
+        toolchain: ["stable", "1.97", "1.96", "1.95"]
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
@@ -38,6 +39,19 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo build --release --verbose
       - run: cargo test --verbose
+
+  # The MSRV declared in Cargo.toml (`rust-version`). Library-only: the dev-
+  # dependency tree (serde_json -> zmij) needs 1.71+, so `cargo test` can't run
+  # this far back — the MSRV promise covers what users compile, not our tests.
+  msrv:
+    name: Build (MSRV 1.70)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+        with:
+          toolchain: "1.70"
+      - run: cargo build --release --verbose
 
   # Same suite on a big-endian host (IBM Z / s390x) under QEMU, proving the
   # little-endian wire format round-trips correctly off little-endian hardware.
