@@ -155,7 +155,6 @@ fn limit_exceeded_is_distinct_from_invalid_msg() {
     // And distinct from every other decode outcome, too.
     for other in [
         Error::Argument,
-        Error::Usage,
         Error::BufferFull,
         Error::InvalidMsg,
         Error::Incomplete,
@@ -177,7 +176,6 @@ fn limit_exceeded_is_distinct_from_invalid_msg() {
 fn error_display_and_std_error() {
     for e in [
         Error::Argument,
-        Error::Usage,
         Error::BufferFull,
         Error::InvalidMsg,
         Error::Incomplete,
