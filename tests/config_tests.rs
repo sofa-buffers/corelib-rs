@@ -219,7 +219,7 @@ fn sequence_roundtrip() {
     let mut buf = [0u8; 64];
     let used = {
         let mut os = OStream::new(&mut buf);
-        os.write_sequence_begin(1).unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
         os.write_unsigned(2, 99).unwrap();
         os.write_sequence_end().unwrap();
         os.bytes_used()

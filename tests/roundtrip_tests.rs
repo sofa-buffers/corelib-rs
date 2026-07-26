@@ -111,7 +111,7 @@ fn deep_nested_sequences_roundtrip() {
     let ev = roundtrip(|os| {
         os.write_unsigned(0, 1).unwrap();
         for _ in 0..5 {
-            os.write_sequence_begin(1).unwrap();
+            os.write_sequence_begin_lazy(1).unwrap();
             os.write_unsigned(0, 42).unwrap();
         }
         for _ in 0..5 {

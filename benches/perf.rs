@@ -100,7 +100,7 @@ fn perf_encode(buf: &mut [u8]) -> usize {
     os.write_array_unsigned(9, &PERF_SAMPLES).unwrap();
     os.write_array_signed(10, &PERF_DELTAS).unwrap();
     os.write_array_fp64(11, &PERF_FP64).unwrap();
-    os.write_sequence_begin(12).unwrap();
+    os.write_sequence_begin_lazy(12).unwrap();
     os.write_unsigned(1, 99).unwrap();
     os.write_signed(2, -7).unwrap();
     os.write_sequence_end().unwrap();

@@ -263,7 +263,7 @@ fn write_array_of_fp64() {
 fn write_nested_sequence() {
     let bytes = encode(|os| {
         os.write_unsigned(0, 42).unwrap();
-        os.write_sequence_begin(1).unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
         os.write_unsigned(0, 42).unwrap();
         os.write_signed(2, -42).unwrap();
         os.write_sequence_end().unwrap();
@@ -279,7 +279,7 @@ fn write_nested_sequence() {
 fn write_nested_sequence_with_array() {
     let bytes = encode(|os| {
         os.write_unsigned(0, 42).unwrap();
-        os.write_sequence_begin(3).unwrap();
+        os.write_sequence_begin_lazy(3).unwrap();
         os.write_unsigned(0, 42).unwrap();
         os.write_array_signed(3, &[-42_i32, -43, -44]).unwrap();
         os.write_sequence_end().unwrap();
@@ -289,6 +289,120 @@ fn write_nested_sequence_with_array() {
         bytes,
         [0x00, 0x2A, 0x1E, 0x00, 0x2A, 0x1C, 0x03, 0x53, 0x55, 0x57, 0x07, 0x11, 0x53]
     );
+}
+
+// --- lazy sequence framing (MESSAGE_SPEC §2) --------------------------------
+
+/// An all-default sequence carries no information, so the field is omitted --
+/// where the eager API would have written the two-byte empty frame `0E 07`.
+#[test]
+fn lazy_sequence_without_content_emits_nothing() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert!(bytes.is_empty(), "got {bytes:02x?}");
+}
+
+/// `end_keep` forces a contentless frame onto the wire — the array element and
+/// explicit-empty cases of §2/§5.1.
+#[test]
+fn end_keep_frames_a_contentless_sequence() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_end_keep().unwrap();
+    });
+    assert_eq!(bytes, [0x0E, 0x07]);
+}
+
+/// Forcing a frame forces its ancestors too: the outer sequence got content (the
+/// inner frame), so it is framed as well.
+#[test]
+fn end_keep_commits_the_enclosing_run() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_sequence_end_keep().unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(bytes, [0x0E, 0x16, 0x07, 0x07]);
+}
+
+/// With content it makes no difference — the headers are already out.
+#[test]
+fn end_keep_matches_end_once_content_exists() {
+    let with_keep = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end_keep().unwrap();
+    });
+    let with_end = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(with_keep, [0x0E, 0x00, 0x2A, 0x07]);
+    assert_eq!(with_keep, with_end);
+}
+
+/// One child field commits the whole held-back run, outermost header first, so a
+/// non-default leaf deep inside brings every enclosing frame back in wire order.
+#[test]
+fn lazy_sequence_commits_the_whole_run_on_first_content() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(bytes, [0x0E, 0x16, 0x00, 0x2A, 0x07, 0x07]);
+}
+
+/// Only the empty inner sequence drops; the outer one has content (the leaf) and
+/// is framed. This is the interleaving the naive "drop the whole run" would get
+/// wrong.
+#[test]
+fn lazy_sequence_drops_only_the_empty_inner_one() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(bytes, [0x0E, 0x00, 0x2A, 0x07]);
+}
+
+/// A lazily framed sequence *after* content in the same scope, and the sibling
+/// order, stay intact.
+#[test]
+fn lazy_sequence_after_content_is_independent() {
+    let bytes = encode(|os| {
+        os.write_unsigned(0, 1).unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_unsigned(2, 3).unwrap();
+    });
+    assert_eq!(bytes, [0x00, 0x01, 0x10, 0x03]);
+}
+
+/// Held-back headers are not in the buffer yet, so a small output buffer sees the
+/// same bytes as a big one: the chunked-encode guarantee is unaffected.
+#[test]
+fn lazy_framing_is_buffer_size_independent() {
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 3];
+    {
+        let mut os = sofab::OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d));
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+        os.flush();
+    }
+    assert_eq!(out, [0x0E, 0x00, 0x2A, 0x07]);
 }
 
 // --- error / overflow behavior ---------------------------------------------
@@ -333,12 +447,13 @@ fn sequence_depth_over_max_is_argument_error() {
     let mut os = OStream::new(&mut buf);
     // 255 nested sequences are allowed; the 256th must be rejected (§4.9).
     for _ in 0..sofab::MAX_DEPTH {
-        os.write_sequence_begin(0).unwrap();
+        os.write_sequence_begin_lazy(0).unwrap();
     }
-    assert_eq!(os.write_sequence_begin(0), Err(Error::Argument));
+    assert_eq!(os.write_sequence_begin_lazy(0), Err(Error::Argument));
+    // The empty-frame call is bounded by the same ceiling.
     // After closing one, opening one more is allowed again.
     os.write_sequence_end().unwrap();
-    os.write_sequence_begin(0).unwrap();
+    os.write_sequence_begin_lazy(0).unwrap();
 }
 
 // --- streaming flush sink ---------------------------------------------------
