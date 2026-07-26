@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     jq \
+    # valgrind backs benches/run_callgrind.sh (Callgrind instructions/op — the
+    # deterministic, machine-independent benchmark). Provides callgrind_annotate
+    # too. Without it the Ir/op benchmark can't run.
+    valgrind \
     && rm -rf /var/lib/apt/lists/*
 
 ARG RUST_VERSION=stable
