@@ -15,10 +15,6 @@ pub enum Error {
     /// sequences). Corresponds to `SOFAB_RET_E_ARGUMENT`.
     Argument,
 
-    /// Invalid API usage (e.g. a decoded value does not fit the requested type).
-    /// Corresponds to `SOFAB_RET_E_USAGE`.
-    Usage,
-
     /// The output buffer is full and no [`crate::Flush`] sink is available.
     /// Corresponds to `SOFAB_RET_E_BUFFER_FULL`.
     BufferFull,
@@ -66,7 +62,6 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let msg = match self {
             Error::Argument => "invalid argument",
-            Error::Usage => "invalid API usage",
             Error::BufferFull => "output buffer full and no flush sink set",
             Error::InvalidMsg => "malformed SofaBuffers message",
             Error::Incomplete => "incomplete SofaBuffers message (ends mid-field)",
