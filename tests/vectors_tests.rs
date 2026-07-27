@@ -30,6 +30,20 @@ use sofab::ArrayKind;
 use sofab::{Error, Flush, IStream, Id, OStream, Signed, Unsigned, Visitor};
 
 /// The shared vectors, embedded from the verbatim asset copy.
+///
+/// **Which column this repo asserts:** `serialized` — the primitive-layer ground
+/// truth, every sequence framed. That is the only form a corelib can produce or
+/// consume: it has no message layer, so it never sees a field's declared default
+/// and cannot decide that a sequence is all-default.
+///
+/// The file's sibling `serialized_sparse` column (present on every vector here,
+/// read by nothing here) is the **message-layer** form of MESSAGE_SPEC §2, where
+/// an all-default sequence-typed field is omitted. It is exercised by the
+/// generator's conformance drivers (`tests/conformance/<lang>/` in
+/// sofa-buffers/generator), which own the schema and thus the defaults. The
+/// corelib primitive that makes that form reachable — dropping a contentless
+/// frame — is tested directly in `tests/ostream_tests.rs`
+/// ("lazy sequence framing"), not through this file.
 const VECTORS_JSON: &str = include_str!("../assets/test_vectors.json");
 
 // --- requires / capability gating -------------------------------------------

@@ -59,7 +59,7 @@ use sofab::{OStream, decode};
 | Streaming **out** | `OStream` writes into a caller buffer and calls a `Flush` sink when it fills, so a message can exceed the buffer; `buffer_set` swaps the buffer mid-stream. |
 | Streaming **in** | `IStream::feed` takes arbitrarily small chunks and suspends/resumes at any byte boundary; string/blob payloads are delivered incrementally. |
 | Zero unnecessary copies | `decode` parses straight from the input buffer, handing string/blob fields back as borrowed slices; `feed` copies only bytes that straddle a chunk boundary. |
-| Low allocation | Per-field encode/decode allocates nothing; the decoder dispatches into a monomorphized `Visitor` (no `dyn`, no boxing). |
+| Low allocation | Per-field encode/decode allocates nothing; the decoder dispatches into a monomorphized `Visitor` (no `dyn`, no boxing). The encoder's only heap use is the run of held-back sequence headers (see [Sequences](#sequences)), and even that stays inline until you nest more than 8 deep. |
 | Raw speed | `unsafe` pointer-advancing varint decode, bulk `copy_from_slice`, native little-endian loads, `#[inline]`/`#[cold]` hot/error split, `opt-level = 3` + fat-LTO. |
 | Type safety | Wire types and value widths live in the type system; array element widths are generic, so an invalid element size is unrepresentable. |
 | Cross-language compatibility | The shared `assets/test_vectors.json` is replayed — the same bytes every other port produces. |
@@ -96,8 +96,9 @@ path that wraps them.
 ### Serialize
 
 `OStream::new` wraps a caller-owned buffer big enough for the whole message. Each
-`write_*` returns `Result<()>`, never allocates, and `bytes_used()` reports the
-byte count:
+`write_*` returns `Result<()>`, never allocates (the one exception is nesting
+sequences more than 8 deep — see [Sequences](#sequences)), and `bytes_used()`
+reports the byte count:
 
 ```rust
 use sofab::OStream;
@@ -132,6 +133,48 @@ let mut out = Vec::new();                  // or a socket / file
     os.flush();                            // push the tail
 }
 ```
+
+### Sequences
+
+A nested sequence is opened with `write_sequence_begin_lazy(id)`, which **holds
+the header back** until the sequence turns out to have content. MESSAGE_SPEC §2
+omits a sequence-typed **field** whose value equals its declared default, and
+"not one child was written" is exactly that condition — so which of the two
+closers you use decides whether a contentless frame survives:
+
+| closer | a contentless sequence | use it for |
+|--------|------------------------|------------|
+| `write_sequence_end()` | **vanishes** — header and end marker both | a `struct`/`union` field, and an array field (the wrapper) |
+| `write_sequence_end_keep()` | is written as `begin` + `end` | a wrapper-array **element**, whose presence carries a dynamic array's length (§5.1); and an array field known to differ from a non-empty declared `default` |
+
+"A sequence is always framed" is therefore no longer true of a **field** — it is
+still true of an **element**. The choice is static, a property of the position in
+the schema rather than of the value, so generated code makes it at generation
+time. There is no eager `write_sequence_begin`; this is the only opener.
+
+```rust
+use sofab::OStream;
+
+let mut buf = [0u8; 32];
+let used = {
+    let mut os = OStream::new(&mut buf);
+    os.write_sequence_begin_lazy(1).unwrap();  // header held back
+    os.write_sequence_end().unwrap();          // no content → nothing is written
+    os.write_sequence_begin_lazy(2).unwrap();  // header held back
+    os.write_unsigned(0, 42).unwrap();         // content → commits header id 2 first
+    os.write_sequence_end().unwrap();
+    os.bytes_used()
+};
+assert_eq!(&buf[..used], &[0x16, 0x00, 0x2A, 0x07]);
+```
+
+Held-back ids are encoder state, not buffer content, so the bytes never depend on
+the output-buffer size, and a flush can never split a pending run. The run is
+**unbounded** up to `MAX_DEPTH` (255), so an all-default sequence is omitted at
+*every* legal nesting depth, not just shallow ones (CORELIB_PLAN §6: only a
+heap-free profile, such as `corelib-rs-no-std`, may bound the run and frame
+eagerly past the bound). It costs nothing to carry: the first 8 levels live
+inline in the encoder and only deeper nesting spills to the heap.
 
 ### Deserialize
 
@@ -250,7 +293,9 @@ the buffers on both sides.
   grows it. With no sink, overflow is `Error::BufferFull`; with a `Flush` sink the
   buffer drains and is reused (`buffer_set` swaps a fresh one). To collect into a
   `Vec`, drive a small scratch buffer with an appending flush closure — *you* own
-  the `Vec`.
+  the `Vec`. The encoder's own memory is the run of held-back sequence ids
+  ([Sequences](#sequences)): eight of them inline, spilling to the heap only if
+  you nest deeper than that.
 - **Decode (`decode` / `IStream` + `Visitor`):** you own the input buffer and it
   must outlive the call. On the zero-copy `decode` fast path (and self-contained
   `feed` chunks) string/blob `&[u8]` chunks **borrow** directly from it, valid
@@ -265,7 +310,9 @@ the buffers on both sides.
 This is a **push / visitor** model: values are handed to your `Visitor` as they
 are parsed, so there is no address-stability requirement. The only memory the
 decoder owns is `IStream`'s small internal carry `Vec` — the few bytes of an item
-that straddled a chunk boundary.
+that straddled a chunk boundary; on the encode side it is `OStream`'s run of
+held-back sequence ids — inline up to eight levels, spilling to a `Vec` beyond,
+never larger than the depth you actually nest to.
 
 ## Feature flags
 
@@ -279,8 +326,10 @@ cargo test                       # unit + integration + doctests (incl. shared v
 ./coverage.sh                    # llvm-cov: summary + HTML + lcov.info
 ```
 
-CI runs fmt + clippy (`-D warnings`), the full suite on **stable** and **beta**,
-the same suite on a **big-endian** s390x host under QEMU, and llvm-cov coverage.
+CI runs fmt + clippy (`-D warnings`), the full suite on **stable** and the three
+most recent pinned stable releases, a library-only build at the declared
+**MSRV 1.70**, the same suite on a **big-endian** s390x host under QEMU, and
+llvm-cov coverage.
 Integration tests live in `tests/` (shared-vector replay, fast-path decode,
 encoder/decoder byte-exact checks, round-trip, and malformed-input errors).
 
