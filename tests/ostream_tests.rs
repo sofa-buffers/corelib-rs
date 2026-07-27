@@ -540,6 +540,76 @@ fn a_cut_short_commit_keeps_its_order_across_the_spill_boundary() {
     assert_eq!(streamed, one_shot);
 }
 
+/// "Is anything held back?" must consult **both** halves of the run's storage,
+/// and the cut point that proves it is the inline/spill split itself.
+///
+/// The test above cuts the commit at three bytes, which leaves five ids inline
+/// and four spilled — `n != 0`, so answering from `n` alone still happens to be
+/// right and the bug hides. Cut instead at exactly `INLINE_PENDING` (8) of the 12
+/// headers and the surviving remainder is *entirely* in the heap spill: `n` is
+/// back to zero while `spill` still holds four ids. An encoder that reads
+/// emptiness off `n` then concludes the run is finished, so those four sequence
+/// headers never reach the wire — and later four of the `end` markers pair with
+/// them and vanish too, shortening the message from 26 bytes to 18 and changing
+/// the nesting structure a decoder sees.
+///
+/// Swept over every cut point rather than pinned to 8, so the split cannot drift
+/// out from under the test if `INLINE_PENDING` changes.
+#[test]
+fn a_cut_short_commit_knows_it_is_pending_at_every_cut_point() {
+    const DEPTH: u32 = 12; // 8 inline + 4 spilled
+
+    // Reference: the same script with room to spare.
+    let mut big = [0u8; 128];
+    let one_shot = {
+        let mut os = OStream::new(&mut big);
+        for id in 1..=DEPTH {
+            os.write_sequence_begin_lazy(id).unwrap();
+        }
+        os.write_unsigned(0, 42).unwrap();
+        for _ in 0..DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+        os.bytes_used()
+    };
+    let one_shot = big[..one_shot].to_vec();
+    // 12 single-byte headers + the 2-byte leaf + 12 end markers.
+    assert_eq!(one_shot.len(), 26);
+
+    for cut in 1..=DEPTH as usize {
+        let mut small = vec![0u8; cut];
+        let mut rest = vec![0u8; 128];
+        let (first, second) = {
+            let mut os = OStream::new(&mut small);
+            for id in 1..=DEPTH {
+                os.write_sequence_begin_lazy(id).unwrap();
+            }
+            // The run needs `DEPTH` bytes and the leaf one more, so every cut in
+            // 1..=DEPTH stops the write short.
+            assert_eq!(
+                os.write_unsigned(0, 42),
+                Err(Error::BufferFull),
+                "cut {cut}"
+            );
+            let first = os.bytes_used();
+            assert_eq!(first, cut, "cut {cut}: expected {cut} headers to fit");
+
+            // Recover into a fresh buffer and re-issue the failed write. Whatever
+            // is left of the run — inline, spilled, or purely spilled — must lead.
+            os.buffer_set(&mut rest, 0);
+            os.write_unsigned(0, 42).unwrap();
+            for _ in 0..DEPTH {
+                os.write_sequence_end().unwrap();
+            }
+            (first, os.bytes_used())
+        };
+
+        let mut streamed = small[..first].to_vec();
+        streamed.extend_from_slice(&rest[..second]);
+        assert_eq!(streamed, one_shot, "cut {cut} lost part of the run");
+    }
+}
+
 /// Nesting far deeper than the 32-level hold-back window this port used to have:
 /// all 40 frames are contentless, so the message is **zero bytes**. The eager
 /// fallback beyond the old window got exactly this wrong — levels 33..40 kept
@@ -592,8 +662,18 @@ fn deep_run_commits_every_level_outermost_first() {
 /// Both closers must give their depth back. `MAX_DEPTH` bounds how many
 /// sequences are open *at once*, not how many a message may contain, so opening
 /// and closing the full ceiling several times over — contentlessly, which is the
-/// shape §2 creates — must keep encoding. Drop the decrement from either closer
-/// and the second round's first `begin` is falsely rejected.
+/// shape §2 creates — must keep encoding.
+///
+/// Scope, precisely: every `end` round below closes its frames **contentlessly**,
+/// so `write_sequence_end` always finds a held-back header to pop and takes its
+/// *drop* path. That is one of the two depth-decrement sites in that function;
+/// this test pins that one, plus `end_keep`'s. The other site — the *emit* path,
+/// reached when the sequence had content and there is no pending header left to
+/// pop — is unreachable from here and belongs to
+/// `content_bearing_end_gives_the_depth_back` below. (An earlier commit message
+/// claimed "deleting the depth decrement from either closer fails it"; that
+/// holds for the drop site and for `end_keep`, and is false for the emit site,
+/// which this test cannot reach.)
 #[test]
 fn both_closers_give_the_depth_back() {
     let mut buf = vec![0u8; 8192];
@@ -628,6 +708,66 @@ fn both_closers_give_the_depth_back() {
         os.write_sequence_begin_lazy(1).unwrap();
     }
     assert_eq!(os.write_sequence_begin_lazy(1), Err(Error::Argument));
+}
+
+/// The **content-bearing** `end` must give its depth back too — the other half of
+/// the test above, and the busiest path in the encoder: a sequence that received
+/// content has no held-back header left to pop, so `write_sequence_end` falls
+/// through to the *emit* path, writes the end marker, and decrements there.
+///
+/// Miss that decrement and the depth ratchets up by one per closed sequence
+/// while at most one is ever open, so the counter reaches `MAX_DEPTH` after 255
+/// sequences and the 256th `begin` is falsely rejected with `Error::Argument` —
+/// on a message that nests exactly one level deep. Both shapes below fail that
+/// way: the flat one at round 255, the nested one at the second round's first
+/// `begin`.
+#[test]
+fn content_bearing_end_gives_the_depth_back() {
+    // Flat: a thousand sequences opened and closed one after another, each with
+    // a child, so never more than one is open at a time. Far past MAX_DEPTH
+    // rounds — the point being that rounds are not a depth.
+    const ROUNDS: u32 = 1000;
+    let mut buf = vec![0u8; 8192];
+    let mut os = OStream::new(&mut buf);
+    for round in 0..ROUNDS {
+        assert_eq!(
+            os.write_sequence_begin_lazy(1),
+            Ok(()),
+            "flat round {round} rejected: the depth was not given back"
+        );
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+    }
+    // Each round: held-back header committed by the child (0x0E), the child
+    // (0x00 0x2A), the end marker (0x07).
+    assert_eq!(os.bytes_used(), 4 * ROUNDS as usize);
+
+    // The ceiling is intact, not merely un-hit: still exactly MAX_DEPTH free.
+    for _ in 0..sofab::MAX_DEPTH {
+        os.write_sequence_begin_lazy(1).unwrap();
+    }
+    assert_eq!(os.write_sequence_begin_lazy(1), Err(Error::Argument));
+
+    // Nested: the full ceiling several times over, with content at the leaf so
+    // every one of the 255 `end`s takes the emit path rather than the drop path.
+    let mut buf = vec![0u8; 8192];
+    let mut os = OStream::new(&mut buf);
+    for round in 0..4 {
+        for level in 0..sofab::MAX_DEPTH {
+            assert_eq!(
+                os.write_sequence_begin_lazy(1),
+                Ok(()),
+                "nested round {round} level {level} rejected"
+            );
+        }
+        os.write_unsigned(0, 42).unwrap(); // commits all 255 held-back headers
+        for _ in 0..sofab::MAX_DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+    }
+    // Per round: 255 committed begin bytes + the 2-byte leaf + 255 end bytes.
+    let per_round = 2 * sofab::MAX_DEPTH as usize + 2;
+    assert_eq!(os.bytes_used(), 4 * per_round);
 }
 
 // --- error / overflow behavior ---------------------------------------------

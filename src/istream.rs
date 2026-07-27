@@ -17,6 +17,15 @@
 //! Both drive the same [`Visitor`]: a field handler with a default no-op for
 //! every method, so an implementor overrides only the field kinds it cares about
 //! and unhandled fields are skipped automatically.
+//!
+//! **What is absent never calls back.** A field equal to its declared default is
+//! omitted by MESSAGE_SPEC §2 — for a sequence-typed field that means the whole
+//! frame is gone, so not even [`Visitor::sequence_begin`] runs, and an all-default
+//! message is the empty byte string that produces no callbacks whatsoever. §5.1
+//! puts the matching duty on the decoding side: initialise the destination to its
+//! declared defaults *before* applying a message, never from a callback that a
+//! default-valued field will not fire. See [`Visitor::sequence_begin`] for the
+//! failure this prevents when a destination is reused across messages.
 
 use crate::error::{Error, Result};
 use crate::types::*;
@@ -28,6 +37,11 @@ use crate::{ArrayKind, FixlenType, Id, Signed, Unsigned};
 /// Every method has a default empty implementation, so an implementor overrides
 /// only the field kinds it cares about. Fields that are not handled are simply
 /// dropped (the equivalent of "not interested" / skip in the C API).
+///
+/// A field equal to its declared default is **not on the wire** (MESSAGE_SPEC
+/// §2), so no method fires for it — including whole sequences, see
+/// [`Visitor::sequence_begin`]. Initialise the destination to its defaults
+/// *before* decoding rather than from a callback (§5.1).
 #[allow(unused_variables)]
 pub trait Visitor {
     /// An unsigned integer field, or an unsigned array element.
@@ -64,6 +78,68 @@ pub trait Visitor {
     fn array_begin(&mut self, id: Id, kind: ArrayKind, count: usize) {}
 
     /// Start of a nested sequence with the given field `id`.
+    ///
+    /// **Absence is meaningful: this is not a reset hook.** MESSAGE_SPEC §2 omits
+    /// a sequence-typed *field* whose value equals its declared default, so an
+    /// all-default `struct`/`union`/array field arrives as **no callback at
+    /// all** — no `sequence_begin`, no [`Visitor::sequence_end`], no children.
+    /// (An all-default message is in turn the empty byte string, which decodes to
+    /// zero callbacks of any kind.) Clearing or preparing a destination slot from
+    /// inside this method therefore silently keeps the previous message's data
+    /// whenever the field is default, because the method never runs.
+    ///
+    /// The duty is on the decoding side, and MESSAGE_SPEC §5.1 states it
+    /// unconditionally: *before* applying a message, initialise every destination
+    /// slot to its declared default — decode into a fresh, default-constructed
+    /// destination, or reset it explicitly before [`decode`] / the first
+    /// [`IStream::feed`]. With that in place the omission is lossless by
+    /// construction: absent reconstructs to the default. Prepare it from a
+    /// callback instead and only non-default fields ever get prepared.
+    ///
+    /// A wrapper-array **element** is the one case that cuts the other way: it
+    /// keeps its frame even when all-default, because element presence is what
+    /// carries a dynamic array's length (§5.1). So `sequence_begin` does fire once
+    /// per present element — it is the enclosing *field* that can disappear.
+    ///
+    /// ```
+    /// use sofab::{decode, Id, OStream, Unsigned, Visitor};
+    ///
+    /// #[derive(Default)]
+    /// struct Dest { elems: Vec<Unsigned> }
+    /// impl Visitor for Dest {
+    ///     fn unsigned(&mut self, _id: Id, v: Unsigned) { self.elems.push(v); }
+    /// }
+    ///
+    /// // Message A: array field id 4 carrying two elements.
+    /// let mut buf = [0u8; 32];
+    /// let n = {
+    ///     let mut os = OStream::new(&mut buf);
+    ///     os.write_sequence_begin_lazy(4).unwrap();
+    ///     os.write_sequence_begin_lazy(0).unwrap();
+    ///     os.write_unsigned(0, 10).unwrap();
+    ///     os.write_sequence_end_keep().unwrap();   // elements keep their frame
+    ///     os.write_sequence_begin_lazy(1).unwrap();
+    ///     os.write_unsigned(0, 11).unwrap();
+    ///     os.write_sequence_end_keep().unwrap();
+    ///     os.write_sequence_end().unwrap();
+    ///     os.bytes_used()
+    /// };
+    /// let a = &buf[..n];
+    /// // Message B: the same field all-default. §2 omits it, so B is *empty*.
+    /// let b: &[u8] = &[];
+    ///
+    /// // Reusing a destination across messages: B calls nothing at all, so A's
+    /// // elements are still sitting there. Nothing the visitor does can fix this.
+    /// let mut reused = Dest::default();
+    /// decode(a, &mut reused).unwrap();
+    /// decode(b, &mut reused).unwrap();
+    /// assert_eq!(reused.elems, [10, 11]);   // stale: not what B means
+    ///
+    /// // Correct: the destination starts at its defaults for each message.
+    /// let mut fresh = Dest::default();
+    /// decode(b, &mut fresh).unwrap();
+    /// assert!(fresh.elems.is_empty());      // absent reconstructs to the default
+    /// ```
     fn sequence_begin(&mut self, id: Id) {}
 
     /// End of the current nested sequence.

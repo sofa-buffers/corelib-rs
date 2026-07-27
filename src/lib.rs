@@ -24,6 +24,28 @@
 //!   any byte boundary (ARCHITECTURE §5.2) yet still takes the zero-copy fast
 //!   path whenever a chunk is self-contained.
 //!
+//! ## Absence is meaningful: initialise the destination, not from a callback
+//!
+//! MESSAGE_SPEC §2 omits any field equal to its declared default — and a
+//! sequence-typed *field* is omitted whole, so an all-default
+//! `struct`/`union`/array produces **no callback at all**: no
+//! [`Visitor::sequence_begin`], no `sequence_end`, no children. An all-default
+//! message is the empty byte string and decodes to zero callbacks of any kind.
+//! (Encoding side: [`OStream::write_sequence_end`] drops such a frame,
+//! [`OStream::write_sequence_end_keep`] forces it out for a wrapper-array
+//! *element*, whose presence is what carries a dynamic array's length, §5.1.)
+//!
+//! A [`Visitor`] therefore **must not** use `sequence_begin` — or any callback —
+//! as its reset/prepare hook. MESSAGE_SPEC §5.1 puts the duty *before* the
+//! decode: initialise every destination slot to its declared default first, then
+//! let the present fields overwrite what they carry. Decode into a fresh,
+//! default-constructed destination, or reset it explicitly before [`decode`] /
+//! the first [`IStream::feed`]. Done that way the omission is lossless by
+//! construction — absent reconstructs to the default. Done from a callback, a
+//! reused destination silently keeps the previous message's values for exactly
+//! the fields the new message left at their defaults. [`Visitor::sequence_begin`]
+//! carries a runnable demonstration.
+//!
 //! ## String validity: strict UTF-8 (always on)
 //!
 //! A `string` field is UTF-8 (MESSAGE_SPEC §8). Because Rust's `str`/`String`

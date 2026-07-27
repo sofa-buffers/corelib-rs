@@ -200,6 +200,50 @@ decode(message, &mut sink).unwrap();
 assert_eq!((sink.a, sink.b, sink.s.as_str()), (42, -7, "hi"));
 ```
 
+#### Absence is meaningful — initialise the destination before you decode
+
+The flip side of [Sequences](#sequences) above: a field equal to its declared
+default is **not on the wire**, so no callback fires for it. For a
+sequence-typed *field* that means the entire frame is gone — no
+`sequence_begin`, no `sequence_end`, no children — and an all-default message is
+the empty byte string, which produces no callbacks at all.
+
+So **do not use `sequence_begin` (or any callback) as your reset/prepare hook.**
+MESSAGE_SPEC §5.1 puts the duty before the decode: initialise every destination
+slot to its declared default *first*, then let the present fields overwrite what
+they carry. Decode into a fresh, default-constructed destination, or reset it
+explicitly before `decode` / the first `feed`.
+
+The failure is silent and only shows up on a **reused** destination:
+
+```rust
+#[derive(Default)]
+struct Dest { elems: Vec<Unsigned> }
+impl Visitor for Dest {
+    // Tempting, and wrong: msg B never calls this, so the clear never happens.
+    fn sequence_begin(&mut self, id: Id) { if id == 4 { self.elems.clear(); } }
+    fn unsigned(&mut self, _id: Id, v: Unsigned) { self.elems.push(v); }
+}
+
+// a = array field id 4 with elements [10, 11];  b = the same field all-default,
+// which §2 omits entirely, so `b` is zero bytes long.
+let mut reused = Dest::default();
+decode(a, &mut reused).unwrap();
+decode(b, &mut reused).unwrap();
+assert_eq!(reused.elems, [10, 11]);   // stale — B's meaning was "empty"
+
+let mut fresh = Dest::default();      // default-initialised per message
+decode(b, &mut fresh).unwrap();
+assert!(fresh.elems.is_empty());      // absent reconstructs to the default
+```
+
+Do it the second way and the omission is lossless by construction. A
+wrapper-array **element** is the one thing that never disappears — its frame is
+kept precisely because element presence carries a dynamic array's length (§5.1),
+so `sequence_begin` does fire once per present element; it is the enclosing
+*field* that can vanish. (Runnable version: the `Visitor::sequence_begin`
+rustdoc.)
+
 ### Deserialize stream
 
 `IStream::feed` takes chunks of any size, suspends/resumes at any byte boundary,
