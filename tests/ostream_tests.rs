@@ -390,15 +390,19 @@ fn lazy_sequence_after_content_is_independent() {
 /// A run **committed across a flush boundary** produces exactly the one-shot
 /// bytes, at every output-buffer size.
 ///
-/// Note what this does *not* test, because it cannot: a flush landing while a
-/// header is still held back is unreachable by construction, not merely
-/// untested. Held-back ids are encoder state and occupy no buffer space, and the
-/// buffer only fills through a *write* — which commits the whole run before its
-/// own first byte. So a pending run can never straddle a flush. What a tiny
-/// buffer does exercise is the other half: the commit itself spilling across
-/// flushes (with a 1-byte buffer the 3-header run flushes between every header),
-/// plus a run that is dropped, re-grown and committed while the buffer keeps
-/// draining underneath it.
+/// Note what this does *not* test, and why: a *buffer-full* flush cannot land
+/// while a header is still held back. Held-back ids are encoder state and occupy
+/// no buffer space, and the buffer only fills through a *write* — which commits
+/// the whole run before its own first byte. What a tiny buffer does exercise is
+/// the other half: the commit itself spilling across flushes (with a 1-byte
+/// buffer the 3-header run flushes between every header), plus a run that is
+/// dropped, re-grown and committed while the buffer keeps draining underneath
+/// it.
+///
+/// A flush mid-run is reachable the *explicit* way, by calling
+/// [`OStream::flush`] between two writes, and that case is covered by
+/// `an_explicit_flush_mid_run_matches_one_shot` below rather than left to the
+/// argument above.
 #[test]
 fn run_committed_across_flush_boundary_matches_one_shot() {
     fn script<F: sofab::Flush>(os: &mut OStream<F>) {
@@ -429,14 +433,59 @@ fn run_committed_across_flush_boundary_matches_one_shot() {
     }
 }
 
+/// The reachable mid-run flush: the caller invokes [`OStream::flush`] itself
+/// while headers are still held back. A pending run is encoder state, not buffer
+/// content, so the flush drains what is in the buffer and the run is untouched —
+/// the bytes are the one-shot bytes, with the drained prefix landing in the sink
+/// early. Committing the run *after* the flush also proves the commit does not
+/// depend on anything the flush reset.
+#[test]
+fn an_explicit_flush_mid_run_matches_one_shot() {
+    // The same script with no flush in it, for the reference bytes.
+    let one_shot = encode(|os| {
+        os.write_unsigned(9, 1).unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(one_shot, [0x48, 0x01, 0x0E, 0x16, 0x00, 0x2A, 0x07, 0x07]);
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64];
+    let flushed_at = {
+        let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d));
+        os.write_unsigned(9, 1).unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        let n = os.flush();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_sequence_end().unwrap();
+        os.flush();
+        n
+    };
+    // The flush saw only the leaf written before the run — held-back headers
+    // occupy no buffer space.
+    assert_eq!(flushed_at, 2);
+    assert_eq!(out, one_shot);
+}
+
 /// A commit that runs out of buffer keeps the headers it could not write. With
 /// no sink, `BufferFull` stops the run half-written; the sequences still pending
 /// are the innermost ones, so installing a fresh buffer and retrying the same
 /// write finishes the run and the two buffers concatenate to exactly the
 /// one-shot bytes. (Zeroing the whole run before writing it, as an earlier draft
 /// did, silently dropped those frames instead.)
+///
+/// Scope, precisely: the ids here are 1..=4, so every header is a single byte
+/// and the cut necessarily falls *between* headers. Retrying is byte-exact only
+/// under that precondition — a cut inside a multi-byte header is not
+/// recoverable, which is what
+/// `recovery_after_a_cut_is_exact_only_on_a_header_boundary` pins.
 #[test]
-fn a_commit_cut_short_by_buffer_full_keeps_the_rest_pending() {
+fn a_commit_cut_short_on_a_header_boundary_keeps_the_rest_pending() {
     fn script<F: sofab::Flush>(os: &mut OStream<F>) -> Vec<Result<(), Error>> {
         let mut r = Vec::new();
         for id in 1..=4 {
@@ -486,6 +535,99 @@ fn a_commit_cut_short_by_buffer_full_keeps_the_rest_pending() {
     let mut streamed = small[..first].to_vec();
     streamed.extend_from_slice(&rest[..second]);
     assert_eq!(streamed, one_shot);
+}
+
+/// Where the recovery above stops. Every other cut-short test uses ids below
+/// 16, whose headers are one byte, so no cut can slice a header in half — and
+/// the recovery then looks unconditional. It is not: no writer here is atomic on
+/// failure, so a cut *inside* a header's varint leaves that prefix in the buffer
+/// while the whole header stays pending, and the retry writes it again.
+///
+/// Ids 16..=27 need a two-byte header (id 16 → tag `0x86 0x01`), so the sweep
+/// below hits both cases. Even cut points land between headers and recover
+/// byte-exactly; odd ones tear a header and the reassembled stream is corrupt —
+/// e.g. cut 1 leaves a stray `0x86` in front of the retried `0x86 0x01`, and
+/// `86 86 01` decodes as sequence id 2144 instead of 16.
+///
+/// Both directions are asserted, so the day a writer *does* become atomic on
+/// failure this test fails and says so, rather than silently over-promising.
+#[test]
+fn recovery_after_a_cut_is_exact_only_on_a_header_boundary() {
+    const DEPTH: u32 = 12;
+    const FIRST: u32 = 16; // 16 << 3 | 6 = 0x86 0x01 — two bytes, unlike 1..=15
+    const RUN_BYTES: usize = 2 * DEPTH as usize;
+
+    fn open_all<F: sofab::Flush>(os: &mut OStream<F>) {
+        for id in FIRST..FIRST + DEPTH {
+            os.write_sequence_begin_lazy(id).unwrap();
+        }
+    }
+
+    // Reference: the same script with room to spare.
+    let mut big = [0u8; 128];
+    let one_shot = {
+        let mut os = OStream::new(&mut big);
+        open_all(&mut os);
+        os.write_unsigned(0, 42).unwrap();
+        for _ in 0..DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+        os.bytes_used()
+    };
+    let one_shot = big[..one_shot].to_vec();
+    // 12 two-byte headers + the 2-byte leaf + 12 end markers.
+    assert_eq!(one_shot.len(), RUN_BYTES + 2 + DEPTH as usize);
+
+    for cut in 1..=RUN_BYTES {
+        let mut small = vec![0u8; cut];
+        let mut rest = vec![0u8; 128];
+        let (first, second) = {
+            let mut os = OStream::new(&mut small);
+            open_all(&mut os);
+            assert_eq!(
+                os.write_unsigned(0, 42),
+                Err(Error::BufferFull),
+                "cut {cut}"
+            );
+            let first = os.bytes_used();
+            assert_eq!(first, cut, "cut {cut}: the buffer should be filled exactly");
+
+            // Recover exactly as the doc on `commit_pending` describes: fresh
+            // buffer, re-issue the failed write.
+            os.buffer_set(&mut rest, 0);
+            os.write_unsigned(0, 42).unwrap();
+            for _ in 0..DEPTH {
+                os.write_sequence_end().unwrap();
+            }
+            (first, os.bytes_used())
+        };
+
+        let mut streamed = small[..first].to_vec();
+        streamed.extend_from_slice(&rest[..second]);
+
+        if cut % 2 == 0 {
+            assert_eq!(streamed, one_shot, "cut {cut} fell on a header boundary");
+        } else {
+            assert_ne!(
+                streamed, one_shot,
+                "cut {cut} sliced a header varint: recovery cannot be exact"
+            );
+            // Precisely: the torn header's leading byte is left behind and the
+            // whole header written again, so the stream is one byte longer.
+            assert_eq!(
+                streamed.len(),
+                one_shot.len() + 1,
+                "cut {cut}: expected exactly the re-written prefix byte"
+            );
+            if cut == 1 {
+                // And the wreckage is well-formed, which is what makes it
+                // dangerous: `86 86 01` is a valid header — sequence id 2144
+                // ((0x86,0x86,0x01) = 17158; 17158 >> 3 = 2144, type 6) — where
+                // id 16's `86 01` was meant.
+                assert_eq!(&streamed[..3], &[0x86, 0x86, 0x01]);
+            }
+        }
+    }
 }
 
 /// The same recovery, but with the run split across the encoder's inline slots
@@ -806,6 +948,40 @@ fn zero_count_arrays_encode_to_header_plus_count() {
     );
 }
 
+/// `write_sequence_begin_lazy` does its own id check — it is the one writer that
+/// does not reach `write_id_type` until much later (or never), so the rejection
+/// cannot be inherited from there, and `id_overflow_is_argument_error` above
+/// only covers `write_unsigned`.
+///
+/// Delete the check and the call returns `Ok`, the id joins the pending run, and
+/// the next field write commits an out-of-range tag onto the wire — silently,
+/// long after the offending call returned.
+#[test]
+fn sequence_id_overflow_is_argument_error() {
+    let mut buf = [0u8; 32];
+    let mut os = OStream::new(&mut buf);
+    assert_eq!(
+        os.write_sequence_begin_lazy(ID_MAX + 1),
+        Err(Error::Argument)
+    );
+
+    // Rejected means *not held back*: the following field commits nothing but
+    // itself, so the bad id cannot surface on the wire later.
+    os.write_unsigned(0, 42).unwrap();
+    let used = os.bytes_used();
+    assert_eq!(&buf[..used], &[0x00, 0x2A]);
+
+    // ID_MAX itself is legal, and frames as the five-byte tag (ID_MAX << 3) | 6.
+    assert_eq!(
+        encode(|os| {
+            os.write_sequence_begin_lazy(ID_MAX).unwrap();
+            os.write_unsigned(0, 42).unwrap();
+            os.write_sequence_end().unwrap();
+        }),
+        [0xFE, 0xFF, 0xFF, 0xFF, 0x3F, 0x00, 0x2A, 0x07]
+    );
+}
+
 #[test]
 fn sequence_depth_over_max_is_argument_error() {
     let mut buf = [0u8; 512];
@@ -815,7 +991,6 @@ fn sequence_depth_over_max_is_argument_error() {
         os.write_sequence_begin_lazy(0).unwrap();
     }
     assert_eq!(os.write_sequence_begin_lazy(0), Err(Error::Argument));
-    // The empty-frame call is bounded by the same ceiling.
     // After closing one, opening one more is allowed again.
     os.write_sequence_end().unwrap();
     os.write_sequence_begin_lazy(0).unwrap();

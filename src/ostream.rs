@@ -62,8 +62,13 @@ const INLINE_PENDING: usize = 8;
 /// The spill is grown on demand: an encoder that never opens a sequence, or
 /// never nests deeper than [`INLINE_PENDING`], allocates nothing at all. That
 /// matters because a fresh `OStream` is normally built per message, so an
-/// unconditional allocation would be one malloc/free per message (measured at
-/// +280 instructions/op on the `encode: typical message` Callgrind workload).
+/// unconditional allocation would be one malloc/free per message: setting
+/// [`INLINE_PENDING`] to 0, which sends every id to the heap, measures 727
+/// Ir/op on the `encode: typical message` Callgrind workload against this
+/// crate's 475 — **+252**. The width of the inline array is worth far less than
+/// its existence: at `INLINE_PENDING = 1` the same workload measures 470, i.e.
+/// the eight slots cost ~5 Ir over one. See the README's Sequences section for
+/// what the hold-back costs against pre-feature eager framing.
 ///
 /// Storage layout: ids `0..n` sit in `inline`, the rest follow in `spill`, in
 /// wire order (outermost first). `spill` may be non-empty while `n` is below
@@ -304,11 +309,20 @@ impl<'a, F: Flush> OStream<'a, F> {
     /// Only the headers that actually reached the buffer are dropped from the
     /// run: if the buffer fills mid-run with no sink to drain it, the sequences
     /// that were not written yet stay pending — still the innermost contiguous
-    /// suffix of the open sequences, so the invariant holds and a caller that
-    /// installs a bigger buffer ([`OStream::buffer_set`]) can carry on. No
-    /// writer in this encoder is atomic on failure, though: a varint can be cut
-    /// in half by the same buffer end, so `BufferFull` without a sink still
-    /// leaves a partial message behind.
+    /// suffix of the open sequences, so the run's own bookkeeping survives the
+    /// failure intact.
+    ///
+    /// That is **not** a general recovery guarantee. No writer in this encoder
+    /// is atomic on failure, and a header is a varint: the buffer end can fall
+    /// *inside* one. The bytes already pushed stay in the buffer while the whole
+    /// header stays pending, so a caller that installs a bigger buffer
+    /// ([`OStream::buffer_set`]) and retries emits that header's leading bytes
+    /// twice — `86 86 01` where id 16's `86 01` was meant, and `86 86 01` is
+    /// itself a well-formed header, for sequence id **2144**: the corruption is
+    /// silent. Retrying is byte-exact only when the cut fell **between** headers,
+    /// which is every cut point when the run's ids are below 16 and their
+    /// headers one byte wide. Both halves are pinned by
+    /// `tests/ostream_tests.rs::recovery_after_a_cut_is_exact_only_on_a_header_boundary`.
     #[cold]
     #[inline(never)]
     fn commit_pending(&mut self) -> Result<()> {

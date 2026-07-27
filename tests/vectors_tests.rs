@@ -44,6 +44,20 @@ use sofab::{Error, Flush, IStream, Id, OStream, Signed, Unsigned, Visitor};
 /// corelib primitive that makes that form reachable — dropping a contentless
 /// frame — is tested directly in `tests/ostream_tests.rs`
 /// ("lazy sequence framing"), not through this file.
+///
+/// **What the shared set does not cover** (cross-repo, not specific to this
+/// port): every `array/*` vector has *leaf* elements — strings — so no vector
+/// puts a **sequence** at element position. Each column is therefore reproduced
+/// with one closer used uniformly: `serialized` with `end_keep` everywhere (what
+/// [`write_fields`] below does), `serialized_sparse` with `end` everywhere. No
+/// vector, in either column, forces the per-position choice §5.1 actually
+/// requires, so none of them would catch `end` used where `end_keep` is
+/// mandatory — the one confusion that corrupts a decoded *value* (an array's
+/// length) rather than costing bytes. Until the shared set grows such a vector,
+/// that case is pinned by this repo's own tests:
+/// `ostream_tests::end_keep_frames_a_contentless_sequence` at the byte level and
+/// `roundtrip_tests::an_all_default_array_element_keeps_the_arrays_length` at
+/// the decoded-length level.
 const VECTORS_JSON: &str = include_str!("../assets/test_vectors.json");
 
 // --- requires / capability gating -------------------------------------------

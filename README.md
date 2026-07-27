@@ -169,12 +169,30 @@ assert_eq!(&buf[..used], &[0x16, 0x00, 0x2A, 0x07]);
 ```
 
 Held-back ids are encoder state, not buffer content, so the bytes never depend on
-the output-buffer size, and a flush can never split a pending run. The run is
-**unbounded** up to `MAX_DEPTH` (255), so an all-default sequence is omitted at
-*every* legal nesting depth, not just shallow ones (CORELIB_PLAN §6: only a
-heap-free profile, such as `corelib-rs-no-std`, may bound the run and frame
-eagerly past the bound). It costs nothing to carry: the first 8 levels live
-inline in the encoder and only deeper nesting spills to the heap.
+the output-buffer size: a pending run survives a flush — including an explicit
+`flush()` between two writes — unchanged. The run is **unbounded** up to
+`MAX_DEPTH` (255), so an all-default sequence is omitted at *every* legal nesting
+depth, not just shallow ones (CORELIB_PLAN §6: only a heap-free profile, such as
+`corelib-rs-no-std`, may bound the run and frame eagerly past the bound).
+
+**What it costs.** Not nothing. Callgrind (`bash benches/run_callgrind.sh`),
+workload `encode: typical message` — a 37-byte message with one nested sequence,
+encoded through a freshly built `OStream`:
+
+| encoder | Ir/op |
+|---|---|
+| eager framing, before this feature | 333 |
+| **lazy framing, as shipped** (8 inline slots, spill beyond) | **475** |
+| lazy framing, `INLINE_PENDING = 1` | 470 |
+| lazy framing, `INLINE_PENDING = 0` (heap on every sequence) | 727 |
+
+So the hold-back costs **+142 Ir/op (+43%)** on that workload — the price of
+carrying a `PendingRun` in a per-message encoder and testing it on every field
+write. Keeping the run off the heap is what most of the tuning buys (475 vs 727);
+the width of the inline array is worth about 5 Ir of that, so 8 slots is a depth
+choice, not a speed one. The other three workloads are flat: `encode: u64 array
+(1000)` 139913 → 139928, and both decode workloads are bit-identical (94180 and
+1186 Ir/op) — nothing in the decoder changed.
 
 ### Deserialize
 
