@@ -106,12 +106,87 @@ fn zero_count_arrays_roundtrip() {
     );
 }
 
+/// A wrapper-array **element** that is all-default must keep its frame, and the
+/// thing that breaks if it does not is a decoded **length**, not a byte count:
+/// a dynamic array's length is *highest present element id + 1* (§5.1), so a
+/// dropped trailing element shortens the array.
+///
+/// This is asserted here, end to end through the decoder, because the shared
+/// vectors cannot assert it: every `array/*` vector in
+/// `assets/test_vectors.json` has leaf (string) elements, so no vector — in
+/// either the `serialized` or the `serialized_sparse` column — puts a *sequence*
+/// at element position, and none of them distinguishes `end` from `end_keep`
+/// there. Replaying them exercises only the dropping closer.
+#[test]
+fn an_all_default_array_element_keeps_the_arrays_length() {
+    /// Element ids one level inside the wrapper, in order.
+    fn element_ids(ev: &[Event]) -> Vec<u32> {
+        let mut depth = 0usize;
+        let mut ids = Vec::new();
+        for e in ev {
+            match e {
+                Event::SequenceBegin(id) => {
+                    if depth == 1 {
+                        ids.push(*id);
+                    }
+                    depth += 1;
+                }
+                Event::SequenceEnd => depth -= 1,
+                _ => {}
+            }
+        }
+        ids
+    }
+
+    // Array field id 4, three struct elements; element 2 (the last) is
+    // all-default and closed with `end_keep`, so its frame survives.
+    let kept = roundtrip(|os| {
+        os.write_sequence_begin_lazy(4).unwrap(); // the array wrapper
+        for id in 0..2u32 {
+            os.write_sequence_begin_lazy(id).unwrap();
+            os.write_unsigned(0, 10 + id as u64).unwrap();
+            os.write_sequence_end_keep().unwrap();
+        }
+        os.write_sequence_begin_lazy(2).unwrap(); // all-default element
+        os.write_sequence_end_keep().unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(element_ids(&kept), [0, 1, 2]);
+    assert_eq!(
+        element_ids(&kept).iter().max().unwrap() + 1,
+        3,
+        "the array must decode as three elements"
+    );
+
+    // The same message with that element closed by the *field* closer — what a
+    // generator emitting `end` at element position would produce. The element
+    // vanishes and the array decodes one element short: a changed value, not
+    // merely changed bytes.
+    let dropped = roundtrip(|os| {
+        os.write_sequence_begin_lazy(4).unwrap();
+        for id in 0..2u32 {
+            os.write_sequence_begin_lazy(id).unwrap();
+            os.write_unsigned(0, 10 + id as u64).unwrap();
+            os.write_sequence_end_keep().unwrap();
+        }
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_sequence_end().unwrap(); // wrong closer for an element
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(element_ids(&dropped), [0, 1]);
+    assert_eq!(
+        element_ids(&dropped).iter().max().unwrap() + 1,
+        2,
+        "dropping the frame is what shortens the array"
+    );
+}
+
 #[test]
 fn deep_nested_sequences_roundtrip() {
     let ev = roundtrip(|os| {
         os.write_unsigned(0, 1).unwrap();
         for _ in 0..5 {
-            os.write_sequence_begin(1).unwrap();
+            os.write_sequence_begin_lazy(1).unwrap();
             os.write_unsigned(0, 42).unwrap();
         }
         for _ in 0..5 {

@@ -263,7 +263,7 @@ fn write_array_of_fp64() {
 fn write_nested_sequence() {
     let bytes = encode(|os| {
         os.write_unsigned(0, 42).unwrap();
-        os.write_sequence_begin(1).unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
         os.write_unsigned(0, 42).unwrap();
         os.write_signed(2, -42).unwrap();
         os.write_sequence_end().unwrap();
@@ -279,7 +279,7 @@ fn write_nested_sequence() {
 fn write_nested_sequence_with_array() {
     let bytes = encode(|os| {
         os.write_unsigned(0, 42).unwrap();
-        os.write_sequence_begin(3).unwrap();
+        os.write_sequence_begin_lazy(3).unwrap();
         os.write_unsigned(0, 42).unwrap();
         os.write_array_signed(3, &[-42_i32, -43, -44]).unwrap();
         os.write_sequence_end().unwrap();
@@ -289,6 +289,627 @@ fn write_nested_sequence_with_array() {
         bytes,
         [0x00, 0x2A, 0x1E, 0x00, 0x2A, 0x1C, 0x03, 0x53, 0x55, 0x57, 0x07, 0x11, 0x53]
     );
+}
+
+// --- lazy sequence framing (MESSAGE_SPEC §2) --------------------------------
+
+/// An all-default sequence carries no information, so the field is omitted --
+/// where the eager API would have written the two-byte empty frame `0E 07`.
+#[test]
+fn lazy_sequence_without_content_emits_nothing() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert!(bytes.is_empty(), "got {bytes:02x?}");
+}
+
+/// `end_keep` forces a contentless frame onto the wire — the array element and
+/// explicit-empty cases of §2/§5.1.
+#[test]
+fn end_keep_frames_a_contentless_sequence() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_end_keep().unwrap();
+    });
+    assert_eq!(bytes, [0x0E, 0x07]);
+}
+
+/// Forcing a frame forces its ancestors too: the outer sequence got content (the
+/// inner frame), so it is framed as well.
+#[test]
+fn end_keep_commits_the_enclosing_run() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_sequence_end_keep().unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(bytes, [0x0E, 0x16, 0x07, 0x07]);
+}
+
+/// With content it makes no difference — the headers are already out.
+#[test]
+fn end_keep_matches_end_once_content_exists() {
+    let with_keep = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end_keep().unwrap();
+    });
+    let with_end = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(with_keep, [0x0E, 0x00, 0x2A, 0x07]);
+    assert_eq!(with_keep, with_end);
+}
+
+/// One child field commits the whole held-back run, outermost header first, so a
+/// non-default leaf deep inside brings every enclosing frame back in wire order.
+#[test]
+fn lazy_sequence_commits_the_whole_run_on_first_content() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(bytes, [0x0E, 0x16, 0x00, 0x2A, 0x07, 0x07]);
+}
+
+/// Only the empty inner sequence drops; the outer one has content (the leaf) and
+/// is framed. This is the interleaving the naive "drop the whole run" would get
+/// wrong.
+#[test]
+fn lazy_sequence_drops_only_the_empty_inner_one() {
+    let bytes = encode(|os| {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(bytes, [0x0E, 0x00, 0x2A, 0x07]);
+}
+
+/// A lazily framed sequence *after* content in the same scope, and the sibling
+/// order, stay intact.
+#[test]
+fn lazy_sequence_after_content_is_independent() {
+    let bytes = encode(|os| {
+        os.write_unsigned(0, 1).unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_unsigned(2, 3).unwrap();
+    });
+    assert_eq!(bytes, [0x00, 0x01, 0x10, 0x03]);
+}
+
+/// A run **committed across a flush boundary** produces exactly the one-shot
+/// bytes, at every output-buffer size.
+///
+/// Note what this does *not* test, and why: a *buffer-full* flush cannot land
+/// while a header is still held back. Held-back ids are encoder state and occupy
+/// no buffer space, and the buffer only fills through a *write* — which commits
+/// the whole run before its own first byte. What a tiny buffer does exercise is
+/// the other half: the commit itself spilling across flushes (with a 1-byte
+/// buffer the 3-header run flushes between every header), plus a run that is
+/// dropped, re-grown and committed while the buffer keeps draining underneath
+/// it.
+///
+/// A flush mid-run is reachable the *explicit* way, by calling
+/// [`OStream::flush`] between two writes, and that case is covered by
+/// `an_explicit_flush_mid_run_matches_one_shot` below rather than left to the
+/// argument above.
+#[test]
+fn run_committed_across_flush_boundary_matches_one_shot() {
+    fn script<F: sofab::Flush>(os: &mut OStream<F>) {
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_sequence_begin_lazy(3).unwrap();
+        os.write_sequence_end().unwrap(); // contentless: id 3 vanishes
+        os.write_sequence_begin_lazy(4).unwrap();
+        os.write_unsigned(0, 42).unwrap(); // commits the run 1, 2, 4
+        os.write_sequence_end().unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_sequence_end().unwrap();
+    }
+
+    let one_shot = encode(script);
+    assert_eq!(one_shot, [0x0E, 0x16, 0x26, 0x00, 0x2A, 0x07, 0x07, 0x07]);
+
+    for size in [1usize, 2, 3, 7] {
+        let mut out: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; size];
+        {
+            let mut os =
+                sofab::OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d));
+            script(&mut os);
+            os.flush();
+        }
+        assert_eq!(out, one_shot, "buffer size {size}");
+    }
+}
+
+/// The reachable mid-run flush: the caller invokes [`OStream::flush`] itself
+/// while headers are still held back. A pending run is encoder state, not buffer
+/// content, so the flush drains what is in the buffer and the run is untouched —
+/// the bytes are the one-shot bytes, with the drained prefix landing in the sink
+/// early. Committing the run *after* the flush also proves the commit does not
+/// depend on anything the flush reset.
+#[test]
+fn an_explicit_flush_mid_run_matches_one_shot() {
+    // The same script with no flush in it, for the reference bytes.
+    let one_shot = encode(|os| {
+        os.write_unsigned(9, 1).unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_sequence_end().unwrap();
+    });
+    assert_eq!(one_shot, [0x48, 0x01, 0x0E, 0x16, 0x00, 0x2A, 0x07, 0x07]);
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64];
+    let flushed_at = {
+        let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d));
+        os.write_unsigned(9, 1).unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_sequence_begin_lazy(2).unwrap();
+        let n = os.flush();
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+        os.write_sequence_end().unwrap();
+        os.flush();
+        n
+    };
+    // The flush saw only the leaf written before the run — held-back headers
+    // occupy no buffer space.
+    assert_eq!(flushed_at, 2);
+    assert_eq!(out, one_shot);
+}
+
+/// A commit that runs out of buffer keeps the headers it could not write. With
+/// no sink, `BufferFull` stops the run half-written; the sequences still pending
+/// are the innermost ones, so installing a fresh buffer and retrying the same
+/// write finishes the run and the two buffers concatenate to exactly the
+/// one-shot bytes. (Zeroing the whole run before writing it, as an earlier draft
+/// did, silently dropped those frames instead.)
+///
+/// Scope, precisely: the ids here are 1..=4, so every header is a single byte
+/// and the cut necessarily falls *between* headers. Retrying is byte-exact only
+/// under that precondition — a cut inside a multi-byte header is not
+/// recoverable, which is what
+/// `recovery_after_a_cut_is_exact_only_on_a_header_boundary` pins.
+#[test]
+fn a_commit_cut_short_on_a_header_boundary_keeps_the_rest_pending() {
+    fn script<F: sofab::Flush>(os: &mut OStream<F>) -> Vec<Result<(), Error>> {
+        let mut r = Vec::new();
+        for id in 1..=4 {
+            r.push(os.write_sequence_begin_lazy(id));
+        }
+        r.push(os.write_unsigned(0, 42));
+        for _ in 0..4 {
+            r.push(os.write_sequence_end());
+        }
+        r
+    }
+
+    // Reference: the same script with room to spare.
+    let mut big = [0u8; 64];
+    let one_shot = {
+        let mut os = OStream::new(&mut big);
+        assert!(script(&mut os).iter().all(Result::is_ok));
+        os.bytes_used()
+    };
+    let one_shot = big[..one_shot].to_vec();
+    assert_eq!(
+        one_shot,
+        [0x0E, 0x16, 0x1E, 0x26, 0x00, 0x2A, 0x07, 0x07, 0x07, 0x07]
+    );
+
+    // Two bytes of room: the run of four headers stops after two.
+    let mut small = [0u8; 2];
+    let mut rest = [0u8; 64];
+    let (first, second) = {
+        let mut os = OStream::new(&mut small);
+        for id in 1..=4 {
+            os.write_sequence_begin_lazy(id).unwrap();
+        }
+        assert_eq!(os.write_unsigned(0, 42), Err(Error::BufferFull));
+        let first = os.bytes_used();
+
+        // Recover: a fresh buffer, and re-issue exactly the failed write. The
+        // two headers that never made it are still pending, so they lead.
+        os.buffer_set(&mut rest, 0);
+        os.write_unsigned(0, 42).unwrap();
+        for _ in 0..4 {
+            os.write_sequence_end().unwrap();
+        }
+        (first, os.bytes_used())
+    };
+
+    let mut streamed = small[..first].to_vec();
+    streamed.extend_from_slice(&rest[..second]);
+    assert_eq!(streamed, one_shot);
+}
+
+/// Where the recovery above stops. Every other cut-short test uses ids below
+/// 16, whose headers are one byte, so no cut can slice a header in half — and
+/// the recovery then looks unconditional. It is not: no writer here is atomic on
+/// failure, so a cut *inside* a header's varint leaves that prefix in the buffer
+/// while the whole header stays pending, and the retry writes it again.
+///
+/// Ids 16..=27 need a two-byte header (id 16 → tag `0x86 0x01`), so the sweep
+/// below hits both cases. Even cut points land between headers and recover
+/// byte-exactly; odd ones tear a header and the reassembled stream is corrupt —
+/// e.g. cut 1 leaves a stray `0x86` in front of the retried `0x86 0x01`, and
+/// `86 86 01` decodes as sequence id 2144 instead of 16.
+///
+/// Both directions are asserted, so the day a writer *does* become atomic on
+/// failure this test fails and says so, rather than silently over-promising.
+#[test]
+fn recovery_after_a_cut_is_exact_only_on_a_header_boundary() {
+    const DEPTH: u32 = 12;
+    const FIRST: u32 = 16; // 16 << 3 | 6 = 0x86 0x01 — two bytes, unlike 1..=15
+    const RUN_BYTES: usize = 2 * DEPTH as usize;
+
+    fn open_all<F: sofab::Flush>(os: &mut OStream<F>) {
+        for id in FIRST..FIRST + DEPTH {
+            os.write_sequence_begin_lazy(id).unwrap();
+        }
+    }
+
+    // Reference: the same script with room to spare.
+    let mut big = [0u8; 128];
+    let one_shot = {
+        let mut os = OStream::new(&mut big);
+        open_all(&mut os);
+        os.write_unsigned(0, 42).unwrap();
+        for _ in 0..DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+        os.bytes_used()
+    };
+    let one_shot = big[..one_shot].to_vec();
+    // 12 two-byte headers + the 2-byte leaf + 12 end markers.
+    assert_eq!(one_shot.len(), RUN_BYTES + 2 + DEPTH as usize);
+
+    for cut in 1..=RUN_BYTES {
+        let mut small = vec![0u8; cut];
+        let mut rest = vec![0u8; 128];
+        let (first, second) = {
+            let mut os = OStream::new(&mut small);
+            open_all(&mut os);
+            assert_eq!(
+                os.write_unsigned(0, 42),
+                Err(Error::BufferFull),
+                "cut {cut}"
+            );
+            let first = os.bytes_used();
+            assert_eq!(first, cut, "cut {cut}: the buffer should be filled exactly");
+
+            // Recover exactly as the doc on `commit_pending` describes: fresh
+            // buffer, re-issue the failed write.
+            os.buffer_set(&mut rest, 0);
+            os.write_unsigned(0, 42).unwrap();
+            for _ in 0..DEPTH {
+                os.write_sequence_end().unwrap();
+            }
+            (first, os.bytes_used())
+        };
+
+        let mut streamed = small[..first].to_vec();
+        streamed.extend_from_slice(&rest[..second]);
+
+        if cut % 2 == 0 {
+            assert_eq!(streamed, one_shot, "cut {cut} fell on a header boundary");
+        } else {
+            assert_ne!(
+                streamed, one_shot,
+                "cut {cut} sliced a header varint: recovery cannot be exact"
+            );
+            // Precisely: the torn header's leading byte is left behind and the
+            // whole header written again, so the stream is one byte longer.
+            assert_eq!(
+                streamed.len(),
+                one_shot.len() + 1,
+                "cut {cut}: expected exactly the re-written prefix byte"
+            );
+            if cut == 1 {
+                // And the wreckage is well-formed, which is what makes it
+                // dangerous: `86 86 01` is a valid header — sequence id 2144
+                // ((0x86,0x86,0x01) = 17158; 17158 >> 3 = 2144, type 6) — where
+                // id 16's `86 01` was meant.
+                assert_eq!(&streamed[..3], &[0x86, 0x86, 0x01]);
+            }
+        }
+    }
+}
+
+/// The same recovery, but with the run split across the encoder's inline slots
+/// and its heap spill (12 levels > the 8 that stay inline), and with a *further*
+/// sequence opened while the run is half-committed. The ids must still reach the
+/// wire outermost-first, in one order, however the storage is split.
+#[test]
+fn a_cut_short_commit_keeps_its_order_across_the_spill_boundary() {
+    const DEPTH: u32 = 12;
+    const EXTRA: u32 = 13;
+
+    // Reference: open 12, open one more, then content, then close all 13.
+    let mut big = [0u8; 128];
+    let one_shot = {
+        let mut os = OStream::new(&mut big);
+        for id in 1..=DEPTH {
+            os.write_sequence_begin_lazy(id).unwrap();
+        }
+        os.write_sequence_begin_lazy(EXTRA).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        for _ in 0..=DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+        os.bytes_used()
+    };
+    let one_shot = big[..one_shot].to_vec();
+
+    // Three bytes of room: the commit stops after three headers, leaving five
+    // inline and four spilled — then id 13 is opened on top of that remainder.
+    let mut small = [0u8; 3];
+    let mut rest = [0u8; 128];
+    let (first, second) = {
+        let mut os = OStream::new(&mut small);
+        for id in 1..=DEPTH {
+            os.write_sequence_begin_lazy(id).unwrap();
+        }
+        assert_eq!(os.write_unsigned(0, 42), Err(Error::BufferFull));
+        let first = os.bytes_used();
+        assert_eq!(first, 3, "expected three single-byte headers to fit");
+
+        os.write_sequence_begin_lazy(EXTRA).unwrap();
+        os.buffer_set(&mut rest, 0);
+        os.write_unsigned(0, 42).unwrap();
+        for _ in 0..=DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+        (first, os.bytes_used())
+    };
+
+    let mut streamed = small[..first].to_vec();
+    streamed.extend_from_slice(&rest[..second]);
+    assert_eq!(streamed, one_shot);
+}
+
+/// "Is anything held back?" must consult **both** halves of the run's storage,
+/// and the cut point that proves it is the inline/spill split itself.
+///
+/// The test above cuts the commit at three bytes, which leaves five ids inline
+/// and four spilled — `n != 0`, so answering from `n` alone still happens to be
+/// right and the bug hides. Cut instead at exactly `INLINE_PENDING` (8) of the 12
+/// headers and the surviving remainder is *entirely* in the heap spill: `n` is
+/// back to zero while `spill` still holds four ids. An encoder that reads
+/// emptiness off `n` then concludes the run is finished, so those four sequence
+/// headers never reach the wire — and later four of the `end` markers pair with
+/// them and vanish too, shortening the message from 26 bytes to 18 and changing
+/// the nesting structure a decoder sees.
+///
+/// Swept over every cut point rather than pinned to 8, so the split cannot drift
+/// out from under the test if `INLINE_PENDING` changes.
+#[test]
+fn a_cut_short_commit_knows_it_is_pending_at_every_cut_point() {
+    const DEPTH: u32 = 12; // 8 inline + 4 spilled
+
+    // Reference: the same script with room to spare.
+    let mut big = [0u8; 128];
+    let one_shot = {
+        let mut os = OStream::new(&mut big);
+        for id in 1..=DEPTH {
+            os.write_sequence_begin_lazy(id).unwrap();
+        }
+        os.write_unsigned(0, 42).unwrap();
+        for _ in 0..DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+        os.bytes_used()
+    };
+    let one_shot = big[..one_shot].to_vec();
+    // 12 single-byte headers + the 2-byte leaf + 12 end markers.
+    assert_eq!(one_shot.len(), 26);
+
+    for cut in 1..=DEPTH as usize {
+        let mut small = vec![0u8; cut];
+        let mut rest = vec![0u8; 128];
+        let (first, second) = {
+            let mut os = OStream::new(&mut small);
+            for id in 1..=DEPTH {
+                os.write_sequence_begin_lazy(id).unwrap();
+            }
+            // The run needs `DEPTH` bytes and the leaf one more, so every cut in
+            // 1..=DEPTH stops the write short.
+            assert_eq!(
+                os.write_unsigned(0, 42),
+                Err(Error::BufferFull),
+                "cut {cut}"
+            );
+            let first = os.bytes_used();
+            assert_eq!(first, cut, "cut {cut}: expected {cut} headers to fit");
+
+            // Recover into a fresh buffer and re-issue the failed write. Whatever
+            // is left of the run — inline, spilled, or purely spilled — must lead.
+            os.buffer_set(&mut rest, 0);
+            os.write_unsigned(0, 42).unwrap();
+            for _ in 0..DEPTH {
+                os.write_sequence_end().unwrap();
+            }
+            (first, os.bytes_used())
+        };
+
+        let mut streamed = small[..first].to_vec();
+        streamed.extend_from_slice(&rest[..second]);
+        assert_eq!(streamed, one_shot, "cut {cut} lost part of the run");
+    }
+}
+
+/// Nesting far deeper than the 32-level hold-back window this port used to have:
+/// all 40 frames are contentless, so the message is **zero bytes**. The eager
+/// fallback beyond the old window got exactly this wrong — levels 33..40 kept
+/// the empty `begin`+`end` pair §2 omits. There is no window any more (this
+/// crate has a heap, so CORELIB_PLAN §6 requires holding back to `MAX_DEPTH`),
+/// and the ceiling itself is canonical too.
+#[test]
+fn contentless_sequences_vanish_at_any_depth() {
+    for depth in [40u32, sofab::MAX_DEPTH] {
+        let mut buf = vec![0u8; 4 * depth as usize];
+        let mut os = OStream::new(&mut buf);
+        for _ in 0..depth {
+            os.write_sequence_begin_lazy(1).unwrap();
+        }
+        for _ in 0..depth {
+            os.write_sequence_end().unwrap();
+        }
+        assert_eq!(os.bytes_used(), 0, "depth {depth} left bytes behind");
+    }
+}
+
+/// The mirror image: content at the bottom of a 40-deep run brings back every
+/// enclosing header, outermost first and in id order — the run is not truncated
+/// at any window.
+#[test]
+fn deep_run_commits_every_level_outermost_first() {
+    const DEPTH: u32 = 40;
+    let mut buf = vec![0u8; 256];
+    let used = {
+        let mut os = OStream::new(&mut buf);
+        for id in 0..DEPTH {
+            os.write_sequence_begin_lazy(id).unwrap();
+        }
+        os.write_unsigned(0, 42).unwrap();
+        for _ in 0..DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+        os.bytes_used()
+    };
+
+    let mut expect: Vec<u8> = Vec::new();
+    for id in 0..DEPTH {
+        common::push_varint(&mut expect, ((id as u64) << 3) | 0x6);
+    }
+    expect.extend_from_slice(&[0x00, 0x2A]); // the leaf
+    expect.extend(std::iter::repeat(0x07).take(DEPTH as usize));
+    assert_eq!(&buf[..used], &expect[..]);
+}
+
+/// Both closers must give their depth back. `MAX_DEPTH` bounds how many
+/// sequences are open *at once*, not how many a message may contain, so opening
+/// and closing the full ceiling several times over — contentlessly, which is the
+/// shape §2 creates — must keep encoding.
+///
+/// Scope, precisely: every `end` round below closes its frames **contentlessly**,
+/// so `write_sequence_end` always finds a held-back header to pop and takes its
+/// *drop* path. That is one of the two depth-decrement sites in that function;
+/// this test pins that one, plus `end_keep`'s. The other site — the *emit* path,
+/// reached when the sequence had content and there is no pending header left to
+/// pop — is unreachable from here and belongs to
+/// `content_bearing_end_gives_the_depth_back` below. (An earlier commit message
+/// claimed "deleting the depth decrement from either closer fails it"; that
+/// holds for the drop site and for `end_keep`, and is false for the emit site,
+/// which this test cannot reach.)
+#[test]
+fn both_closers_give_the_depth_back() {
+    let mut buf = vec![0u8; 8192];
+    let mut os = OStream::new(&mut buf);
+
+    // Rounds closed with `end`: every frame vanishes, so nothing is written.
+    for _ in 0..4 {
+        for _ in 0..sofab::MAX_DEPTH {
+            os.write_sequence_begin_lazy(1).unwrap();
+        }
+        for _ in 0..sofab::MAX_DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+    }
+    assert_eq!(os.bytes_used(), 0);
+
+    // Rounds closed with `end_keep`: every frame reaches the wire, and the
+    // depth still comes back.
+    for _ in 0..4 {
+        for _ in 0..sofab::MAX_DEPTH {
+            os.write_sequence_begin_lazy(1).unwrap();
+        }
+        for _ in 0..sofab::MAX_DEPTH {
+            os.write_sequence_end_keep().unwrap();
+        }
+    }
+    let kept = 4 * 2 * sofab::MAX_DEPTH as usize; // one begin + one end byte each
+    assert_eq!(os.bytes_used(), kept);
+
+    // The ceiling is intact, not merely un-hit: still exactly MAX_DEPTH free.
+    for _ in 0..sofab::MAX_DEPTH {
+        os.write_sequence_begin_lazy(1).unwrap();
+    }
+    assert_eq!(os.write_sequence_begin_lazy(1), Err(Error::Argument));
+}
+
+/// The **content-bearing** `end` must give its depth back too — the other half of
+/// the test above, and the busiest path in the encoder: a sequence that received
+/// content has no held-back header left to pop, so `write_sequence_end` falls
+/// through to the *emit* path, writes the end marker, and decrements there.
+///
+/// Miss that decrement and the depth ratchets up by one per closed sequence
+/// while at most one is ever open, so the counter reaches `MAX_DEPTH` after 255
+/// sequences and the 256th `begin` is falsely rejected with `Error::Argument` —
+/// on a message that nests exactly one level deep. Both shapes below fail that
+/// way: the flat one at round 255, the nested one at the second round's first
+/// `begin`.
+#[test]
+fn content_bearing_end_gives_the_depth_back() {
+    // Flat: a thousand sequences opened and closed one after another, each with
+    // a child, so never more than one is open at a time. Far past MAX_DEPTH
+    // rounds — the point being that rounds are not a depth.
+    const ROUNDS: u32 = 1000;
+    let mut buf = vec![0u8; 8192];
+    let mut os = OStream::new(&mut buf);
+    for round in 0..ROUNDS {
+        assert_eq!(
+            os.write_sequence_begin_lazy(1),
+            Ok(()),
+            "flat round {round} rejected: the depth was not given back"
+        );
+        os.write_unsigned(0, 42).unwrap();
+        os.write_sequence_end().unwrap();
+    }
+    // Each round: held-back header committed by the child (0x0E), the child
+    // (0x00 0x2A), the end marker (0x07).
+    assert_eq!(os.bytes_used(), 4 * ROUNDS as usize);
+
+    // The ceiling is intact, not merely un-hit: still exactly MAX_DEPTH free.
+    for _ in 0..sofab::MAX_DEPTH {
+        os.write_sequence_begin_lazy(1).unwrap();
+    }
+    assert_eq!(os.write_sequence_begin_lazy(1), Err(Error::Argument));
+
+    // Nested: the full ceiling several times over, with content at the leaf so
+    // every one of the 255 `end`s takes the emit path rather than the drop path.
+    let mut buf = vec![0u8; 8192];
+    let mut os = OStream::new(&mut buf);
+    for round in 0..4 {
+        for level in 0..sofab::MAX_DEPTH {
+            assert_eq!(
+                os.write_sequence_begin_lazy(1),
+                Ok(()),
+                "nested round {round} level {level} rejected"
+            );
+        }
+        os.write_unsigned(0, 42).unwrap(); // commits all 255 held-back headers
+        for _ in 0..sofab::MAX_DEPTH {
+            os.write_sequence_end().unwrap();
+        }
+    }
+    // Per round: 255 committed begin bytes + the 2-byte leaf + 255 end bytes.
+    let per_round = 2 * sofab::MAX_DEPTH as usize + 2;
+    assert_eq!(os.bytes_used(), 4 * per_round);
 }
 
 // --- error / overflow behavior ---------------------------------------------
@@ -327,18 +948,52 @@ fn zero_count_arrays_encode_to_header_plus_count() {
     );
 }
 
+/// `write_sequence_begin_lazy` does its own id check — it is the one writer that
+/// does not reach `write_id_type` until much later (or never), so the rejection
+/// cannot be inherited from there, and `id_overflow_is_argument_error` above
+/// only covers `write_unsigned`.
+///
+/// Delete the check and the call returns `Ok`, the id joins the pending run, and
+/// the next field write commits an out-of-range tag onto the wire — silently,
+/// long after the offending call returned.
+#[test]
+fn sequence_id_overflow_is_argument_error() {
+    let mut buf = [0u8; 32];
+    let mut os = OStream::new(&mut buf);
+    assert_eq!(
+        os.write_sequence_begin_lazy(ID_MAX + 1),
+        Err(Error::Argument)
+    );
+
+    // Rejected means *not held back*: the following field commits nothing but
+    // itself, so the bad id cannot surface on the wire later.
+    os.write_unsigned(0, 42).unwrap();
+    let used = os.bytes_used();
+    assert_eq!(&buf[..used], &[0x00, 0x2A]);
+
+    // ID_MAX itself is legal, and frames as the five-byte tag (ID_MAX << 3) | 6.
+    assert_eq!(
+        encode(|os| {
+            os.write_sequence_begin_lazy(ID_MAX).unwrap();
+            os.write_unsigned(0, 42).unwrap();
+            os.write_sequence_end().unwrap();
+        }),
+        [0xFE, 0xFF, 0xFF, 0xFF, 0x3F, 0x00, 0x2A, 0x07]
+    );
+}
+
 #[test]
 fn sequence_depth_over_max_is_argument_error() {
     let mut buf = [0u8; 512];
     let mut os = OStream::new(&mut buf);
     // 255 nested sequences are allowed; the 256th must be rejected (§4.9).
     for _ in 0..sofab::MAX_DEPTH {
-        os.write_sequence_begin(0).unwrap();
+        os.write_sequence_begin_lazy(0).unwrap();
     }
-    assert_eq!(os.write_sequence_begin(0), Err(Error::Argument));
+    assert_eq!(os.write_sequence_begin_lazy(0), Err(Error::Argument));
     // After closing one, opening one more is allowed again.
     os.write_sequence_end().unwrap();
-    os.write_sequence_begin(0).unwrap();
+    os.write_sequence_begin_lazy(0).unwrap();
 }
 
 // --- streaming flush sink ---------------------------------------------------

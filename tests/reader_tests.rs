@@ -242,3 +242,122 @@ fn large_blob_single_call() {
     assert_eq!(v.calls, 1);
     assert_eq!(v.got, data);
 }
+
+/// An omitted sequence is **silent**: it produces no `sequence_begin`, no
+/// `sequence_end` and no children, on both decode paths. MESSAGE_SPEC §2 drops a
+/// sequence-typed field whose value equals its declared default, and an
+/// all-default message is the empty byte string — zero callbacks of any kind.
+///
+/// This pins the contract the decoder docs now state, and the reason they state
+/// it: a consumer cannot hook "prepare my destination" onto a callback that an
+/// absent field never fires. §5.1 puts that duty *before* the decode instead —
+/// "initialise every destination slot to its element default" — which the second
+/// half checks by replaying the exact failure with a reused destination and then
+/// with a default-initialised one.
+#[test]
+fn an_omitted_sequence_fires_no_callbacks_and_absence_must_be_prepared_for() {
+    use common::Event;
+    use sofab::{OStream, Unsigned};
+
+    // Message A: array field id 4 with two framed elements (element frames are
+    // kept — presence carries a dynamic array's length, §5.1).
+    let mut buf = [0u8; 64];
+    let n = {
+        let mut os = OStream::new(&mut buf);
+        os.write_sequence_begin_lazy(4).unwrap();
+        os.write_sequence_begin_lazy(0).unwrap();
+        os.write_unsigned(0, 10).unwrap();
+        os.write_sequence_end_keep().unwrap();
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_unsigned(0, 11).unwrap();
+        os.write_sequence_end_keep().unwrap();
+        os.write_sequence_end().unwrap();
+        os.bytes_used()
+    };
+    let a = buf[..n].to_vec();
+    assert_eq!(
+        a,
+        [0x26, 0x06, 0x00, 0x0A, 0x07, 0x0E, 0x00, 0x0B, 0x07, 0x07]
+    );
+
+    // Message B: the same field all-default. §2 omits it, so B is zero bytes.
+    let mut buf = [0u8; 64];
+    let n = {
+        let mut os = OStream::new(&mut buf);
+        os.write_sequence_begin_lazy(4).unwrap();
+        os.write_sequence_end().unwrap();
+        os.bytes_used()
+    };
+    let b = buf[..n].to_vec();
+    assert!(
+        b.is_empty(),
+        "an all-default sequence field must emit nothing"
+    );
+
+    // Not one callback for B, on either path.
+    for path in ["decode", "feed"] {
+        let mut rec = common::Recorder::new();
+        if path == "decode" {
+            decode(&b, &mut rec).unwrap();
+        } else {
+            IStream::new().feed(&b, &mut rec).unwrap();
+        }
+        assert!(
+            rec.events.is_empty(),
+            "[{path}] omitted sequence called back"
+        );
+    }
+
+    // A, by contrast, delivers the wrapper and both element frames.
+    let mut rec = common::Recorder::new();
+    decode(&a, &mut rec).unwrap();
+    assert_eq!(
+        rec.events,
+        [
+            Event::SequenceBegin(4),
+            Event::SequenceBegin(0),
+            Event::Unsigned(0, 10),
+            Event::SequenceEnd,
+            Event::SequenceBegin(1),
+            Event::Unsigned(0, 11),
+            Event::SequenceEnd,
+            Event::SequenceEnd,
+        ]
+    );
+
+    // The consequence, and the documented remedy. `Dest` does the tempting thing
+    // and resets from `sequence_begin`; because B never calls it, a reused
+    // destination keeps A's elements.
+    #[derive(Default)]
+    struct Dest {
+        elems: Vec<Unsigned>,
+    }
+    impl Visitor for Dest {
+        fn sequence_begin(&mut self, id: Id) {
+            if id == 4 {
+                self.elems.clear();
+            }
+        }
+        fn unsigned(&mut self, _id: Id, v: Unsigned) {
+            self.elems.push(v);
+        }
+    }
+
+    let mut reused = Dest::default();
+    decode(&a, &mut reused).unwrap();
+    assert_eq!(reused.elems, [10, 11]);
+    decode(&b, &mut reused).unwrap();
+    assert_eq!(
+        reused.elems,
+        [10, 11],
+        "if this ever clears itself, the callback-absence contract changed"
+    );
+
+    // §5.1 done right: initialise the destination before applying the message.
+    let mut fresh = Dest::default();
+    decode(&b, &mut fresh).unwrap();
+    assert!(
+        fresh.elems.is_empty(),
+        "absent must reconstruct to the default"
+    );
+}

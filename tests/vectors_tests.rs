@@ -30,6 +30,34 @@ use sofab::ArrayKind;
 use sofab::{Error, Flush, IStream, Id, OStream, Signed, Unsigned, Visitor};
 
 /// The shared vectors, embedded from the verbatim asset copy.
+///
+/// **Which column this repo asserts:** `serialized` — the primitive-layer ground
+/// truth, every sequence framed. That is the only form a corelib can produce or
+/// consume: it has no message layer, so it never sees a field's declared default
+/// and cannot decide that a sequence is all-default.
+///
+/// The file's sibling `serialized_sparse` column (present on every vector here,
+/// read by nothing here) is the **message-layer** form of MESSAGE_SPEC §2, where
+/// an all-default sequence-typed field is omitted. It is exercised by the
+/// generator's conformance drivers (`tests/conformance/<lang>/` in
+/// sofa-buffers/generator), which own the schema and thus the defaults. The
+/// corelib primitive that makes that form reachable — dropping a contentless
+/// frame — is tested directly in `tests/ostream_tests.rs`
+/// ("lazy sequence framing"), not through this file.
+///
+/// **What the shared set does not cover** (cross-repo, not specific to this
+/// port): every `array/*` vector has *leaf* elements — strings — so no vector
+/// puts a **sequence** at element position. Each column is therefore reproduced
+/// with one closer used uniformly: `serialized` with `end_keep` everywhere (what
+/// [`write_fields`] below does), `serialized_sparse` with `end` everywhere. No
+/// vector, in either column, forces the per-position choice §5.1 actually
+/// requires, so none of them would catch `end` used where `end_keep` is
+/// mandatory — the one confusion that corrupts a decoded *value* (an array's
+/// length) rather than costing bytes. Until the shared set grows such a vector,
+/// that case is pinned by this repo's own tests:
+/// `ostream_tests::end_keep_frames_a_contentless_sequence` at the byte level and
+/// `roundtrip_tests::an_all_default_array_element_keeps_the_arrays_length` at
+/// the decoded-length level.
 const VECTORS_JSON: &str = include_str!("../assets/test_vectors.json");
 
 // --- requires / capability gating -------------------------------------------
@@ -97,6 +125,10 @@ fn array_kind(element_type: &str) -> ArrayKind {
 
 /// Write a vector's `fields[]` into any stream (buffered or flushing).
 fn write_fields<F: Flush>(os: &mut OStream<F>, fields: &[Value]) {
+    // A vector's `serialized` form is the primitive-layer ground truth and always
+    // carries the frame, so every sequence closes with `end_keep`: identical bytes
+    // once the sequence has content, and the empty-sequence vectors keep their
+    // `begin`+`end` pair instead of vanishing.
     for f in fields {
         let op = f["op"].as_str().expect("op");
         let id = f.get("id").and_then(Value::as_u64).unwrap_or(0) as Id;
@@ -115,8 +147,8 @@ fn write_fields<F: Flush>(os: &mut OStream<F>, fields: &[Value]) {
                 .write_blob(id, &hex_to_bytes(f["value_hex"].as_str().unwrap()))
                 .unwrap(),
             "array" => encode_array(os, id, f),
-            "sequence_begin" => os.write_sequence_begin(id).unwrap(),
-            "sequence_end" => os.write_sequence_end().unwrap(),
+            "sequence_begin" => os.write_sequence_begin_lazy(id).unwrap(),
+            "sequence_end" => os.write_sequence_end_keep().unwrap(),
             other => panic!("unsupported op {other:?} (vector should be `requires`-skipped)"),
         }
     }

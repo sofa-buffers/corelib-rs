@@ -79,7 +79,7 @@ fn encode_typical(os: &mut OStream) {
     os.write_fp32(4, 3.14159).unwrap();
     os.write_str(5, "sofab").unwrap();
     os.write_array_unsigned(6, &[10u16, 20, 30, 40]).unwrap();
-    os.write_sequence_begin(7).unwrap();
+    os.write_sequence_begin_lazy(7).unwrap();
     os.write_unsigned(1, 99).unwrap();
     os.write_signed(2, -7).unwrap();
     os.write_sequence_end().unwrap();

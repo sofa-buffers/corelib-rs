@@ -43,6 +43,103 @@ impl Flush for NoFlush {
     fn flush(&mut self, _data: &[u8]) {}
 }
 
+/// How many held-back sequence headers fit without touching the heap. Nesting
+/// deeper than this spills into a `Vec` and the run keeps growing — this is a
+/// storage split, **not** a bound on the hold-back: past it the encoder still
+/// holds back, it just pays an allocation (see [`PendingRun`]).
+const INLINE_PENDING: usize = 8;
+
+/// The run of held-back sequence ids: the ids of the innermost open sequences
+/// whose header has not been written yet (MESSAGE_SPEC §2 lazy framing).
+///
+/// A stack that lives inline for the first [`INLINE_PENDING`] levels and spills
+/// to the heap beyond, so it is **unbounded** up to the format's [`MAX_DEPTH`]
+/// ceiling — which is what makes this port canonical at every legal depth.
+/// CORELIB_PLAN §6 ("How deep the hold-back reaches") lets only a heap-free
+/// profile bound the run and frame eagerly past the bound; this crate has a
+/// heap, so it must not.
+///
+/// The spill is grown on demand: an encoder that never opens a sequence, or
+/// never nests deeper than [`INLINE_PENDING`], allocates nothing at all. That
+/// matters because a fresh `OStream` is normally built per message, so an
+/// unconditional allocation would be one malloc/free per message: setting
+/// [`INLINE_PENDING`] to 0, which sends every id to the heap, measures 727
+/// Ir/op on the `encode: typical message` Callgrind workload against this
+/// crate's 475 — **+252**. The width of the inline array is worth far less than
+/// its existence: at `INLINE_PENDING = 1` the same workload measures 470, i.e.
+/// the eight slots cost ~5 Ir over one. See the README's Sequences section for
+/// what the hold-back costs against pre-feature eager framing.
+///
+/// Storage layout: ids `0..n` sit in `inline`, the rest follow in `spill`, in
+/// wire order (outermost first). `spill` may be non-empty while `n` is below
+/// [`INLINE_PENDING`] — after a partial commit — so `push` must consult `spill`
+/// first to keep the order.
+#[derive(Default)]
+struct PendingRun {
+    inline: [Id; INLINE_PENDING],
+    n: usize,
+    spill: Vec<Id>,
+}
+
+impl PendingRun {
+    /// Number of held-back headers.
+    #[inline]
+    fn len(&self) -> usize {
+        self.n + self.spill.len()
+    }
+
+    /// Whether any header is held back. On the hot path: every field write tests
+    /// it once.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.n == 0 && self.spill.is_empty()
+    }
+
+    /// Append an id (the innermost open sequence).
+    #[inline]
+    fn push(&mut self, id: Id) {
+        if self.n < INLINE_PENDING && self.spill.is_empty() {
+            self.inline[self.n] = id;
+            self.n += 1;
+        } else {
+            self.spill.push(id);
+        }
+    }
+
+    /// Remove the innermost held-back id, if the innermost open sequence is one.
+    #[inline]
+    fn pop(&mut self) -> Option<Id> {
+        if let Some(id) = self.spill.pop() {
+            return Some(id);
+        }
+        self.n = self.n.checked_sub(1)?;
+        Some(self.inline[self.n])
+    }
+
+    /// The `i`th held-back id, outermost first.
+    #[inline]
+    fn get(&self, i: usize) -> Id {
+        if i < self.n {
+            self.inline[i]
+        } else {
+            self.spill[i - self.n]
+        }
+    }
+
+    /// Drop the outermost `k` ids — the prefix that has reached the wire. The
+    /// remainder keeps its order, so it stays the innermost contiguous suffix of
+    /// the open sequences.
+    fn drop_front(&mut self, k: usize) {
+        if k <= self.n {
+            self.inline.copy_within(k..self.n, 0);
+            self.n -= k;
+        } else {
+            self.spill.drain(..k - self.n);
+            self.n = 0;
+        }
+    }
+}
+
 /// Streaming Sofab encoder writing into a caller-provided buffer.
 pub struct OStream<'a, F: Flush = NoFlush> {
     buffer: &'a mut [u8],
@@ -50,6 +147,9 @@ pub struct OStream<'a, F: Flush = NoFlush> {
     offset: usize,
     /// Number of nested sequences currently open, capped at [`MAX_DEPTH`].
     depth: u32,
+    /// Sequence headers held back so far. Always a contiguous suffix of the open
+    /// sequences: writing any field commits the whole run at once.
+    pending: PendingRun,
     /// `None` means "no sink": a full buffer is an error rather than a flush.
     flush: Option<F>,
 }
@@ -72,6 +172,7 @@ impl<'a> OStream<'a, NoFlush> {
             end,
             offset,
             depth: 0,
+            pending: PendingRun::default(), // heap-free until nesting spills
             flush: None,
         }
     }
@@ -89,6 +190,7 @@ impl<'a, F: Flush> OStream<'a, F> {
             end,
             offset,
             depth: 0,
+            pending: PendingRun::default(), // heap-free until nesting spills
             flush: Some(sink),
         }
     }
@@ -183,12 +285,59 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     /// Write a field header: the `(id << 3) | wire_type` tag as a varint.
     /// Returns [`Error::Argument`] for an `id` above [`ID_MAX`].
+    ///
+    /// This is the single choke point every field write passes through, so it is
+    /// also where a held-back sequence run is committed: the field about to be
+    /// written is content, which means every enclosing sequence is non-default and
+    /// must be framed after all.
     #[inline]
     fn write_id_type(&mut self, id: Id, wire_type: u8) -> Result<()> {
         if id > ID_MAX {
             return Err(Error::Argument);
         }
+        let is_content = wire_type != T_SEQUENCE_START && wire_type != T_SEQUENCE_END;
+        if is_content && !self.pending.is_empty() {
+            self.commit_pending()?;
+        }
         self.write_varint(((id as Unsigned) << 3) | wire_type as Unsigned)
+    }
+
+    /// Write out the held-back sequence headers, outermost first.
+    ///
+    /// Cold: it runs at most once per non-default sequence, never per field.
+    ///
+    /// Only the headers that actually reached the buffer are dropped from the
+    /// run: if the buffer fills mid-run with no sink to drain it, the sequences
+    /// that were not written yet stay pending — still the innermost contiguous
+    /// suffix of the open sequences, so the run's own bookkeeping survives the
+    /// failure intact.
+    ///
+    /// That is **not** a general recovery guarantee. No writer in this encoder
+    /// is atomic on failure, and a header is a varint: the buffer end can fall
+    /// *inside* one. The bytes already pushed stay in the buffer while the whole
+    /// header stays pending, so a caller that installs a bigger buffer
+    /// ([`OStream::buffer_set`]) and retries emits that header's leading bytes
+    /// twice — `86 86 01` where id 16's `86 01` was meant, and `86 86 01` is
+    /// itself a well-formed header, for sequence id **2144**: the corruption is
+    /// silent. Retrying is byte-exact only when the cut fell **between** headers,
+    /// which is every cut point when the run's ids are below 16 and their
+    /// headers one byte wide. Both halves are pinned by
+    /// `tests/ostream_tests.rs::recovery_after_a_cut_is_exact_only_on_a_header_boundary`.
+    #[cold]
+    #[inline(never)]
+    fn commit_pending(&mut self) -> Result<()> {
+        let mut written = 0;
+        let mut result = Ok(());
+        for i in 0..self.pending.len() {
+            let tag = ((self.pending.get(i) as Unsigned) << 3) | T_SEQUENCE_START as Unsigned;
+            if let Err(e) = self.write_varint(tag) {
+                result = Err(e);
+                break;
+            }
+            written += 1;
+        }
+        self.pending.drop_front(written);
+        result
     }
 
     // --- scalar writers -----------------------------------------------------
@@ -332,23 +481,103 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     // --- sequence writers ---------------------------------------------------
 
-    /// Open a nested sequence with the given field `id`.
+    /// Open a nested sequence whose header is **held back** until the sequence
+    /// turns out to have content.
     ///
-    /// Returns [`Error::Argument`] if more than [`MAX_DEPTH`] (255) sequences
-    /// would be open at once (§4.9).
+    /// MESSAGE_SPEC §2 omits a sequence-typed field whose value equals its declared
+    /// default, and "not one child was written" is exactly that condition —
+    /// evaluated per child field, recursively, for free. A sequence closed with
+    /// nothing in it therefore emits **nothing** instead of a two-byte empty frame,
+    /// and an all-default message becomes the empty byte string.
+    ///
+    /// The predicate is never a byte image of the object, so struct padding cannot
+    /// influence it and a non-zero nested default is handled by the caller's
+    /// ordinary per-field test.
+    ///
+    /// This is the only way to open a sequence. How it closes decides whether a
+    /// contentless one survives: [`OStream::write_sequence_end`] drops it,
+    /// [`OStream::write_sequence_end_keep`] forces the frame out.
+    ///
+    /// There is **no depth window**: the run of held-back headers grows on
+    /// demand to the format's [`MAX_DEPTH`] ceiling, so the omission is
+    /// canonical at every legal nesting level (CORELIB_PLAN §6, "How deep the
+    /// hold-back reaches" — only a heap-free profile may bound the run and frame
+    /// eagerly past the bound). The run is the encoder's only heap use, and even
+    /// that is deferred: it stays inline until nesting passes
+    /// `INLINE_PENDING` (8) levels.
+    ///
+    /// ```
+    /// use sofab::OStream;
+    ///
+    /// let mut buf = [0u8; 32];
+    /// let used = {
+    ///     let mut os = OStream::new(&mut buf);
+    ///     os.write_sequence_begin_lazy(1).unwrap();  // header held back
+    ///     os.write_sequence_end().unwrap();          // no content → nothing is written
+    ///     os.write_sequence_begin_lazy(2).unwrap();  // header held back
+    ///     os.write_unsigned(0, 42).unwrap();         // content → commits header id 2 first
+    ///     os.write_sequence_end().unwrap();
+    ///     os.bytes_used()
+    /// };
+    /// assert_eq!(&buf[..used], &[0x16, 0x00, 0x2A, 0x07]);
+    /// ```
     #[inline]
-    pub fn write_sequence_begin(&mut self, id: Id) -> Result<()> {
+    pub fn write_sequence_begin_lazy(&mut self, id: Id) -> Result<()> {
         if self.depth >= MAX_DEPTH {
             return Err(Error::Argument);
         }
-        self.write_id_type(id, T_SEQUENCE_START)?;
+        if id > ID_MAX {
+            return Err(Error::Argument);
+        }
+        self.pending.push(id);
         self.depth += 1;
         Ok(())
     }
 
-    /// Close the most recently opened nested sequence.
+    /// Close the most recently opened nested sequence, letting it **vanish** if it
+    /// received no content.
+    ///
+    /// Use it wherever absence encodes the same value as an empty frame: a
+    /// `struct`/`union` field, and an array field whose declared `default` is the
+    /// empty collection (MESSAGE_SPEC §2). Where the frame must be visible, close
+    /// with [`OStream::write_sequence_end_keep`] instead.
     #[inline]
     pub fn write_sequence_end(&mut self) -> Result<()> {
+        if self.pending.pop().is_some() {
+            // The innermost open sequence was the last held-back one: dropped.
+            self.depth = self.depth.saturating_sub(1);
+            return Ok(());
+        }
+        self.write_id_type(0, T_SEQUENCE_END)?;
+        self.depth = self.depth.saturating_sub(1);
+        Ok(())
+    }
+
+    /// Close the most recently opened nested sequence, **keeping** its frame even
+    /// when it received no content.
+    ///
+    /// Behaves like a write: it first emits any held-back headers — this frame's
+    /// and every enclosing one's — and then the end marker, so an empty sequence
+    /// reaches the wire as `begin` + `end`.
+    ///
+    /// Required wherever the frame carries information beyond its contents:
+    /// - a **wrapper-array element** (`struct`/`union`/nested row): element
+    ///   presence is what carries a dynamic array's length — *highest present id +
+    ///   1* (§5.1) — so dropping an all-default element would change the decoded
+    ///   length, not just the bytes;
+    /// - an array field already known to **differ from a non-empty declared
+    ///   `default`**: absence would reconstruct that default, so the empty frame is
+    ///   the only encoding of "explicitly empty" (§2, §3).
+    ///
+    /// The two failure directions are not symmetric, which is why this is the safe
+    /// choice when in doubt: using it where [`OStream::write_sequence_end`] would
+    /// do costs one non-canonical empty frame that a decoder normalizes away, while
+    /// the reverse silently changes an array's length.
+    #[inline]
+    pub fn write_sequence_end_keep(&mut self) -> Result<()> {
+        if !self.pending.is_empty() {
+            self.commit_pending()?;
+        }
         self.write_id_type(0, T_SEQUENCE_END)?;
         self.depth = self.depth.saturating_sub(1);
         Ok(())
