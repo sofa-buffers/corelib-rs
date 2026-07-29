@@ -76,7 +76,7 @@ fn arrays_roundtrip() {
             Event::ArrayBegin(2, ArrayKind::Signed, 2),
             Event::Signed(2, -5),
             Event::Signed(2, 5),
-            Event::ArrayBegin(3, ArrayKind::Fixlen, 2),
+            Event::ArrayBegin(3, ArrayKind::Fp64, 2),
             Event::Fp64(3, 1.5f64.to_bits()),
             Event::Fp64(3, (-2.5f64).to_bits()),
         ]
@@ -100,8 +100,8 @@ fn zero_count_arrays_roundtrip() {
         [
             Event::ArrayBegin(1, ArrayKind::Unsigned, 0),
             Event::ArrayBegin(2, ArrayKind::Signed, 0),
-            Event::ArrayBegin(3, ArrayKind::Fixlen, 0),
-            Event::ArrayBegin(4, ArrayKind::Fixlen, 0),
+            Event::ArrayBegin(3, ArrayKind::Fp32, 0),
+            Event::ArrayBegin(4, ArrayKind::Fp64, 0),
         ]
     );
 }

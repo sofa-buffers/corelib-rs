@@ -69,12 +69,23 @@ impl FixlenType {
 
 /// Element category of an array, reported to a [`crate::Visitor`] at the start
 /// of an array field.
+///
+/// For a fixlen array the kind names the **element subtype** (`Fp32` / `Fp64`),
+/// not merely "some fixlen array": the receiver has to know which of the two it
+/// is before it can decide whether the array is the declared field's value at
+/// all (CORELIB_PLAN §4.8 step 3, MESSAGE_SPEC §7.3). The hook is therefore
+/// delivered *after* the `fixlen_word` for wire type `ARRAY_FIXLEN`, and right
+/// after the count word for the integer arrays, which carry no second word.
+///
+/// The discriminants are normative across the family; do not renumber them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrayKind {
     /// Unsigned-integer elements (delivered via [`crate::Visitor::unsigned`]).
-    Unsigned,
+    Unsigned = 0,
     /// Signed-integer elements (delivered via [`crate::Visitor::signed`]).
-    Signed,
-    /// Floating-point elements (delivered via `fp32` / `fp64`).
-    Fixlen,
+    Signed = 1,
+    /// 32-bit float elements (delivered via [`crate::Visitor::fp32`]).
+    Fp32 = 2,
+    /// 64-bit float elements (delivered via [`crate::Visitor::fp64`]).
+    Fp64 = 3,
 }
