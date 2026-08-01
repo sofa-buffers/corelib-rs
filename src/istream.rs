@@ -75,6 +75,26 @@ pub trait Visitor {
 
     /// Start of an array field with `count` elements of the given `kind`. The
     /// elements follow via the scalar / float callbacks with the same `id`.
+    ///
+    /// Called **exactly once** per array field — never per element — and always
+    /// before the first element callback. `count == 0` is no exception: an
+    /// empty array still reports its kind, and is followed by no element
+    /// callback at all.
+    ///
+    /// For a fixlen array the call is made only after the `fixlen_word` has been
+    /// read and validated, so `kind` names the element subtype
+    /// ([`ArrayKind::Fp32`] / [`ArrayKind::Fp64`]) rather than "some fixlen
+    /// array". A receiver that bounds the array against a schema-declared
+    /// element count MUST first check `kind` against the declared element type:
+    /// a contradicting kind means the field is skipped under MESSAGE_SPEC §7.3
+    /// and the schema bound MUST NOT be applied, because the field was never
+    /// this array's value (CORELIB_PLAN §4.8 step 3). Integer arrays carry no
+    /// second word, so their call is made right after the count varint.
+    ///
+    /// The **format** ceiling `ARRAY_MAX` (2^31-1) is enforced by the corelib on
+    /// the count word, before this call and before the `fixlen_word` is read;
+    /// `count` is therefore always within that ceiling here, and nothing has
+    /// been allocated on the strength of it.
     fn array_begin(&mut self, id: Id, kind: ArrayKind, count: usize) {}
 
     /// Start of a nested sequence with the given field `id`.
@@ -485,7 +505,18 @@ impl IStream {
                         }
                         _ => return Err(Error::InvalidMsg),
                     };
-                    v.array_begin(id, ArrayKind::Fixlen, count as usize);
+                    // The hook fires only here, past the `fixlen_word`, and
+                    // names the element subtype: generated code has to decide
+                    // fp32-vs-fp64 *before* it may apply a schema `count` bound,
+                    // because a contradicting subtype means the field is skipped
+                    // and was never this array's value (§4.8 step 3, §7.3).
+                    // Fires exactly once per array field, `count == 0` included.
+                    let kind = if fp64 {
+                        ArrayKind::Fp64
+                    } else {
+                        ArrayKind::Fp32
+                    };
+                    v.array_begin(id, kind, count as usize);
                     if count > 0 {
                         self.resume = Resume::ArrayFix {
                             id,
