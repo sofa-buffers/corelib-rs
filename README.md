@@ -181,18 +181,23 @@ encoded through a freshly built `OStream`:
 
 | encoder | Ir/op |
 |---|---|
-| eager framing, before this feature | 333 |
-| **lazy framing, as shipped** (8 inline slots, spill beyond) | **475** |
-| lazy framing, `INLINE_PENDING = 1` | 470 |
-| lazy framing, `INLINE_PENDING = 0` (heap on every sequence) | 727 |
+| **lazy framing, as shipped** (8 inline slots, spill beyond) | **248** |
+| lazy framing, `INLINE_PENDING = 1` | 243 |
+| lazy framing, `INLINE_PENDING = 0` (heap on every sequence) | 523 |
 
-So the hold-back costs **+142 Ir/op (+43%)** on that workload — the price of
-carrying a `PendingRun` in a per-message encoder and testing it on every field
-write. Keeping the run off the heap is what most of the tuning buys (475 vs 727);
-the width of the inline array is worth about 5 Ir of that, so 8 slots is a depth
-choice, not a speed one. The other three workloads are flat: `encode: u64 array
-(1000)` 139913 → 139928, and both decode workloads are bit-identical (94180 and
-1186 Ir/op) — nothing in the decoder changed.
+The hold-back is not free — it carries a `PendingRun` in a per-message encoder
+and tests it on every field write. Measured against eager framing when the
+feature landed, it cost **+142 Ir/op (+43%)** on this workload. Keeping the run
+off the heap is what most of the tuning buys (248 vs 523); the width of the
+inline array is worth about 5 Ir of that, so 8 slots is a depth choice, not a
+speed one.
+
+The absolute figures above are lower than the ones this table carried when the
+feature landed, because the varint codecs and the encoder's capacity handling
+were reworked since (`encode: typical message` 475 → 248, `encode: u64 array
+(1000)` 139928 → 29646, `decode: u64 array (1000)` 94180 → 45724, `decode:
+typical message` 1186 → 521). The ratios the `INLINE_PENDING` choice rests on
+did not move.
 
 ### Deserialize
 

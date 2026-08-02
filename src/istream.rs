@@ -6,7 +6,7 @@
 //!   it advances a cursor over the buffer, decoding every field with no copies;
 //!   string/blob payloads are delivered as a single borrowed slice straight out
 //!   of your buffer. This is the 90 % case on a server and the speed showcase.
-//! * [`IStream`] — the **streaming path** (ARCHITECTURE §5.2). Feed it bytes in
+//! * [`IStream`] — the **streaming path** (CORELIB_PLAN §5.2). Feed it bytes in
 //!   arbitrarily small chunks with [`IStream::feed`]; a single field header or
 //!   payload may be split across any number of `feed` calls and the decoder
 //!   suspends/resumes at any byte boundary. When the whole message is fed in one
@@ -29,8 +29,15 @@
 
 use crate::error::{Error, Result};
 use crate::types::*;
-use crate::varint::{read_varint, zigzag_decode};
+use crate::varint::{read_varint, read_varint_ready, zigzag_decode, MAX_VARINT_LEN};
 use crate::{ArrayKind, FixlenType, Id, Signed, Unsigned};
+
+// The fixlen subtype tags as they appear in the low 3 bits of a fixlen word,
+// for matching the wire byte directly (see `FixlenType`).
+const FX_FP32: u8 = FixlenType::Fp32 as u8;
+const FX_FP64: u8 = FixlenType::Fp64 as u8;
+const FX_STR: u8 = FixlenType::Str as u8;
+const FX_BLOB: u8 = FixlenType::Blob as u8;
 
 /// Receives decoded fields from [`IStream`] / [`decode`].
 ///
@@ -188,11 +195,11 @@ enum Resume {
         signed: bool,
         remaining: usize,
     },
-    /// Mid fixlen (float) array: `remaining` elements of `elem_len` bytes each.
+    /// Mid fixlen (float) array: `remaining` elements still to read. The element
+    /// width is implied by `fp64` (4 or 8 bytes — §4.8 admits no other).
     ArrayFix {
         id: Id,
         fp64: bool,
-        elem_len: usize,
         remaining: usize,
     },
 }
@@ -292,81 +299,29 @@ impl IStream {
     /// so they are never re-delivered.
     fn parse<V: Visitor>(&mut self, buf: &[u8], v: &mut V) -> Result<usize> {
         let mut pos = 0usize;
-        loop {
-            // 1) Finish anything left in progress from a previous chunk.
-            match self.resume {
-                Resume::None => {}
-                Resume::Payload { .. } => {
-                    pos = self.deliver_payload(buf, pos, v);
-                    if matches!(self.resume, Resume::Payload { .. }) {
-                        return Ok(pos); // still hungry for payload bytes
-                    }
-                    continue;
-                }
-                Resume::ArrayInt {
-                    id,
-                    signed,
-                    remaining,
-                } => {
-                    let mut rem = remaining;
-                    while rem > 0 {
-                        let elem_start = pos;
-                        match read_varint(buf, &mut pos)? {
-                            Some(val) => {
-                                if signed {
-                                    v.signed(id, zigzag_decode(val));
-                                } else {
-                                    v.unsigned(id, val);
-                                }
-                                rem -= 1;
-                            }
-                            None => {
-                                self.resume = Resume::ArrayInt {
-                                    id,
-                                    signed,
-                                    remaining: rem,
-                                };
-                                return Ok(elem_start);
-                            }
-                        }
-                    }
-                    self.resume = Resume::None;
-                    continue;
-                }
-                Resume::ArrayFix {
-                    id,
-                    fp64,
-                    elem_len,
-                    remaining,
-                } => {
-                    let mut rem = remaining;
-                    while rem > 0 {
-                        if buf.len() - pos < elem_len {
-                            self.resume = Resume::ArrayFix {
-                                id,
-                                fp64,
-                                elem_len,
-                                remaining: rem,
-                            };
-                            return Ok(pos);
-                        }
-                        emit_fixlen_value(buf, pos, fp64, id, v);
-                        pos += elem_len;
-                        rem -= 1;
-                    }
-                    self.resume = Resume::None;
-                    continue;
-                }
-            }
 
-            // 2) Read the next field header.
+        // 1) Finish anything left in progress from a previous chunk. At most one
+        //    item can ever be in progress, so this is a one-time preamble rather
+        //    than a per-field dispatch inside the loop below.
+        if !matches!(self.resume, Resume::None) {
+            pos = self.resume_item(buf, pos, v)?;
+            if !matches!(self.resume, Resume::None) {
+                // This chunk did not finish it either.
+                return Ok(pos);
+            }
+        }
+
+        // 2) Field loop. `self.resume` is `None` throughout — an item that runs
+        //    out of bytes sets it and returns immediately.
+        loop {
             if pos >= buf.len() {
                 return Ok(pos);
             }
             let field_start = pos;
-            let header = match read_varint(buf, &mut pos)? {
-                Some(h) => h,
-                None => return Ok(field_start),
+            let header = match read_varint(buf, &mut pos) {
+                Ok(h) => h,
+                Err(Error::Incomplete) => return Ok(field_start),
+                Err(e) => return Err(e),
             };
             let wire = (header & 0x07) as u8;
             let id_raw = header >> 3;
@@ -376,104 +331,120 @@ impl IStream {
             let id = id_raw as Id;
 
             match wire {
-                T_VARINT_UNSIGNED => match read_varint(buf, &mut pos)? {
-                    Some(val) => v.unsigned(id, val),
-                    None => return Ok(field_start),
+                T_VARINT_UNSIGNED => match read_varint(buf, &mut pos) {
+                    Ok(val) => v.unsigned(id, val),
+                    Err(Error::Incomplete) => return Ok(field_start),
+                    Err(e) => return Err(e),
                 },
-                T_VARINT_SIGNED => match read_varint(buf, &mut pos)? {
-                    Some(zz) => v.signed(id, zigzag_decode(zz)),
-                    None => return Ok(field_start),
+                T_VARINT_SIGNED => match read_varint(buf, &mut pos) {
+                    Ok(zz) => v.signed(id, zigzag_decode(zz)),
+                    Err(Error::Incomplete) => return Ok(field_start),
+                    Err(e) => return Err(e),
                 },
 
                 T_FIXLEN => {
-                    let word = match read_varint(buf, &mut pos)? {
-                        Some(w) => w,
-                        None => return Ok(field_start),
+                    let word = match read_varint(buf, &mut pos) {
+                        Ok(w) => w,
+                        Err(Error::Incomplete) => return Ok(field_start),
+                        Err(e) => return Err(e),
                     };
-                    let subtype = FixlenType::from_raw((word & 0x07) as u8)?;
                     if (word >> 3) as u64 > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
                     let len = (word >> 3) as usize;
-                    match subtype {
-                        FixlenType::Fp32 => {
+                    // Dispatch straight on the 3-bit subtype tag. Going through
+                    // `FixlenType::from_raw` first would decode the tag into an
+                    // enum only to branch on it again — two jump tables where
+                    // the wire needs one. An unknown tag falls through to the
+                    // `InvalidMsg` arm exactly as `from_raw` would report it.
+                    match (word & 0x07) as u8 {
+                        FX_FP32 => {
                             if len != 4 {
                                 return Err(Error::InvalidMsg);
                             }
                             if buf.len() - pos < 4 {
                                 return Ok(field_start); // carry header+word+partial
                             }
-                            emit_fixlen_value(buf, pos, false, id, v);
+                            // SAFETY: 4 bytes are readable at `pos`.
+                            unsafe { emit_fixlen_value::<false, V>(buf, pos, id, v) };
                             pos += 4;
                         }
-                        FixlenType::Fp64 => {
+                        FX_FP64 => {
                             if len != 8 {
                                 return Err(Error::InvalidMsg);
                             }
                             if buf.len() - pos < 8 {
                                 return Ok(field_start);
                             }
-                            emit_fixlen_value(buf, pos, true, id, v);
+                            // SAFETY: 8 bytes are readable at `pos`.
+                            unsafe { emit_fixlen_value::<true, V>(buf, pos, id, v) };
                             pos += 8;
                         }
-                        FixlenType::Str | FixlenType::Blob => {
-                            let is_blob = matches!(subtype, FixlenType::Blob);
-                            if len == 0 {
+                        tag @ (FX_STR | FX_BLOB) => {
+                            let is_blob = tag == FX_BLOB;
+                            if buf.len() - pos >= len {
+                                // Whole payload present: hand it over as one
+                                // borrowed slice, no `resume` bookkeeping. This
+                                // is the contiguous zero-copy case, including
+                                // the empty payload (`len == 0`).
+                                let chunk = &buf[pos..pos + len];
                                 if is_blob {
-                                    v.blob(id, 0, 0, &[]);
+                                    v.blob(id, len, 0, chunk);
                                 } else {
-                                    v.string(id, 0, 0, &[]);
+                                    v.string(id, len, 0, chunk);
                                 }
+                                pos += len;
                             } else {
+                                // Straddles the chunk boundary: deliver what is
+                                // here and suspend for the rest.
                                 self.resume = Resume::Payload {
                                     id,
                                     is_blob,
                                     total: len,
                                     remaining: len,
                                 };
-                                pos = self.deliver_payload(buf, pos, v);
-                                if matches!(self.resume, Resume::Payload { .. }) {
-                                    return Ok(pos);
-                                }
+                                return Ok(self.deliver_payload(buf, pos, v));
                             }
                         }
+                        _ => return Err(Error::InvalidMsg),
                     }
                 }
 
                 T_VARINTARRAY_UNSIGNED => {
-                    let count = match read_varint(buf, &mut pos)? {
-                        Some(c) => c,
-                        None => return Ok(field_start),
+                    let count = match read_varint(buf, &mut pos) {
+                        Ok(c) => c,
+                        Err(Error::Incomplete) => return Ok(field_start),
+                        Err(e) => return Err(e),
                     };
                     if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
                     v.array_begin(id, ArrayKind::Unsigned, count as usize);
-                    self.resume = Resume::ArrayInt {
-                        id,
-                        signed: false,
-                        remaining: count as usize,
-                    };
+                    pos = self.int_array::<false, V>(buf, pos, id, count as usize, v)?;
+                    if !matches!(self.resume, Resume::None) {
+                        return Ok(pos);
+                    }
                 }
                 T_VARINTARRAY_SIGNED => {
-                    let count = match read_varint(buf, &mut pos)? {
-                        Some(c) => c,
-                        None => return Ok(field_start),
+                    let count = match read_varint(buf, &mut pos) {
+                        Ok(c) => c,
+                        Err(Error::Incomplete) => return Ok(field_start),
+                        Err(e) => return Err(e),
                     };
                     if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
                     }
                     v.array_begin(id, ArrayKind::Signed, count as usize);
-                    self.resume = Resume::ArrayInt {
-                        id,
-                        signed: true,
-                        remaining: count as usize,
-                    };
+                    pos = self.int_array::<true, V>(buf, pos, id, count as usize, v)?;
+                    if !matches!(self.resume, Resume::None) {
+                        return Ok(pos);
+                    }
                 }
                 T_FIXLENARRAY => {
-                    let count = match read_varint(buf, &mut pos)? {
-                        Some(c) => c,
-                        None => return Ok(field_start),
+                    let count = match read_varint(buf, &mut pos) {
+                        Ok(c) => c,
+                        Err(Error::Incomplete) => return Ok(field_start),
+                        Err(e) => return Err(e),
                     };
                     if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
@@ -482,27 +453,18 @@ impl IStream {
                     // when empty (count == 0) — this is what distinguishes an
                     // empty fp32 array from an empty fp64 array on the wire
                     // (§4.8).
-                    let word = match read_varint(buf, &mut pos)? {
-                        Some(w) => w,
-                        None => return Ok(field_start),
+                    let word = match read_varint(buf, &mut pos) {
+                        Ok(w) => w,
+                        Err(Error::Incomplete) => return Ok(field_start),
+                        Err(e) => return Err(e),
                     };
-                    let subtype = FixlenType::from_raw((word & 0x07) as u8)?;
-                    let elem_len = (word >> 3) as usize;
                     // Only fixed-width float subtypes are valid in a fixlen
-                    // array; string/blob must use a sequence instead.
-                    let fp64 = match subtype {
-                        FixlenType::Fp32 => {
-                            if elem_len != 4 {
-                                return Err(Error::InvalidMsg);
-                            }
-                            false
-                        }
-                        FixlenType::Fp64 => {
-                            if elem_len != 8 {
-                                return Err(Error::InvalidMsg);
-                            }
-                            true
-                        }
+                    // array; string/blob must use a sequence instead. Subtype
+                    // and element width are one test: each float subtype admits
+                    // exactly one width (§4.8).
+                    let fp64 = match ((word & 0x07) as u8, word >> 3) {
+                        (FX_FP32, 4) => false,
+                        (FX_FP64, 8) => true,
                         _ => return Err(Error::InvalidMsg),
                     };
                     // The hook fires only here, past the `fixlen_word`, and
@@ -517,13 +479,13 @@ impl IStream {
                         ArrayKind::Fp32
                     };
                     v.array_begin(id, kind, count as usize);
-                    if count > 0 {
-                        self.resume = Resume::ArrayFix {
-                            id,
-                            fp64,
-                            elem_len,
-                            remaining: count as usize,
-                        };
+                    pos = if fp64 {
+                        self.fix_array::<true, V>(buf, pos, id, count as usize, v)
+                    } else {
+                        self.fix_array::<false, V>(buf, pos, id, count as usize, v)
+                    };
+                    if !matches!(self.resume, Resume::None) {
+                        return Ok(pos);
                     }
                 }
 
@@ -549,8 +511,140 @@ impl IStream {
         }
     }
 
+    /// Continue the one item that was in progress when the previous chunk ran
+    /// out, returning the cursor position reached. `self.resume` is left `None`
+    /// if this chunk finished it and set to the new progress if it did not.
+    ///
+    /// Only ever called with a non-`None` resume state, and never from inside
+    /// the field loop: a single item is in progress at a time, so this cost is
+    /// paid once per `feed`, not once per field.
+    #[inline(never)]
+    fn resume_item<V: Visitor>(&mut self, buf: &[u8], pos: usize, v: &mut V) -> Result<usize> {
+        match self.resume {
+            Resume::None => Ok(pos),
+            Resume::Payload { .. } => Ok(self.deliver_payload(buf, pos, v)),
+            Resume::ArrayInt {
+                id,
+                signed,
+                remaining,
+            } => {
+                self.resume = Resume::None;
+                if signed {
+                    self.int_array::<true, V>(buf, pos, id, remaining, v)
+                } else {
+                    self.int_array::<false, V>(buf, pos, id, remaining, v)
+                }
+            }
+            Resume::ArrayFix {
+                id,
+                fp64,
+                remaining,
+            } => {
+                self.resume = Resume::None;
+                Ok(if fp64 {
+                    self.fix_array::<true, V>(buf, pos, id, remaining, v)
+                } else {
+                    self.fix_array::<false, V>(buf, pos, id, remaining, v)
+                })
+            }
+        }
+    }
+
+    /// Read `rem` varint array elements from `buf` at `pos`, pushing each to
+    /// `v`, and return the cursor position reached. If the buffer ran out
+    /// mid-array, `self.resume` holds the remaining count and the returned
+    /// position is the start of the unfinished element.
+    ///
+    /// The cursor is taken and returned **by value**: threading a `&mut usize`
+    /// through a call the optimizer may not inline forces every varint to write
+    /// the cursor back to memory.
+    ///
+    /// `SIGNED` is a const parameter so the ZigZag decision is compiled out of
+    /// the element loop rather than re-tested per element.
+    #[inline(always)]
+    fn int_array<const SIGNED: bool, V: Visitor>(
+        &mut self,
+        buf: &[u8],
+        pos: usize,
+        id: Id,
+        mut rem: usize,
+        v: &mut V,
+    ) -> Result<usize> {
+        let mut p = pos;
+
+        // Bulk run — while a full varint is guaranteed readable, no element can
+        // be truncated, so the loop carries no bounds check beyond its own.
+        while rem > 0 && p + MAX_VARINT_LEN <= buf.len() {
+            // SAFETY: `MAX_VARINT_LEN` bytes are readable at `p`, per the guard.
+            let val = unsafe { read_varint_ready(buf.as_ptr(), &mut p) }?;
+            if SIGNED {
+                v.signed(id, zigzag_decode(val));
+            } else {
+                v.unsigned(id, val);
+            }
+            rem -= 1;
+        }
+
+        // Tail — inside the last few bytes an element may straddle the chunk.
+        while rem > 0 {
+            let elem_start = p;
+            match read_varint(buf, &mut p) {
+                Ok(val) => {
+                    if SIGNED {
+                        v.signed(id, zigzag_decode(val));
+                    } else {
+                        v.unsigned(id, val);
+                    }
+                    rem -= 1;
+                }
+                Err(Error::Incomplete) => {
+                    self.resume = Resume::ArrayInt {
+                        id,
+                        signed: SIGNED,
+                        remaining: rem,
+                    };
+                    return Ok(elem_start);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(p)
+    }
+
+    /// [`IStream::int_array`] for fixed-width float elements. Cannot fail: the
+    /// element width is already validated, so running out of bytes is the only
+    /// non-completing outcome.
+    #[inline(always)]
+    fn fix_array<const FP64: bool, V: Visitor>(
+        &mut self,
+        buf: &[u8],
+        pos: usize,
+        id: Id,
+        mut rem: usize,
+        v: &mut V,
+    ) -> usize {
+        let elem_len = if FP64 { 8 } else { 4 };
+        let mut p = pos;
+        while rem > 0 {
+            if buf.len() - p < elem_len {
+                self.resume = Resume::ArrayFix {
+                    id,
+                    fp64: FP64,
+                    remaining: rem,
+                };
+                return p;
+            }
+            // SAFETY: `elem_len` bytes are readable at `p`, just checked.
+            unsafe { emit_fixlen_value::<FP64, V>(buf, p, id, v) };
+            p += elem_len;
+            rem -= 1;
+        }
+        p
+    }
+
     /// Deliver as much of an in-progress string/blob payload as `buf` holds,
     /// updating `self.resume`. Returns the new cursor position.
+    #[inline(never)]
     fn deliver_payload<V: Visitor>(&mut self, buf: &[u8], mut pos: usize, v: &mut V) -> usize {
         if let Resume::Payload {
             id,
@@ -586,16 +680,26 @@ impl IStream {
     }
 }
 
-/// Decode `elem_len` (4 or 8) little-endian float bytes at `buf[pos..]` and push
-/// them to the visitor. Caller guarantees the bytes are present.
+/// Decode 4 (`FP64 == false`) or 8 little-endian float bytes at `buf[pos..]` and
+/// push them to the visitor.
+///
+/// # Safety
+///
+/// `buf` must hold 4 (resp. 8) readable bytes at `pos`.
 #[inline]
-fn emit_fixlen_value<V: Visitor>(buf: &[u8], pos: usize, fp64: bool, id: Id, v: &mut V) {
-    if fp64 {
-        let b: [u8; 8] = buf[pos..pos + 8].try_into().unwrap();
-        v.fp64(id, f64::from_le_bytes(b));
+unsafe fn emit_fixlen_value<const FP64: bool, V: Visitor>(
+    buf: &[u8],
+    pos: usize,
+    id: Id,
+    v: &mut V,
+) {
+    let p = buf.as_ptr().add(pos);
+    if FP64 {
+        debug_assert!(pos + 8 <= buf.len());
+        v.fp64(id, f64::from_le_bytes(core::ptr::read_unaligned(p.cast())));
     } else {
-        let b: [u8; 4] = buf[pos..pos + 4].try_into().unwrap();
-        v.fp32(id, f32::from_le_bytes(b));
+        debug_assert!(pos + 4 <= buf.len());
+        v.fp32(id, f32::from_le_bytes(core::ptr::read_unaligned(p.cast())));
     }
 }
 

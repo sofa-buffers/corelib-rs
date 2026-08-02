@@ -22,11 +22,12 @@
 /// ```
 #[inline]
 pub fn trim_tail<T: PartialEq + Copy>(a: &[T], zero: T) -> &[T] {
-    let mut n = a.len();
-    while n > 0 && a[n - 1] == zero {
-        n -= 1;
+    // `rposition` walks backwards without a bounds check per element; the
+    // generated encode path calls this on every fixed-length array.
+    match a.iter().rposition(|&x| x != zero) {
+        Some(last) => &a[..last + 1],
+        None => &a[..0],
     }
-    &a[..n]
 }
 
 /// [`trim_tail`] for `f32`, comparing by **bit pattern** rather than by `==`.
@@ -44,11 +45,10 @@ pub fn trim_tail<T: PartialEq + Copy>(a: &[T], zero: T) -> &[T] {
 /// ```
 #[inline]
 pub fn trim_tail_f32(a: &[f32]) -> &[f32] {
-    let mut n = a.len();
-    while n > 0 && f32::to_bits(a[n - 1]) == 0 {
-        n -= 1;
+    match a.iter().rposition(|&x| f32::to_bits(x) != 0) {
+        Some(last) => &a[..last + 1],
+        None => &a[..0],
     }
-    &a[..n]
 }
 
 /// [`trim_tail`] for `f64`, comparing by bit pattern — see [`trim_tail_f32`].
@@ -60,11 +60,10 @@ pub fn trim_tail_f32(a: &[f32]) -> &[f32] {
 /// ```
 #[inline]
 pub fn trim_tail_f64(a: &[f64]) -> &[f64] {
-    let mut n = a.len();
-    while n > 0 && f64::to_bits(a[n - 1]) == 0 {
-        n -= 1;
+    match a.iter().rposition(|&x| f64::to_bits(x) != 0) {
+        Some(last) => &a[..last + 1],
+        None => &a[..0],
     }
-    &a[..n]
 }
 
 #[cfg(test)]
