@@ -183,6 +183,30 @@ fn perf_encode_u64(buf: &mut [u8], src: &[u64]) -> usize {
 // ---------------------------------------------------------------------------
 // measurement
 // ---------------------------------------------------------------------------
+/// How long one batch of operations should take before the clock is read again.
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` is a real syscall — never
+/// vDSO-accelerated — costing on the order of a microsecond, so reading it once
+/// per operation would time the clock rather than the codec, and the cycle
+/// counter bracketing the loop would absorb it too. Ten milliseconds of work per
+/// read keeps that below 0.01 % of all three reported metrics.
+const BATCH_SECS: f64 = 0.01;
+
+/// Number of operations to run between clock reads: the smallest power of two
+/// whose run spans [`BATCH_SECS`].
+fn calibrate(mut body: impl FnMut()) -> u64 {
+    let mut batch: u64 = 1;
+    loop {
+        let t0 = cpu_now();
+        for _ in 0..batch {
+            body();
+        }
+        if cpu_now() - t0 >= BATCH_SECS {
+            return batch;
+        }
+        batch = batch.saturating_mul(2);
+    }
+}
+
 struct PerfResult {
     iters: u64,
     cycles_op: f64, // hardware cycles per operation
@@ -218,14 +242,20 @@ fn measure_encode(mut encode: impl FnMut() -> usize) -> (PerfResult, usize) {
         msg = encode(); // warmup
     }
 
+    let batch = calibrate(|| {
+        black_box(encode());
+    });
+
     let mut sink: usize = 0;
     let mut it: u64 = 0;
     let c0 = cycles::read();
     let t0 = cpu_now();
     let mut el;
     loop {
-        sink = sink.wrapping_add(encode());
-        it += 1;
+        for _ in 0..batch {
+            sink = sink.wrapping_add(encode());
+        }
+        it += batch;
         el = cpu_now() - t0;
         if el >= 1.0 {
             break;
@@ -251,16 +281,24 @@ fn measure_decode(buf: &[u8]) -> PerfResult {
     }
     black_box(out.acc);
 
+    let batch = calibrate(|| {
+        let mut o = PerfOut::default();
+        perf_decode(black_box(buf), &mut o);
+        black_box(o.acc);
+    });
+
     let mut sink: u64 = 0;
     let mut it: u64 = 0;
     let c0 = cycles::read();
     let t0 = cpu_now();
     let mut el;
     loop {
-        let mut o = PerfOut::default();
-        perf_decode(black_box(buf), &mut o);
-        sink = sink.wrapping_add(o.acc);
-        it += 1;
+        for _ in 0..batch {
+            let mut o = PerfOut::default();
+            perf_decode(black_box(buf), &mut o);
+            sink = sink.wrapping_add(o.acc);
+        }
+        it += batch;
         el = cpu_now() - t0;
         if el >= 1.0 {
             break;

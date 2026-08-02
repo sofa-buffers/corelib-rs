@@ -128,16 +128,45 @@ pub fn run_decode_typical(wire: &[u8]) -> u64 {
     black_box(sink.acc)
 }
 
+/// How long one batch of operations should take before the clock is read again.
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` is a real syscall — never
+/// vDSO-accelerated — costing on the order of a microsecond, so reading it once
+/// per operation would time the clock rather than the codec: at ~22 ns/op for
+/// the typical message, ~98 % of each iteration would be the measurement. Ten
+/// milliseconds of work per read pushes that below 0.01 %.
+const BATCH_SECS: f64 = 0.01;
+
 /// Run `body` repeatedly until ~1 s of CPU time has elapsed (after one warm-up
 /// call) and return throughput in MB/s for a message of `bytes` bytes.
+///
+/// The clock is read once per **batch**, never per operation, so the reported
+/// time is the work and not the measurement (BENCH_SPEC "Timing": one warmup
+/// before starting the timer, then a ~1 s CPU-time loop).
 fn measure(bytes: usize, mut body: impl FnMut()) -> f64 {
     body(); // warmup
+
+    // Grow the batch until it spans `BATCH_SECS`, so the clock read that ends
+    // it is a rounding error against the work it timed.
+    let mut batch: u64 = 1;
+    loop {
+        let t0 = cpu_now();
+        for _ in 0..batch {
+            body();
+        }
+        if cpu_now() - t0 >= BATCH_SECS {
+            break;
+        }
+        batch = batch.saturating_mul(2);
+    }
+
     let t0 = cpu_now();
     let mut it: u64 = 0;
     let mut el;
     loop {
-        body();
-        it += 1;
+        for _ in 0..batch {
+            body();
+        }
+        it += batch;
         el = cpu_now() - t0;
         if el >= 1.0 {
             break;
