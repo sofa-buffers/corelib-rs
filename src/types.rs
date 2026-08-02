@@ -54,19 +54,6 @@ pub enum FixlenType {
     Blob = 0x3,
 }
 
-impl FixlenType {
-    /// Decode a 3-bit fixlen tag from the wire, rejecting unsupported subtypes.
-    pub(crate) fn from_raw(raw: u8) -> crate::Result<Self> {
-        match raw {
-            0x0 => Ok(FixlenType::Fp32),
-            0x1 => Ok(FixlenType::Fp64),
-            0x2 => Ok(FixlenType::Str),
-            0x3 => Ok(FixlenType::Blob),
-            _ => Err(crate::Error::InvalidMsg),
-        }
-    }
-}
-
 /// Element category of an array, reported to a [`crate::Visitor`] at the start
 /// of an array field.
 ///

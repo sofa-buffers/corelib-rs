@@ -251,6 +251,65 @@ fn varint_overflow_is_invalid() {
     assert_eq!(is.feed(&bytes, &mut rec), Err(Error::InvalidMsg));
 }
 
+/// A varint whose payload does not fit the 64-bit value type: eleven
+/// continuation bytes. Wherever one of these appears the message is INVALID
+/// regardless of what follows (MESSAGE_SPEC §7) — never Incomplete.
+const OVERLONG: [u8; 12] = [0x80; 12];
+
+/// `prefix` followed by an over-wide varint must be rejected as `InvalidMsg`.
+fn assert_overlong_rejected(prefix: &[u8], what: &str) {
+    let mut bytes = prefix.to_vec();
+    bytes.extend_from_slice(&OVERLONG);
+    let mut rec = Recorder::new();
+    let mut is = IStream::new();
+    assert_eq!(
+        is.feed(&bytes, &mut rec),
+        Err(Error::InvalidMsg),
+        "an over-wide varint as {what} was not rejected"
+    );
+}
+
+#[test]
+fn varint_overflow_is_invalid_at_every_position() {
+    // Every place the wire format reads a varint, in field-header order.
+    assert_overlong_rejected(&[], "a field header");
+    assert_overlong_rejected(&[0x00], "an unsigned value");
+    assert_overlong_rejected(&[0x01], "a signed value");
+    assert_overlong_rejected(&[0x02], "a fixlen word");
+    assert_overlong_rejected(&[0x03], "an unsigned array count");
+    assert_overlong_rejected(&[0x04], "a signed array count");
+    assert_overlong_rejected(&[0x05], "a fixlen array count");
+    assert_overlong_rejected(&[0x05, 0x01], "a fixlen array word");
+    assert_overlong_rejected(&[0x03, 0x01], "an unsigned array element");
+    assert_overlong_rejected(&[0x04, 0x01], "a signed array element");
+}
+
+#[test]
+fn fp64_with_wrong_length_is_invalid() {
+    // FIXLEN, subtype FP64 (1), but length 2 instead of 8.
+    let bytes = [0x02, (2 << 3) | 0x01, 0xAA, 0xBB];
+    let mut rec = Recorder::new();
+    let mut is = IStream::new();
+    assert_eq!(is.feed(&bytes, &mut rec), Err(Error::InvalidMsg));
+}
+
+#[test]
+fn oversized_count_is_invalid_for_every_array_kind() {
+    // The `count > ARRAY_MAX` guard applies to all three array wire types, not
+    // just the unsigned one (§4.7, §4.8).
+    for tag in [0x03u8, 0x04, 0x05] {
+        let mut bytes = vec![tag];
+        push_varint(&mut bytes, i32::MAX as u64 + 1);
+        let mut rec = Recorder::new();
+        let mut is = IStream::new();
+        assert_eq!(
+            is.feed(&bytes, &mut rec),
+            Err(Error::InvalidMsg),
+            "oversized count accepted for wire tag {tag:#x}"
+        );
+    }
+}
+
 #[test]
 fn dangling_sequence_end_is_invalid() {
     let mut rec = Recorder::new();
@@ -282,7 +341,7 @@ fn fp32_with_wrong_length_is_invalid() {
 #[test]
 fn reserved_fixlen_subtype_is_invalid() {
     // A FIXLEN field (wire tag 2) whose fixlen word carries a reserved subtype
-    // tag (0x4). Only 0x0..=0x3 are defined; FixlenType::from_raw rejects
+    // tag (0x4). Only 0x0..=0x3 are defined; the decoder rejects
     // 0x4..=0x7 with InvalidMsg (§7). Word = (len 4 << 3) | subtype 0x4 = 0x24.
     let mut rec = Recorder::new();
     let mut is = IStream::new();

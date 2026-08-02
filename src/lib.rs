@@ -21,7 +21,7 @@
 //! * [`decode`] — give it a whole message; it advances a pointer over the buffer
 //!   and hands every field (and zero-copy string/blob slices) to your visitor.
 //! * [`IStream`] — feed it arbitrarily small chunks; it suspends and resumes at
-//!   any byte boundary (ARCHITECTURE §5.2) yet still takes the zero-copy fast
+//!   any byte boundary (CORELIB_PLAN §5.2) yet still takes the zero-copy fast
 //!   path whenever a chunk is self-contained.
 //!
 //! ## Absence is meaningful: initialise the destination, not from a callback

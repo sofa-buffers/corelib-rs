@@ -3,17 +3,19 @@
 //! [`OStream`] writes Sofab fields into a caller-owned byte buffer. When the
 //! buffer fills it hands the bytes to an optional [`Flush`] sink and resumes at
 //! the start of the buffer, so messages larger than the buffer can be streamed
-//! out (ARCHITECTURE §5.1). With no sink, a full buffer yields
+//! out (CORELIB_PLAN §5.1). With no sink, a full buffer yields
 //! [`Error::BufferFull`].
 //!
 //! For the common server case where you just want the bytes in a growable `Vec`,
 //! drive a small scratch buffer with a flush closure that appends to the `Vec`
 //! — that is the back end of the generated-object `serialize()` helper
-//! (ARCHITECTURE §6.1).
+//! (CORELIB_PLAN §6.1).
 
 use crate::error::{Error, Result};
 use crate::types::*;
-use crate::varint::zigzag_encode;
+use crate::varint::{
+    write_varint_unchecked, write_varint_unchecked_narrow, zigzag_encode, MAX_VARINT_LEN,
+};
 use crate::{Id, Signed, Unsigned};
 
 /// Sink that receives buffered bytes when the output buffer is flushed.
@@ -63,12 +65,15 @@ const INLINE_PENDING: usize = 8;
 /// never nests deeper than [`INLINE_PENDING`], allocates nothing at all. That
 /// matters because a fresh `OStream` is normally built per message, so an
 /// unconditional allocation would be one malloc/free per message: setting
-/// [`INLINE_PENDING`] to 0, which sends every id to the heap, measures 727
+/// [`INLINE_PENDING`] to 0, which sends every id to the heap, measures 523
 /// Ir/op on the `encode: typical message` Callgrind workload against this
-/// crate's 475 — **+252**. The width of the inline array is worth far less than
-/// its existence: at `INLINE_PENDING = 1` the same workload measures 470, i.e.
+/// crate's 248 — **+275**. The width of the inline array is worth far less than
+/// its existence: at `INLINE_PENDING = 1` the same workload measures 243, i.e.
 /// the eight slots cost ~5 Ir over one. See the README's Sequences section for
 /// what the hold-back costs against pre-feature eager framing.
+///
+/// (The absolute figures moved when the encoder's varint and capacity handling
+/// were reworked; the ratio they were chosen on did not.)
 ///
 /// Storage layout: ids `0..n` sit in `inline`, the rest follow in `spill`, in
 /// wire order (outermost first). `spill` may be non-empty while `n` is below
@@ -130,6 +135,18 @@ impl PendingRun {
     /// remainder keeps its order, so it stays the innermost contiguous suffix of
     /// the open sequences.
     fn drop_front(&mut self, k: usize) {
+        // The whole run committed: the case every successful commit takes. The
+        // general path below shifts a run-length range, which lowers to a
+        // `memmove` call — a real one, even when the range is empty, because the
+        // length is not a compile-time constant.
+        if k == self.len() {
+            self.n = 0;
+            self.spill.clear();
+            return;
+        }
+        if k == 0 {
+            return;
+        }
         if k <= self.n {
             self.inline.copy_within(k..self.n, 0);
             self.n -= k;
@@ -253,7 +270,30 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     /// Copy a raw byte slice out, draining the buffer as needed. Uses a bulk
     /// `copy_from_slice` per buffer-sized run rather than a byte-at-a-time loop.
-    fn push_raw(&mut self, mut data: &[u8]) -> Result<()> {
+    #[inline]
+    fn push_raw(&mut self, data: &[u8]) -> Result<()> {
+        // The payload fits as it stands — the case for every string or blob
+        // written into a buffer sized for the message. One copy, no loop.
+        if self.offset + data.len() <= self.end {
+            // SAFETY: `data.len()` writable bytes remain at `offset`, and the
+            // caller's slice cannot alias the buffer (both are borrowed here).
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    self.buffer.as_mut_ptr().add(self.offset),
+                    data.len(),
+                );
+            }
+            self.offset += data.len();
+            return Ok(());
+        }
+        self.push_raw_split(data)
+    }
+
+    /// [`OStream::push_raw`] for a payload longer than the room left: emit it in
+    /// buffer-sized runs, draining to the sink between them.
+    #[inline(never)]
+    fn push_raw_split(&mut self, mut data: &[u8]) -> Result<()> {
         while !data.is_empty() {
             if self.offset >= self.end {
                 self.drain_full()?;
@@ -266,10 +306,54 @@ impl<'a, F: Flush> OStream<'a, F> {
         Ok(())
     }
 
+    /// [`OStream::push_raw`] for a payload of statically known size — a float's
+    /// wire bytes. When the run fits (it does unless the buffer is nearly full)
+    /// this lowers to a single store instead of a `memcpy` call.
+    #[inline]
+    fn push_raw_fixed<const N: usize>(&mut self, data: &[u8; N]) -> Result<()> {
+        if self.offset + N <= self.end {
+            // SAFETY: `N` writable bytes remain at `offset`, just checked.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    self.buffer.as_mut_ptr().add(self.offset),
+                    N,
+                );
+            }
+            self.offset += N;
+            Ok(())
+        } else {
+            self.push_raw(data)
+        }
+    }
+
     /// Encode `value` as a base-128 (LEB128) varint: 7 payload bits per byte,
     /// low byte first, with the high bit set on every byte but the last.
+    ///
+    /// One bounds check covers the whole varint: with a full varint's worth of
+    /// room the bytes go out with no per-byte capacity test, buffer-full branch
+    /// or `Result` to thread. Only within the last [`MAX_VARINT_LEN`] bytes of
+    /// the buffer does it fall back to the byte-at-a-time writer that can flush
+    /// mid-varint.
     #[inline]
-    fn write_varint(&mut self, mut value: Unsigned) -> Result<()> {
+    fn write_varint(&mut self, value: Unsigned) -> Result<()> {
+        let offset = self.offset;
+        if offset + MAX_VARINT_LEN <= self.end {
+            // SAFETY: `MAX_VARINT_LEN` writable bytes remain at `offset`.
+            let n = unsafe {
+                write_varint_unchecked_narrow(self.buffer.as_mut_ptr().add(offset), value)
+            };
+            self.offset = offset + n;
+            Ok(())
+        } else {
+            self.write_varint_split(value)
+        }
+    }
+
+    /// Varint writer for the tail of the buffer, where the encoding may have to
+    /// be split across a flush.
+    #[inline(never)]
+    fn write_varint_split(&mut self, mut value: Unsigned) -> Result<()> {
         loop {
             let mut b = (value as u8) & 0x7F;
             value >>= 7;
@@ -340,20 +424,58 @@ impl<'a, F: Flush> OStream<'a, F> {
         result
     }
 
+    /// Write a field header followed by one varint value — the shape of every
+    /// scalar field — under a **single** capacity check.
+    ///
+    /// A header and its value are two varints, and checking them separately
+    /// costs the whole cursor round trip twice: load `offset`, load `end`,
+    /// compare, store `offset`. Reserving both up front leaves the field as two
+    /// register-to-memory encodings and one cursor update.
+    ///
+    /// This is a second choke point for field writes, so it carries
+    /// [`OStream::write_id_type`]'s obligation too: writing a field is content,
+    /// which proves every enclosing held-back sequence non-default. Only content
+    /// wire types reach here — the sequence markers keep going through
+    /// `write_id_type` — so the commit is unconditional rather than
+    /// type-dependent.
+    #[inline]
+    fn write_field_varint(&mut self, id: Id, wire_type: u8, value: Unsigned) -> Result<()> {
+        debug_assert!(wire_type != T_SEQUENCE_START && wire_type != T_SEQUENCE_END);
+        if id > ID_MAX {
+            return Err(Error::Argument);
+        }
+        if !self.pending.is_empty() {
+            self.commit_pending()?;
+        }
+        let header = ((id as Unsigned) << 3) | wire_type as Unsigned;
+        let offset = self.offset;
+        if offset + 2 * MAX_VARINT_LEN <= self.end {
+            let base = self.buffer.as_mut_ptr();
+            // SAFETY: two full varints' worth of writable bytes remain.
+            let mut off = offset;
+            unsafe {
+                off += write_varint_unchecked_narrow(base.add(off), header);
+                off += write_varint_unchecked(base.add(off), value);
+            }
+            self.offset = off;
+            return Ok(());
+        }
+        self.write_varint_split(header)?;
+        self.write_varint_split(value)
+    }
+
     // --- scalar writers -----------------------------------------------------
 
     /// Write an unsigned-integer field.
     #[inline]
     pub fn write_unsigned(&mut self, id: Id, value: Unsigned) -> Result<()> {
-        self.write_id_type(id, T_VARINT_UNSIGNED)?;
-        self.write_varint(value)
+        self.write_field_varint(id, T_VARINT_UNSIGNED, value)
     }
 
     /// Write a signed-integer field (ZigZag + varint).
     #[inline]
     pub fn write_signed(&mut self, id: Id, value: Signed) -> Result<()> {
-        self.write_id_type(id, T_VARINT_SIGNED)?;
-        self.write_varint(zigzag_encode(value))
+        self.write_field_varint(id, T_VARINT_SIGNED, zigzag_encode(value))
     }
 
     /// Write a boolean as an unsigned `0` / `1`.
@@ -370,21 +492,67 @@ impl<'a, F: Flush> OStream<'a, F> {
         if data.len() as u64 > FIXLEN_MAX {
             return Err(Error::Argument);
         }
-        self.write_id_type(id, T_FIXLEN)?;
-        self.write_varint(((data.len() as Unsigned) << 3) | subtype as Unsigned)?;
+        self.write_field_varint(
+            id,
+            T_FIXLEN,
+            ((data.len() as Unsigned) << 3) | subtype as Unsigned,
+        )?;
+        self.push_raw(data)
+    }
+
+    /// A whole fixlen field whose payload has a statically known size — header,
+    /// `(len << 3) | subtype` word and the raw bytes — under a single capacity
+    /// check. Same bytes as [`OStream::write_fixlen`], minus the length check an
+    /// `N`-byte payload cannot fail.
+    ///
+    /// Like [`OStream::write_field_varint`], this bypasses
+    /// [`OStream::write_id_type`] and so carries its held-back-sequence
+    /// obligation directly: a float field is content, and a struct whose first
+    /// member is a float is exactly the case that proves the enclosing sequence
+    /// non-default.
+    #[inline]
+    fn write_fixlen_fixed<const N: usize>(
+        &mut self,
+        id: Id,
+        subtype: FixlenType,
+        data: &[u8; N],
+    ) -> Result<()> {
+        if id > ID_MAX {
+            return Err(Error::Argument);
+        }
+        if !self.pending.is_empty() {
+            self.commit_pending()?;
+        }
+        let header = ((id as Unsigned) << 3) | T_FIXLEN as Unsigned;
+        let word = ((N as Unsigned) << 3) | subtype as Unsigned;
+        let offset = self.offset;
+        if offset + 2 * MAX_VARINT_LEN + N <= self.end {
+            let base = self.buffer.as_mut_ptr();
+            let mut off = offset;
+            // SAFETY: header, word and payload all fit in the reserved run.
+            unsafe {
+                off += write_varint_unchecked_narrow(base.add(off), header);
+                off += write_varint_unchecked_narrow(base.add(off), word);
+                core::ptr::copy_nonoverlapping(data.as_ptr(), base.add(off), N);
+            }
+            self.offset = off + N;
+            return Ok(());
+        }
+        self.write_varint_split(header)?;
+        self.write_varint_split(word)?;
         self.push_raw(data)
     }
 
     /// Write a 32-bit float field.
     #[inline]
     pub fn write_fp32(&mut self, id: Id, value: f32) -> Result<()> {
-        self.write_fixlen(id, &value.to_le_bytes(), FixlenType::Fp32)
+        self.write_fixlen_fixed(id, FixlenType::Fp32, &value.to_le_bytes())
     }
 
     /// Write a 64-bit float field.
     #[inline]
     pub fn write_fp64(&mut self, id: Id, value: f64) -> Result<()> {
-        self.write_fixlen(id, &value.to_le_bytes(), FixlenType::Fp64)
+        self.write_fixlen_fixed(id, FixlenType::Fp64, &value.to_le_bytes())
     }
 
     /// Write a string field (raw UTF-8 bytes, no NUL on the wire).
@@ -407,6 +575,71 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     // --- array writers ------------------------------------------------------
 
+    /// Write `data.len()` varints, in runs sized to the room left in the buffer.
+    ///
+    /// The capacity test is per *run*, not per element: with `k` full varints'
+    /// worth of space free, the next `k` elements go out through a local cursor
+    /// with no bounds check, no buffer reload and no `Result` between them. Only
+    /// the element that straddles the end of the buffer takes the byte-at-a-time
+    /// path that can flush mid-varint.
+    #[inline]
+    fn write_varint_run<T: Copy, W: Fn(T) -> Unsigned>(
+        &mut self,
+        data: &[T],
+        to_wire: W,
+    ) -> Result<()> {
+        // Whole array fits with room to spare: one multiply decides it, and the
+        // element loop then carries no bookkeeping at all. This is the case for
+        // any array written into a buffer sized for the message.
+        if data.len().saturating_mul(MAX_VARINT_LEN) <= self.end - self.offset {
+            let base = self.buffer.as_mut_ptr();
+            let mut off = self.offset;
+            for &e in data {
+                // SAFETY: every element has `MAX_VARINT_LEN` bytes of headroom,
+                // checked in bulk above.
+                off += unsafe { write_varint_unchecked(base.add(off), to_wire(e)) };
+            }
+            self.offset = off;
+            return Ok(());
+        }
+
+        self.write_varint_run_chunked(data, to_wire)
+    }
+
+    /// [`OStream::write_varint_run`] when the array does not fit in what is left
+    /// of the buffer: write it in runs sized to the room available, draining to
+    /// the sink in between. Outlined so its bookkeeping stays out of the
+    /// fits-in-one-go loop above.
+    #[inline(never)]
+    fn write_varint_run_chunked<T: Copy, W: Fn(T) -> Unsigned>(
+        &mut self,
+        data: &[T],
+        to_wire: W,
+    ) -> Result<()> {
+        let mut i = 0;
+        while i < data.len() {
+            let room = (self.end - self.offset) / MAX_VARINT_LEN;
+            if room == 0 {
+                // Within a varint's reach of the end: let the splitting writer
+                // flush (or report `BufferFull`) for this one element.
+                self.write_varint_split(to_wire(data[i]))?;
+                i += 1;
+                continue;
+            }
+            let run = room.min(data.len() - i);
+            let base = self.buffer.as_mut_ptr();
+            let mut off = self.offset;
+            for &e in &data[i..i + run] {
+                // SAFETY: `off` has at least `MAX_VARINT_LEN` writable bytes —
+                // `run` was capped at the number of whole varints that fit.
+                off += unsafe { write_varint_unchecked(base.add(off), to_wire(e)) };
+            }
+            self.offset = off;
+            i += run;
+        }
+        Ok(())
+    }
+
     /// Write an array of unsigned integers (`u8`/`u16`/`u32`/`u64` elements).
     ///
     /// A zero-count array is a valid empty array on the wire — it encodes as
@@ -415,12 +648,8 @@ impl<'a, F: Flush> OStream<'a, F> {
         if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
-        self.write_id_type(id, T_VARINTARRAY_UNSIGNED)?;
-        self.write_varint(data.len() as Unsigned)?;
-        for e in data {
-            self.write_varint(e.widen())?;
-        }
-        Ok(())
+        self.write_field_varint(id, T_VARINTARRAY_UNSIGNED, data.len() as Unsigned)?;
+        self.write_varint_run(data, T::widen)
     }
 
     /// Write an array of signed integers (`i8`/`i16`/`i32`/`i64` elements).
@@ -431,12 +660,8 @@ impl<'a, F: Flush> OStream<'a, F> {
         if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
-        self.write_id_type(id, T_VARINTARRAY_SIGNED)?;
-        self.write_varint(data.len() as Unsigned)?;
-        for e in data {
-            self.write_varint(zigzag_encode(e.widen()))?;
-        }
-        Ok(())
+        self.write_field_varint(id, T_VARINTARRAY_SIGNED, data.len() as Unsigned)?;
+        self.write_varint_run(data, |e: T| zigzag_encode(e.widen()))
     }
 
     /// Write an array of 32-bit floats.
@@ -450,11 +675,10 @@ impl<'a, F: Flush> OStream<'a, F> {
         if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
-        self.write_id_type(id, T_FIXLENARRAY)?;
-        self.write_varint(data.len() as Unsigned)?;
+        self.write_field_varint(id, T_FIXLENARRAY, data.len() as Unsigned)?;
         self.write_varint((4 << 3) | FixlenType::Fp32 as Unsigned)?;
         for &e in data {
-            self.push_raw(&e.to_le_bytes())?;
+            self.push_raw_fixed(&e.to_le_bytes())?;
         }
         Ok(())
     }
@@ -470,11 +694,10 @@ impl<'a, F: Flush> OStream<'a, F> {
         if data.len() as u64 > ARRAY_MAX {
             return Err(Error::Argument);
         }
-        self.write_id_type(id, T_FIXLENARRAY)?;
-        self.write_varint(data.len() as Unsigned)?;
+        self.write_field_varint(id, T_FIXLENARRAY, data.len() as Unsigned)?;
         self.write_varint((8 << 3) | FixlenType::Fp64 as Unsigned)?;
         for &e in data {
-            self.push_raw(&e.to_le_bytes())?;
+            self.push_raw_fixed(&e.to_le_bytes())?;
         }
         Ok(())
     }

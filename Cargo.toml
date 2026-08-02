@@ -12,7 +12,7 @@ categories = ["encoding", "parsing", "network-programming"]
 # The crate is published on crates.io as `sofa-buffers-corelib` (the name users
 # add to their `Cargo.toml`), but the importable namespace is `sofab` —
 # `use sofab::…`. This matches the language-independent API contract
-# (ARCHITECTURE §6).
+# (CORELIB_PLAN §6).
 [lib]
 name = "sofab"
 
