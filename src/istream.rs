@@ -325,9 +325,17 @@ impl IStream {
             };
             let wire = (header & 0x07) as u8;
             let id_raw = header >> 3;
-            if id_raw > ID_MAX as Unsigned {
+            // The ID_MAX ceiling bounds the id of a *value-bearing* header only
+            // (§6.2). A sequence end carries no value, so whatever id it names
+            // is discarded and the marker re-encoded as the bare `0x07` (§4.9)
+            // — an over-ceiling id there is normalized away, not INVALID. The
+            // header varint stays bounded by §4.1's 64-bit limit either way,
+            // which `read_varint` has already enforced above.
+            if id_raw > ID_MAX as Unsigned && wire != T_SEQUENCE_END {
                 return Err(Error::InvalidMsg);
             }
+            // Truncating only for a sequence end past the ceiling, whose arm
+            // ignores `id`; every other arm has just had `id_raw` bounded.
             let id = id_raw as Id;
 
             match wire {
