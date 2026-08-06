@@ -21,7 +21,7 @@
 //! whole-buffer `feed` — so a whole message and the same bytes fed a byte at a
 //! time run the exact same code; this suite exercises both.
 
-use sofab::{Error, FixlenType, Id, IStream, Visitor};
+use sofab::{Error, FixlenType, IStream, Id, Visitor};
 
 /// One header/payload event, recorded in order. A dedicated visitor keeps this
 /// suite's assertions about *ordering* — header before the first payload byte —
@@ -117,10 +117,7 @@ fn header_is_announced_only_once_the_length_word_has_arrived() {
     let mut is = IStream::new();
     for (i, b) in bytes.iter().enumerate() {
         let _ = is.feed(&[*b], &mut rec);
-        let announced = rec
-            .events
-            .iter()
-            .any(|e| matches!(e, Ev::FixlenBegin(..)));
+        let announced = rec.events.iter().any(|e| matches!(e, Ev::FixlenBegin(..)));
         // byte 0 is the tag, byte 1 the length word (single-byte for len 10).
         assert_eq!(
             announced,
@@ -200,7 +197,10 @@ fn empty_blob_announces_the_header_with_its_subtype() {
     assert_eq!(outcome, Ok(()));
     assert_eq!(
         events,
-        [Ev::FixlenBegin(3, FixlenType::Blob, 0), Ev::Blob(3, 0, 0, 0)]
+        [
+            Ev::FixlenBegin(3, FixlenType::Blob, 0),
+            Ev::Blob(3, 0, 0, 0)
+        ]
     );
 }
 
