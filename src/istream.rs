@@ -80,6 +80,32 @@ pub trait Visitor {
     /// A chunk of a blob field. See [`Visitor::string`] for the chunking model.
     fn blob(&mut self, id: Id, total: usize, offset: usize, chunk: &[u8]) {}
 
+    /// Start of a scalar fixlen field, announced after its length word is read
+    /// and validated and **before** any payload byte. Fired exactly **once** per
+    /// field, `total == 0` included, and never for an array element (an array is
+    /// announced through [`Visitor::array_begin`] instead).
+    ///
+    /// This is the scalar twin of [`Visitor::array_begin`], and exists for the
+    /// same reason: a schema bound established by the length word alone — a
+    /// `string`/`blob` whose `total` exceeds a `maxlen` — must be latchable *at
+    /// the word*. CORELIB_PLAN §5.2 makes INVALID dominate INCOMPLETE, so a
+    /// message truncated exactly at the length word cannot be allowed to degrade
+    /// to INCOMPLETE while the same bytes read whole are INVALID (a
+    /// chunk-boundary-dependent verdict §6.4/§7.2 forbid). Without this callback
+    /// the only event carrying `total` is [`Visitor::string`] / [`Visitor::blob`]
+    /// on the payload path, which cannot fire for a message that ends there.
+    /// Raising from this callback is what a consumer uses to turn the field
+    /// INVALID at the word.
+    ///
+    /// `subtype` is the subtype actually on the wire (`Str` / `Blob` / `Fp32` /
+    /// `Fp64`): the corelib knows what *arrived*, not what was *declared*, so a
+    /// consumer whose field expects a different subtype treats this as a §7.3
+    /// skip rather than measuring `total` against that field's bound. For a
+    /// float, `total` is the fixed width (4 or 8), already validated here; a
+    /// malformed float width is rejected before this fires, so nothing is
+    /// announced for it.
+    fn fixlen_begin(&mut self, id: Id, subtype: FixlenType, total: usize) {}
+
     /// Start of an array field with `count` elements of the given `kind`. The
     /// elements follow via the scalar / float callbacks with the same `id`.
     ///
@@ -365,31 +391,51 @@ impl IStream {
                     // enum only to branch on it again — two jump tables where
                     // the wire needs one. An unknown tag falls through to the
                     // `InvalidMsg` arm exactly as `from_raw` would report it.
+                    //
+                    // Each arm announces the field at its length word via
+                    // `fixlen_begin` — after the word is read and validated,
+                    // before any payload byte — so a schema `maxlen` violation is
+                    // latchable *here*: a message ending exactly at this word must
+                    // stay INVALID rather than degrade to INCOMPLETE (§5.2, and see
+                    // [`Visitor::fixlen_begin`]). It is the scalar twin of the
+                    // `array_begin` on the array arms below; the array wire types
+                    // dispatch elsewhere, so this fires once per scalar fixlen
+                    // field, `total == 0` included. A malformed float width is
+                    // rejected first, so nothing is announced for it.
                     match (word & 0x07) as u8 {
                         FX_FP32 => {
                             if len != 4 {
                                 return Err(Error::InvalidMsg);
                             }
-                            if buf.len() - pos < 4 {
-                                return Ok(field_start); // carry header+word+partial
+                            v.fixlen_begin(id, FixlenType::Fp32, len);
+                            // A scalar float is a one-element fixed-width run on
+                            // the wire; deliver it through `fix_array` (count 1)
+                            // so a value straddling the chunk boundary resumes via
+                            // `Resume::ArrayFix` instead of re-parsing the header —
+                            // which would re-fire `fixlen_begin`.
+                            pos = self.fix_array::<false, V>(buf, pos, id, 1, v);
+                            if !matches!(self.resume, Resume::None) {
+                                return Ok(pos);
                             }
-                            // SAFETY: 4 bytes are readable at `pos`.
-                            unsafe { emit_fixlen_value::<false, V>(buf, pos, id, v) };
-                            pos += 4;
                         }
                         FX_FP64 => {
                             if len != 8 {
                                 return Err(Error::InvalidMsg);
                             }
-                            if buf.len() - pos < 8 {
-                                return Ok(field_start);
+                            v.fixlen_begin(id, FixlenType::Fp64, len);
+                            pos = self.fix_array::<true, V>(buf, pos, id, 1, v);
+                            if !matches!(self.resume, Resume::None) {
+                                return Ok(pos);
                             }
-                            // SAFETY: 8 bytes are readable at `pos`.
-                            unsafe { emit_fixlen_value::<true, V>(buf, pos, id, v) };
-                            pos += 8;
                         }
                         tag @ (FX_STR | FX_BLOB) => {
                             let is_blob = tag == FX_BLOB;
+                            let subtype = if is_blob {
+                                FixlenType::Blob
+                            } else {
+                                FixlenType::Str
+                            };
+                            v.fixlen_begin(id, subtype, len);
                             if buf.len() - pos >= len {
                                 // Whole payload present: hand it over as one
                                 // borrowed slice, no `resume` bookkeeping. This
