@@ -204,3 +204,35 @@ fn deep_nested_sequences_roundtrip() {
     }
     assert_eq!(ev, expected);
 }
+
+#[test]
+fn an_over_ceiling_sequence_end_id_normalizes_to_the_canonical_marker() {
+    // The other direction — decode, then re-encode — for the one construct §4.9
+    // defines asymmetrically: a decoder MUST accept a sequence-end header
+    // carrying *any* id and discard it, and what it decoded MUST re-encode as
+    // the canonical single byte `0x07`.
+    //
+    // Input is the F-0054 isolate: a sequence opened under id 14 and closed by
+    // an end marker whose id is 2³¹, one past ID_MAX (§6.2 exempts the marker).
+    let mut rec = Recorder::new();
+    let mut is = IStream::new();
+    is.feed(&[0x76, 0x87, 0x80, 0x80, 0x80, 0x40], &mut rec)
+        .expect("decode failed");
+    assert_eq!(rec.events, [Event::SequenceBegin(14), Event::SequenceEnd]);
+
+    let mut buf = [0u8; 16];
+    let used = {
+        let mut os = OStream::new(&mut buf);
+        for ev in &rec.events {
+            match ev {
+                Event::SequenceBegin(id) => os.write_sequence_begin_lazy(*id).unwrap(),
+                // `_keep`, so the empty frame survives re-encoding and the end
+                // marker is actually written out.
+                Event::SequenceEnd => os.write_sequence_end_keep().unwrap(),
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        os.bytes_used()
+    };
+    assert_eq!(&buf[..used], &[0x76, 0x07]);
+}
