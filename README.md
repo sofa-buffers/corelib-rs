@@ -56,7 +56,7 @@ use sofab::{OStream, decode};
 
 | Goal | How |
 |------|-----|
-| Streaming **out** | `OStream` writes into a caller buffer and calls a `Flush` sink when it fills, so a message can exceed the buffer; `buffer_set` swaps the buffer mid-stream. |
+| Streaming **out** | `OStream` writes into a caller buffer and hands it to a `Flush` sink when it fills, so a message can exceed the buffer — down to a `MIN_OUTPUT_BUFFER` of **1 byte**. The sink says what to write into next: the same buffer (it copied) or a replacement (it took ours). |
 | Streaming **in** | `IStream::feed` takes arbitrarily small chunks and suspends/resumes at any byte boundary; string/blob payloads are delivered incrementally. |
 | Zero unnecessary copies | `decode` parses straight from the input buffer, handing string/blob fields back as borrowed slices; `feed` copies only bytes that straddle a chunk boundary. |
 | Low allocation | Per-field encode/decode allocates nothing; the decoder dispatches into a monomorphized `Visitor` (no `dyn`, no boxing). The encoder's only heap use is the run of held-back sequence headers (see [Sequences](#sequences)), and even that stays inline until you nest more than 8 deep. |
@@ -116,8 +116,8 @@ let message = &buf[..used];
 
 ### Serialize stream
 
-Attach a `Flush` sink (any `FnMut(&[u8])`) with `OStream::with_flush`. When the
-scratch buffer fills, its bytes drain to the sink and writing resumes at the start;
+Attach a `Flush` sink with `OStream::with_flush`. When the scratch buffer fills, it
+goes to the sink and writing resumes in whatever the sink leaves behind;
 `flush()` pushes the tail — so the message can far exceed the buffer:
 
 ```rust
@@ -128,11 +128,21 @@ let mut out = Vec::new();                  // or a socket / file
 {
     let mut os = OStream::with_flush(&mut scratch, 0, |chunk: &[u8]| {
         out.extend_from_slice(chunk);
-    });
+    })
+    .unwrap();                             // rejects a buffer below MIN_OUTPUT_BUFFER
     for i in 0..1000u32 { os.write_unsigned(i, i as u64).unwrap(); }
-    os.flush();                            // push the tail
+    os.flush().unwrap();                   // push the tail
 }
 ```
+
+Any `FnMut(&[u8])` is a **copying** sink: it borrows the bytes and the encoder keeps
+writing into the same buffer. A **taking** sink — one that queues the buffer for an
+async write or hands it to DMA — implements `Flush` by hand and returns a
+*replacement* buffer plus its start offset. It cannot do otherwise: the buffer
+arrives as an owned `&mut [u8]`, so a sink that keeps it has nothing to give back
+and must supply a replacement to compile. Returning a buffer with a non-zero offset
+is how a sink re-arms header room in every flushed unit — one framing header per
+packet.
 
 ### Sequences
 
@@ -357,12 +367,29 @@ The hot path is allocation-free and **never owns your payload memory** — you o
 the buffers on both sides.
 
 - **Encode (`OStream`):** you own the `&mut [u8]`; the library never allocates or
-  grows it. With no sink, overflow is `Error::BufferFull`; with a `Flush` sink the
-  buffer drains and is reused (`buffer_set` swaps a fresh one). To collect into a
-  `Vec`, drive a small scratch buffer with an appending flush closure — *you* own
-  the `Vec`. The encoder's own memory is the run of held-back sequence ids
-  ([Sequences](#sequences)): eight of them inline, spilling to the heap only if
-  you nest deeper than that.
+  grows an output buffer — not even for the one-shot path, where the caller (or
+  generated code, from the schema's `MAX_SIZE`) allocates and hands one in. With no
+  sink, overflow is `Error::BufferFull`; with a `Flush` sink the buffer goes to the
+  sink, which either copies and returns it or takes it and installs a replacement.
+  `buffer_set` does the same from the outside, between messages or after a
+  buffer-full. To collect into a `Vec`, drive a small scratch buffer with an
+  appending flush closure — *you* own the `Vec`. The encoder's own memory is the
+  run of held-back sequence ids ([Sequences](#sequences)): eight of them inline,
+  spilling to the heap only if you nest deeper than that.
+- **`MIN_OUTPUT_BUFFER` = 1.** The smallest output buffer this port accepts **for
+  streaming**. It binds every buffer installed *together with a sink* —
+  `with_flush`, `buffer_set` on a stream that has one, and a replacement a sink
+  returns — which must have `buffer.len() - offset >= 1`; a smaller one is refused
+  with `Error::Argument` where it is handed over, never partway through a message.
+  It binds **nothing else**: a buffer installed *without* a sink has no minimum,
+  because no flush can occur there, so a caller sizing from `MAX_SIZE` keeps it
+  exact and a two-byte message still encodes into a two-byte buffer. The value is 1
+  because the encoder splits every atomic unit — header, `fixlen_word`, count,
+  scalar, float — across a flush at any byte boundary, so nothing needs to land
+  contiguously.
+- **No pass-through.** A sink is only ever handed the output buffer; a `string` or
+  `blob` payload is copied through it rather than passed to the sink directly. Your
+  sink never receives memory it did not get from you.
 - **Decode (`decode` / `IStream` + `Visitor`):** you own the input buffer and it
   must outlive the call. On the zero-copy `decode` fast path (and self-contained
   `feed` chunks) string/blob `&[u8]` chunks **borrow** directly from it, valid
@@ -371,7 +398,7 @@ the buffers on both sides.
 
 | Buffer | Owner / lifetime |
 |--------|------------------|
-| **Output buffer** | Caller-owned `&mut [u8]`; library never allocates or grows it. |
+| **Output buffer** | Caller-owned `&mut [u8]`; library never allocates or grows it. With a sink: capacity ≥ `MIN_OUTPUT_BUFFER` (1). |
 | **Input buffer** | Caller-owned; must outlive the call; string/blob slices borrow from it during the callback. |
 
 This is a **push / visitor** model: values are handed to your `Visitor` as they

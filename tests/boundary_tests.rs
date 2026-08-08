@@ -22,7 +22,7 @@ use sofab::{Error, IStream, OStream};
 /// Write one field of every kind — scalars, floats, a string, a blob, all three
 /// array flavours and a nested sequence — so a single pass exercises every
 /// writer and every decoder resume state.
-fn write_everything<F: sofab::Flush>(os: &mut OStream<F>) {
+fn write_everything<'a, F: sofab::Flush<'a>>(os: &mut OStream<'a, F>) {
     os.write_unsigned(1, 0xDEAD_BEEF).unwrap();
     os.write_unsigned(2, u64::MAX).unwrap(); // 10-byte varint
     os.write_signed(3, -12345).unwrap();
@@ -69,9 +69,10 @@ fn every_buffer_size_produces_the_one_shot_bytes() {
         {
             let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
                 collected.extend_from_slice(chunk);
-            });
+            })
+            .unwrap();
             write_everything(&mut os);
-            os.flush();
+            os.flush().unwrap();
         }
         assert_eq!(
             collected, reference,
@@ -131,9 +132,10 @@ fn an_array_larger_than_the_buffer_streams_out_whole() {
         {
             let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
                 collected.extend_from_slice(chunk);
-            });
+            })
+            .unwrap();
             os.write_array_unsigned(7, &src).unwrap();
-            os.flush();
+            os.flush().unwrap();
         }
         assert_eq!(
             collected, reference,
