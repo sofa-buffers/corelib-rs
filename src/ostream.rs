@@ -18,31 +18,90 @@ use crate::varint::{
 };
 use crate::{Id, Signed, Unsigned};
 
-/// Sink that receives buffered bytes when the output buffer is flushed.
+/// Sink that receives the output buffer when it fills (or on an explicit
+/// [`OStream::flush`]), and says what the encoder writes into next.
 ///
-/// Any `FnMut(&[u8])` closure implements this trait, so callbacks can be passed
-/// directly. Implement it manually to plug into a custom transport/writer.
-pub trait Flush {
-    /// Consume `data` (e.g. push to a transport or storage). Called with the
-    /// bytes accumulated since the last flush.
-    fn flush(&mut self, data: &[u8]);
+/// # The handover contract (CORELIB_PLAN §5.1)
+///
+/// A sink either **copies** the bytes it was handed or **takes** the buffer —
+/// queues it for an asynchronous write, hands it to a transport, to DMA. The
+/// encoder cannot tell the two apart, so the sink states which it did by what it
+/// returns:
+///
+/// * **Copied** — return the same buffer with offset `0`. The encoder resumes
+///   writing into it from the start.
+/// * **Took** — return a *replacement* buffer and the offset to start at. The
+///   encoder switches to it and never touches the one it gave away.
+///
+/// Rust makes the dangerous half impossible rather than merely forbidden: the
+/// buffer arrives as an owned `&'a mut [u8]`, so a sink that keeps it has
+/// nothing to give back and *must* supply a replacement to compile. There is no
+/// "returned without installing anything while secretly retaining the memory"
+/// state for this port to guard against.
+///
+/// The returned buffer is a mid-stream installation like any other, so its
+/// capacity (`len - offset`) must be at least [`MIN_OUTPUT_BUFFER`]; a smaller
+/// one is refused with [`Error::Argument`] at the flush that returned it. The
+/// offset belongs to the installation and is consumed — returning the same
+/// buffer with a non-zero offset is how a sink re-arms header room in *every*
+/// flushed unit, one framing header per packet.
+///
+/// # Closures
+///
+/// Any `FnMut(&[u8])` implements this trait as a **copying** sink, so the common
+/// case stays a one-liner:
+///
+/// ```
+/// # use sofab::OStream;
+/// let mut out: Vec<u8> = Vec::new();
+/// let mut scratch = [0u8; 16];
+/// let mut os = OStream::with_flush(&mut scratch, 0, |chunk: &[u8]| {
+///     out.extend_from_slice(chunk)
+/// })
+/// .unwrap();
+/// os.write_unsigned(1, 42).unwrap();
+/// os.flush().unwrap();
+/// ```
+///
+/// Implement the trait by hand only for a taking sink — a closure has no way to
+/// return a buffer.
+pub trait Flush<'a> {
+    /// Consume the first `used` bytes of `buffer`, then say what to write into
+    /// next: `(buffer, 0)` if the bytes were copied, or `(replacement, offset)`
+    /// if `buffer` was taken.
+    fn flush(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize);
 }
 
-impl<T: FnMut(&[u8])> Flush for T {
+impl<'a, T: FnMut(&[u8])> Flush<'a> for T {
     #[inline]
-    fn flush(&mut self, data: &[u8]) {
-        self(data)
+    fn flush(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize) {
+        self(&buffer[..used]);
+        (buffer, 0)
     }
 }
 
-/// A [`Flush`] sink that does nothing. Used as the default when the stream is
-/// constructed without a sink; a full buffer then returns [`Error::BufferFull`].
+/// A [`Flush`] sink that does nothing. Used as the default type parameter when
+/// the stream is constructed without a sink; a full buffer then returns
+/// [`Error::BufferFull`] and this sink is never called.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoFlush;
 
-impl Flush for NoFlush {
+impl<'a> Flush<'a> for NoFlush {
     #[inline]
-    fn flush(&mut self, _data: &[u8]) {}
+    fn flush(&mut self, buffer: &'a mut [u8], _used: usize) -> (&'a mut [u8], usize) {
+        (buffer, 0)
+    }
+}
+
+/// Whether a buffer may be installed **with a sink**: its capacity must reach
+/// [`MIN_OUTPUT_BUFFER`] (CORELIB_PLAN §5.1). `checked_sub` folds the
+/// out-of-range-offset case in — an offset past the end has no capacity at all.
+#[inline]
+fn check_streaming_capacity(len: usize, offset: usize) -> Result<()> {
+    match len.checked_sub(offset) {
+        Some(capacity) if capacity >= MIN_OUTPUT_BUFFER => Ok(()),
+        _ => Err(Error::Argument),
+    }
 }
 
 /// How many held-back sequence headers fit without touching the heap. Nesting
@@ -158,7 +217,7 @@ impl PendingRun {
 }
 
 /// Streaming Sofab encoder writing into a caller-provided buffer.
-pub struct OStream<'a, F: Flush = NoFlush> {
+pub struct OStream<'a, F: Flush<'a> = NoFlush> {
     buffer: &'a mut [u8],
     end: usize,
     offset: usize,
@@ -195,21 +254,35 @@ impl<'a> OStream<'a, NoFlush> {
     }
 }
 
-impl<'a, F: Flush> OStream<'a, F> {
+impl<'a, F: Flush<'a>> OStream<'a, F> {
     /// Create an encoder with a flush `sink`, starting at `offset`. When the
-    /// buffer fills, the accumulated bytes are passed to `sink` and writing
-    /// resumes at the start of the buffer.
+    /// buffer fills, it is handed to `sink` under the [`Flush`] handover
+    /// contract and writing resumes in whatever the sink left behind.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] if the buffer's capacity — `buffer.len() - offset`,
+    /// which an offset past the end makes nonexistent — is below
+    /// [`MIN_OUTPUT_BUFFER`]. A buffer that cannot hold a single byte would
+    /// otherwise flush stale content, or none at all, partway through a message;
+    /// the minimum is checked **here**, where the buffer is handed over, and
+    /// nowhere later (CORELIB_PLAN §5.1).
+    ///
+    /// The minimum applies only because a sink is attached. Use
+    /// [`OStream::new`] / [`OStream::with_offset`] for a buffer without one:
+    /// no flush can occur there, so no minimum binds it.
     #[inline]
-    pub fn with_flush(buffer: &'a mut [u8], offset: usize, sink: F) -> Self {
+    pub fn with_flush(buffer: &'a mut [u8], offset: usize, sink: F) -> Result<Self> {
+        check_streaming_capacity(buffer.len(), offset)?;
         let end = buffer.len();
-        OStream {
+        Ok(OStream {
             buffer,
             end,
             offset,
             depth: 0,
             pending: PendingRun::default(), // heap-free until nesting spills
             flush: Some(sink),
-        }
+        })
     }
 
     /// Number of bytes written to the active buffer since the last flush.
@@ -220,24 +293,67 @@ impl<'a, F: Flush> OStream<'a, F> {
 
     /// Flush any pending bytes to the sink (if one is set) and report how many
     /// bytes were pending. With no sink the buffer is left intact.
-    pub fn flush(&mut self) -> usize {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] if the sink took the buffer and installed a
+    /// replacement whose capacity is below [`MIN_OUTPUT_BUFFER`]. The bytes
+    /// reached the sink either way; what failed is the next installation.
+    pub fn flush(&mut self) -> Result<usize> {
         let used = self.offset;
-        if used > 0 {
-            if let Some(sink) = self.flush.as_mut() {
-                sink.flush(&self.buffer[..used]);
-                self.offset = 0;
-            }
+        if used > 0 && self.flush.is_some() {
+            self.hand_over()?;
         }
-        used
+        Ok(used)
     }
 
-    /// Replace the active buffer (typically called from within a flush sink),
-    /// resuming writes at `offset` in the new buffer.
+    /// Replace the active buffer, resuming writes at `offset` in the new one.
+    ///
+    /// This is the mid-stream buffer-set of CORELIB_PLAN §5.1. A sink does not
+    /// call it — it returns its replacement from [`Flush::flush`] instead, which
+    /// is the only point at which the encoder is between buffers. Use this from
+    /// the *outside*: to install a bigger buffer after a sinkless stream reported
+    /// [`Error::BufferFull`], or to re-arm header room between messages.
+    ///
+    /// The offset belongs to this installation and is consumed by it.
+    ///
+    /// # Errors
+    ///
+    /// On a stream **with** a sink, [`Error::Argument`] if the new buffer's
+    /// capacity (`buffer.len() - offset`) is below [`MIN_OUTPUT_BUFFER`]. A
+    /// stream without a sink is subject to no minimum and this never fails.
     #[inline]
-    pub fn buffer_set(&mut self, buffer: &'a mut [u8], offset: usize) {
+    pub fn buffer_set(&mut self, buffer: &'a mut [u8], offset: usize) -> Result<()> {
+        if self.flush.is_some() {
+            check_streaming_capacity(buffer.len(), offset)?;
+        }
         self.end = buffer.len();
         self.buffer = buffer;
         self.offset = offset;
+        Ok(())
+    }
+
+    /// Hand the active buffer to the sink and adopt whatever it leaves behind —
+    /// the same buffer if it copied, a replacement if it took ours.
+    ///
+    /// The buffer is moved out with a `mem::take`, because handing a sink
+    /// `&'a mut [u8]` is what lets it *keep* the memory; an empty slice stands in
+    /// for the moment in between. Whatever comes back is installed before the
+    /// capacity is judged, so a rejected replacement still cannot be written
+    /// into: below [`MIN_OUTPUT_BUFFER`] means `offset >= end`, which routes the
+    /// next write back through here rather than into the buffer.
+    fn hand_over(&mut self) -> Result<()> {
+        let used = self.offset;
+        let buffer = core::mem::take(&mut self.buffer);
+        let sink = self
+            .flush
+            .as_mut()
+            .expect("hand_over is only reached with a sink installed");
+        let (buffer, offset) = sink.flush(buffer, used);
+        self.end = buffer.len();
+        self.buffer = buffer;
+        self.offset = offset;
+        check_streaming_capacity(self.end, offset)
     }
 
     // --- primitives ---------------------------------------------------------
@@ -258,14 +374,10 @@ impl<'a, F: Flush> OStream<'a, F> {
     #[cold]
     #[inline(never)]
     fn drain_full(&mut self) -> Result<()> {
-        match self.flush.as_mut() {
-            Some(sink) => {
-                sink.flush(&self.buffer[..self.offset]);
-                self.offset = 0;
-                Ok(())
-            }
-            None => Err(Error::BufferFull),
+        if self.flush.is_none() {
+            return Err(Error::BufferFull);
         }
+        self.hand_over()
     }
 
     /// Copy a raw byte slice out, draining the buffer as needed. Uses a bulk

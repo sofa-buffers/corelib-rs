@@ -27,7 +27,7 @@ fn buffer_set_switches_buffers() {
         let mut os = OStream::new(&mut a);
         os.write_unsigned(0, 1).unwrap();
         let ua = os.bytes_used();
-        os.buffer_set(&mut b, 0);
+        os.buffer_set(&mut b, 0).unwrap();
         os.write_unsigned(0, 2).unwrap();
         (ua, os.bytes_used())
     };
@@ -42,7 +42,7 @@ fn flush_without_sink_reports_pending_bytes() {
     let mut os = OStream::new(&mut buf);
     os.write_unsigned(0, 7).unwrap();
     // No sink: flush() reports the count but leaves the buffer in place.
-    assert_eq!(os.flush(), 2);
+    assert_eq!(os.flush(), Ok(2));
     assert_eq!(os.bytes_used(), 2);
 }
 
