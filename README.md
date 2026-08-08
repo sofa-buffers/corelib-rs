@@ -52,6 +52,37 @@ cargo add sofa-buffers-corelib
 use sofab::{OStream, decode};
 ```
 
+### Feature flags
+
+**None — always the full format.**
+
+### Choosing between the two Rust corelibs
+
+SofaBuffers ships **two** Rust corelibs with the same API and the same wire
+format, each built for its target:
+
+- **`corelib-rs` (this crate)** — `std`, heap-using, `opt-level = 3` + fat LTO.
+  For desktop and server workloads where throughput is the goal. Golden reference
+  for the benchmark tools; roughly **1.4× prost throughput** in the arena.
+- **[`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std)** —
+  `#![no_std]`, no allocator, `opt-level = "z"` + LTO, size-tuned for bare-metal
+  firmware. About **1.3× micropb throughput** at a Cortex-M flash footprint of
+  roughly **7.0 KB vs ~8.5 KB**.
+
+| | `corelib-rs` (this crate) | `corelib-rs-no-std` |
+|---|---|---|
+| Target | desktop / server | microcontroller / firmware |
+| `std` / allocator | requires `std`, uses the heap | `#![no_std]`, no allocation |
+| Release profile | `opt-level = 3`, fat LTO | `opt-level = "z"`, LTO |
+| Optimized for | raw throughput | small `.text` footprint |
+| Configurable format | no — always full | Cargo features trim wire types / value width |
+| Arena reference | ~1.4× prost | ~1.3× micropb; Cortex-M ~7.0 KB vs ~8.5 KB |
+
+Pick **this crate** for servers and throughput; pick **`corelib-rs-no-std`** for
+embedded and footprint. The public API mirrors between them, so moving code across
+is at most a profile change. Arena figures are approximate (best-of-5, comparable
+only within a language).
+
 ## Why this design
 
 | Goal | How |
@@ -408,10 +439,6 @@ that straddled a chunk boundary; on the encode side it is `OStream`'s run of
 held-back sequence ids — inline up to eight levels, spilling to a `Vec` beyond,
 never larger than the depth you actually nest to.
 
-## Feature flags
-
-**None — always the full format.**
-
 ## Build & test
 
 ```bash
@@ -425,13 +452,19 @@ most recent pinned stable releases, a library-only build at the declared
 **MSRV 1.70**, the same suite on a **big-endian** s390x host under QEMU, and
 llvm-cov coverage.
 Integration tests live in `tests/` (shared-vector replay, fast-path decode,
-encoder/decoder byte-exact checks, round-trip, and malformed-input errors).
+encoder/decoder byte-exact checks, round-trip, malformed-input errors, the
+output-buffer and flush-handover contract, non-canonical-but-valid input, and
+chunk lifetime — every chunk scrubbed the moment `feed` returns).
 
 ## Benchmarks
 
 Three tools mirror the other ports' `perf`, `bench` and `run_callgrind.sh`
-tooling — same workloads (a 1000-element `u64` array and a mixed message) and
-output format, so results are comparable across languages:
+tooling — same workloads and output format, so results are comparable across
+languages. `bench` and `run_callgrind.sh` cover all four BENCH_SPEC datasets: a
+1000-element `u64` array, a small mixed message, an unbounded **1 MB blob**
+(one-shot and streamed through a 4096-byte buffer), and the **composite** message
+(wrapper array, multi-byte UTF-8, depth-3 nesting, an omitted default field, a
+two-byte field header) with a decode and a skip-all decode row:
 
 ```bash
 cargo bench --bench perf          # cycles/op + CPU ns/op + throughput
@@ -446,29 +479,8 @@ RUSTFLAGS="-C target-cpu=native" cargo bench   # last few percent
 independent of clock speed or scheduling, so the numbers compare across
 machines.
 
-## Choosing between the two Rust corelibs
-
-SofaBuffers ships **two** Rust corelibs with the same API and the same wire
-format, each built for its target:
-
-- **`corelib-rs` (this crate)** — `std`, heap-using, `opt-level = 3` + fat LTO.
-  For desktop and server workloads where throughput is the goal. Golden reference
-  for the benchmark tools; roughly **1.4× prost throughput** in the arena.
-- **[`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std)** —
-  `#![no_std]`, no allocator, `opt-level = "z"` + LTO, size-tuned for bare-metal
-  firmware. About **1.3× micropb throughput** at a Cortex-M flash footprint of
-  roughly **7.0 KB vs ~8.5 KB**.
-
-| | `corelib-rs` (this crate) | `corelib-rs-no-std` |
-|---|---|---|
-| Target | desktop / server | microcontroller / firmware |
-| `std` / allocator | requires `std`, uses the heap | `#![no_std]`, no allocation |
-| Release profile | `opt-level = 3`, fat LTO | `opt-level = "z"`, LTO |
-| Optimized for | raw throughput | small `.text` footprint |
-| Configurable format | no — always full | Cargo features trim wire types / value width |
-| Arena reference | ~1.4× prost | ~1.3× micropb; Cortex-M ~7.0 KB vs ~8.5 KB |
-
-Pick **this crate** for servers and throughput; pick **`corelib-rs-no-std`** for
-embedded and footprint. The public API mirrors between them, so moving code across
-is at most a profile change. Arena figures are approximate (best-of-5, comparable
-only within a language).
+The `blob 1MB` rows are bandwidth-bound — five bytes of that message are metadata
+and a million are payload — so read them **against each other**, not next to
+`typical message`. The optional `encode: blob 1MB passthrough` row is absent: this
+port copies `string`/`blob` runs through the output buffer rather than handing them
+to the sink directly, which CORELIB_PLAN §5.1 permits.

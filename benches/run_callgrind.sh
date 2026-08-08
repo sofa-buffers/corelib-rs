@@ -37,7 +37,21 @@ fi
 
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
-WORKLOADS=(encode_u64_array encode_typical decode_u64_array decode_typical)
+# Order follows BENCH_SPEC's table. `encode: blob 1MB passthrough` is its one
+# optional row and this port implements no pass-through (CORELIB_PLAN §5.1 makes
+# it a MAY), so the row is absent rather than a placeholder.
+WORKLOADS=(
+    encode_u64_array
+    encode_typical
+    encode_blob_oneshot
+    encode_blob_streaming
+    encode_composite
+    decode_u64_array
+    decode_typical
+    decode_blob
+    decode_composite
+    decode_composite_skip
+)
 
 run_cg() { # $1 workload
     valgrind --tool=callgrind --collect-atstart=no --toggle-collect="run_$1" \
@@ -50,10 +64,16 @@ bytes_of() { grep -ohE 'BYTES=[0-9]+' "$OUT/$1.log" 2>/dev/null | head -1 | cut 
 
 label() {
     case "$1" in
-        encode_u64_array) echo "encode: u64 array (1000)";;
-        encode_typical)   echo "encode: typical message";;
-        decode_u64_array) echo "decode: u64 array (1000)";;
-        decode_typical)   echo "decode: typical message";;
+        encode_u64_array)      echo "encode: u64 array (1000)";;
+        encode_typical)        echo "encode: typical message";;
+        encode_blob_oneshot)   echo "encode: blob 1MB one-shot";;
+        encode_blob_streaming) echo "encode: blob 1MB streaming";;
+        encode_composite)      echo "encode: composite";;
+        decode_u64_array)      echo "decode: u64 array (1000)";;
+        decode_typical)        echo "decode: typical message";;
+        decode_blob)           echo "decode: blob 1MB";;
+        decode_composite)      echo "decode: composite";;
+        decode_composite_skip) echo "decode: composite skip-all";;
     esac
 }
 
@@ -74,3 +94,7 @@ done
 echo
 echo "Ir = instructions retired (Callgrind). Independent of CPU clock and OS"
 echo "scheduling; depends only on the executed code, so it compares across machines."
+echo
+echo "The blob 1MB rows are where Ir/op earns its keep: the gap from one-shot to"
+echo "streaming is the divisible-run path (CORELIB_PLAN 5.1) with the memory"
+echo "subsystem taken out of it, which MB/s cannot show on a bandwidth-bound row."
