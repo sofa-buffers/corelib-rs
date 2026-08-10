@@ -1042,15 +1042,27 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// `struct`/`union` field, and an array field whose declared `default` is the
     /// empty collection (MESSAGE_SPEC §2). Where the frame must be visible, close
     /// with [`OStream::write_sequence_end_keep`] instead.
+    ///
+    /// Closing a sequence that is **not open** is [`Error::Argument`], with
+    /// nothing written: a lone end marker is malformed *regardless of what
+    /// follows* (§5.2 lists "a sequence-end marker with no open sequence" among
+    /// those conditions, and this port's own decoder answers `InvalidMsg` to a
+    /// bare `0x07`), so the encoder refuses to emit one instead of reporting
+    /// success for bytes every conformant decoder must reject. §6.3 leaves a
+    /// single code for a caller mistake — the one this writer's siblings already
+    /// return for an out-of-range id and for nesting past [`MAX_DEPTH`].
     #[inline]
     pub fn write_sequence_end(&mut self) -> Result<()> {
+        if self.depth == 0 {
+            return Err(Error::Argument);
+        }
         if self.pending.pop().is_some() {
             // The innermost open sequence was the last held-back one: dropped.
-            self.depth = self.depth.saturating_sub(1);
+            self.depth -= 1;
             return Ok(());
         }
         self.write_id_type(0, T_SEQUENCE_END)?;
-        self.depth = self.depth.saturating_sub(1);
+        self.depth -= 1;
         Ok(())
     }
 
@@ -1074,13 +1086,21 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// choice when in doubt: using it where [`OStream::write_sequence_end`] would
     /// do costs one non-canonical empty frame that a decoder normalizes away, while
     /// the reverse silently changes an array's length.
+    ///
+    /// Closing a sequence that is **not open** is [`Error::Argument`], with
+    /// nothing written — see [`OStream::write_sequence_end`]. The check comes
+    /// first, before any held-back header is committed, so a rejected close
+    /// leaves the stream exactly as it found it.
     #[inline]
     pub fn write_sequence_end_keep(&mut self) -> Result<()> {
+        if self.depth == 0 {
+            return Err(Error::Argument);
+        }
         if !self.pending.is_empty() {
             self.commit_pending()?;
         }
         self.write_id_type(0, T_SEQUENCE_END)?;
-        self.depth = self.depth.saturating_sub(1);
+        self.depth -= 1;
         Ok(())
     }
 }

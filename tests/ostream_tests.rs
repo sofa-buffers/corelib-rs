@@ -1048,6 +1048,74 @@ fn sequence_depth_over_max_is_argument_error() {
     os.write_sequence_begin_lazy(0).unwrap();
 }
 
+/// Closing a sequence that was never opened is a caller mistake, not output.
+///
+/// A lone `0x07` is a sequence-end marker with no open sequence — CORELIB_PLAN
+/// §5.2 lists it among the byte sequences that are malformed *regardless of what
+/// follows*, and this port's own decoder rejects it (`IStream::feed(&[0x07])` →
+/// `Error::InvalidMsg`, `dangling_sequence_end_is_invalid`). An encoder that
+/// emits it and answers `Ok(())` therefore reports success for bytes every
+/// conformant decoder in the family must refuse. §6.3 leaves exactly one code
+/// for such a mistake — `InvalidArgument` — which is what the encoder already
+/// returns for the other two structural arguments it checks (`id > ID_MAX`,
+/// `depth >= MAX_DEPTH`).
+///
+/// Both closers are pinned, at the top level and after a balanced frame, and in
+/// both cases the rejection must be total: not one byte reaches the buffer, and
+/// the encoder's depth accounting is left as it was — the guard is what makes
+/// the decrement's underflow unreachable, so the closers may subtract plainly
+/// instead of hiding the mistake behind a `saturating_sub`. The last block
+/// therefore reopens the full `MAX_DEPTH` ceiling after two rejected closes:
+/// neither may have spent a level the caller never opened.
+#[test]
+fn unbalanced_sequence_end_is_argument_error() {
+    fn close(os: &mut OStream, keep: bool) -> Result<(), Error> {
+        if keep {
+            os.write_sequence_end_keep()
+        } else {
+            os.write_sequence_end()
+        }
+    }
+
+    for keep in [false, true] {
+        // At the top level, with nothing ever opened.
+        let mut buf = [0u8; 16];
+        let mut os = OStream::new(&mut buf);
+        assert_eq!(close(&mut os, keep), Err(Error::Argument));
+        assert_eq!(os.bytes_used(), 0, "a rejected close still wrote bytes");
+
+        // One frame too many after a balanced one, both with and without
+        // content in it (the drop path and the emit path of `end`).
+        for content in [false, true] {
+            let mut buf = [0u8; 16];
+            let mut os = OStream::new(&mut buf);
+            os.write_sequence_begin_lazy(1).unwrap();
+            if content {
+                os.write_unsigned(0, 42).unwrap();
+            }
+            os.write_sequence_end().unwrap();
+            let balanced = os.bytes_used();
+            assert_eq!(close(&mut os, keep), Err(Error::Argument));
+            assert_eq!(
+                os.bytes_used(),
+                balanced,
+                "a rejected close still wrote bytes"
+            );
+        }
+    }
+
+    // The depth counter survived: a rejected close must not have consumed a
+    // level, so the full ceiling is still available afterwards.
+    let mut buf = vec![0u8; 1024];
+    let mut os = OStream::new(&mut buf);
+    assert_eq!(os.write_sequence_end(), Err(Error::Argument));
+    assert_eq!(os.write_sequence_end_keep(), Err(Error::Argument));
+    for _ in 0..sofab::MAX_DEPTH {
+        os.write_sequence_begin_lazy(1).unwrap();
+    }
+    assert_eq!(os.write_sequence_begin_lazy(1), Err(Error::Argument));
+}
+
 // --- streaming flush sink ---------------------------------------------------
 
 #[test]
