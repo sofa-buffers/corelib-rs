@@ -202,10 +202,11 @@ fn a_truncated_message_is_incomplete_at_every_cut() {
 type Case = (&'static str, fn(&mut OStream));
 
 /// Every field writer is a point where a lazily-opened sequence stops being
-/// default and its header has to reach the wire (CORELIB_PLAN §6). The fused
-/// writers reach the buffer without going through `write_id_type`, which is
-/// where that commit normally lives, so this pins the obligation on each one
-/// individually: a field written inside a held-back sequence must produce
+/// default and its header has to reach the wire (CORELIB_PLAN §6). The commit
+/// lives in the two content choke points, `write_field_varint` and
+/// `write_fixlen_fixed`, each holding its own copy — there is no single funnel
+/// below them to inherit it from. So this pins the obligation on each public
+/// writer individually: a field written inside a held-back sequence must produce
 /// exactly the header, the field, and the end marker.
 #[test]
 fn every_writer_commits_a_held_back_sequence_header() {

@@ -964,6 +964,80 @@ fn content_bearing_end_gives_the_depth_back() {
     assert_eq!(os.bytes_used(), 4 * per_round);
 }
 
+// --- the sequence-end marker ------------------------------------------------
+
+/// A sequence end is matched positionally against the innermost open start
+/// (CORELIB_PLAN §4.9), so the marker carries **no id**: whatever id the
+/// sequence was opened with — up to and including [`ID_MAX`], whose start header
+/// is five bytes wide — the closer is the bare canonical `0x07`, on both closers.
+///
+/// The marker writer takes no id parameter at all, which is what makes that
+/// true by construction; this pins the wire side of it, so a closer that started
+/// echoing the sequence's id shows up here as an encoder failure rather than as
+/// a decoder-tolerance surprise on the far end.
+#[test]
+fn every_sequence_end_marker_is_the_bare_canonical_byte() {
+    // (id, its `(id << 3) | T_SEQUENCE_START` header as a varint)
+    let cases: &[(u32, &[u8])] = &[
+        (0, &[0x06]),
+        (1, &[0x0E]),
+        (15, &[0x7E]),
+        (16, &[0x86, 0x01]),
+        (2047, &[0xFE, 0x7F]),
+        (ID_MAX, &[0xFE, 0xFF, 0xFF, 0xFF, 0x3F]),
+    ];
+
+    for &(id, header) in cases {
+        let with_content = encode(|os| {
+            os.write_sequence_begin_lazy(id).unwrap();
+            os.write_unsigned(0, 42).unwrap();
+            os.write_sequence_end().unwrap();
+        });
+        let mut expected = header.to_vec();
+        expected.extend_from_slice(&[0x00, 0x2A, 0x07]);
+        assert_eq!(with_content, expected, "sequence id {id}");
+
+        let empty_kept = encode(|os| {
+            os.write_sequence_begin_lazy(id).unwrap();
+            os.write_sequence_end_keep().unwrap();
+        });
+        let mut expected = header.to_vec();
+        expected.push(0x07);
+        assert_eq!(empty_kept, expected, "sequence id {id}, kept");
+    }
+}
+
+/// The marker is a write like any other and its one failure mode is running out
+/// of buffer. Without a sink there is nowhere to drain to, so both closers report
+/// [`Error::BufferFull`] — the only error path the marker writer has, now that
+/// the id bound and the hold-back commit (neither of which a sequence end can
+/// ever reach) are gone from it.
+///
+/// The second half also pins the documented non-atomicity: `end_keep` commits
+/// the held-back header first, so the header is on the wire even though the
+/// marker that should follow it never made it.
+#[test]
+fn a_sequence_end_marker_that_does_not_fit_is_buffer_full() {
+    // Three bytes hold exactly the committed header, the field and its value.
+    let mut buf = [0u8; 3];
+    let mut os = OStream::new(&mut buf);
+    os.write_sequence_begin_lazy(1).unwrap();
+    os.write_unsigned(0, 42).unwrap();
+    assert_eq!(os.write_sequence_end(), Err(Error::BufferFull));
+    assert_eq!(os.bytes_used(), 3);
+    drop(os);
+    assert_eq!(buf, [0x0E, 0x00, 0x2A]);
+
+    // One byte holds the header `end_keep` commits, and nothing more.
+    let mut buf = [0u8; 1];
+    let mut os = OStream::new(&mut buf);
+    os.write_sequence_begin_lazy(1).unwrap();
+    assert_eq!(os.write_sequence_end_keep(), Err(Error::BufferFull));
+    assert_eq!(os.bytes_used(), 1);
+    drop(os);
+    assert_eq!(buf, [0x0E]);
+}
+
 // --- error / overflow behavior ---------------------------------------------
 
 #[test]
@@ -1000,10 +1074,10 @@ fn zero_count_arrays_encode_to_header_plus_count() {
     );
 }
 
-/// `write_sequence_begin_lazy` does its own id check — it is the one writer that
-/// does not reach `write_id_type` until much later (or never), so the rejection
-/// cannot be inherited from there, and `id_overflow_is_argument_error` above
-/// only covers `write_unsigned`.
+/// `write_sequence_begin_lazy` does its own id check — its header is not written
+/// by a field writer at all but held back and later emitted by `commit_pending`,
+/// which bounds nothing, so the rejection cannot be inherited, and
+/// `id_overflow_is_argument_error` above only covers `write_unsigned`.
 ///
 /// Delete the check and the call returns `Ok`, the id joins the pending run, and
 /// the next field write commits an out-of-range tag onto the wire — silently,
