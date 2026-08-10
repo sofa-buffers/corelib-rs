@@ -304,6 +304,79 @@ fn write_array_of_fp64() {
     );
 }
 
+/// A float array's payload is the elements' little-endian images back to back,
+/// and the encoder emits that run in **bulk** rather than element by element.
+/// Two properties have to survive that, and neither is visible in the fixed
+/// vectors above:
+///
+/// * **Bit-exactness.** The wire bytes are the bit pattern, not the value: a
+///   signalling NaN keeps its payload, `-0.0` its sign, a subnormal its
+///   mantissa. `to_le_bytes` is the reference, so the assertion holds on a
+///   big-endian host too — where the bulk run has to byte-swap after all.
+/// * **Buffer-independence.** §5.1 lets that run be divided at any byte, so the
+///   size of the buffer it is streamed through must not show in the output —
+///   down to `MIN_OUTPUT_BUFFER`, where every element is split across a flush.
+#[test]
+fn a_float_array_is_bit_exact_at_every_buffer_size() {
+    // A signalling NaN (quiet bit clear, non-zero payload), a quiet NaN, both
+    // infinities, both zeros, the smallest subnormal and both extremes.
+    let a32: [f32; 9] = [
+        f32::from_bits(0x7F80_0001),
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        f32::MIN,
+        f32::MAX,
+    ];
+    let a64: [f64; 9] = [
+        f64::from_bits(0x7FF0_0000_0000_0001),
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        0.0,
+        -0.0,
+        f64::from_bits(1),
+        f64::MIN,
+        f64::MAX,
+    ];
+
+    // `[ header id 0 = FIXLENARRAY ][ count ][ fixlen_word ]` then the payload.
+    let mut expect32 = vec![0x05, 0x09, 0x20];
+    for e in a32 {
+        expect32.extend_from_slice(&e.to_le_bytes());
+    }
+    let mut expect64 = vec![0x05, 0x09, 0x41];
+    for e in a64 {
+        expect64.extend_from_slice(&e.to_le_bytes());
+    }
+
+    assert_eq!(encode(|os| os.write_array_fp32(0, &a32).unwrap()), expect32);
+    assert_eq!(encode(|os| os.write_array_fp64(0, &a64).unwrap()), expect64);
+
+    for size in [1usize, 2, 3, 5, 8, 16] {
+        let mut out32: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; size];
+        {
+            let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out32.extend_from_slice(d));
+            os.write_array_fp32(0, &a32).unwrap();
+            os.flush().unwrap();
+        }
+        assert_eq!(out32, expect32, "fp32 array through a {size}-byte buffer");
+
+        let mut out64: Vec<u8> = Vec::new();
+        let mut buf = vec![0u8; size];
+        {
+            let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out64.extend_from_slice(d));
+            os.write_array_fp64(0, &a64).unwrap();
+            os.flush().unwrap();
+        }
+        assert_eq!(out64, expect64, "fp64 array through a {size}-byte buffer");
+    }
+}
+
 // --- sequences --------------------------------------------------------------
 
 #[test]
