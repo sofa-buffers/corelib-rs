@@ -307,7 +307,30 @@ impl IStream {
         }
         if self.carry.is_empty() {
             // Fast path: parse straight from the caller's slice, no copy.
-            let consumed = self.parse(chunk, visitor).map_err(|e| self.latch(e))?;
+            //
+            // A chunk that continues a long string/blob payload — every chunk of
+            // a streamed payload but the first — is handed over **here** rather
+            // than by the field parser: delivering one is a dozen instructions,
+            // and routing it through `parse` spends that parser's whole call
+            // frame on a chunk that holds no field at all. Only if the payload
+            // ends inside the chunk does the parser see the remainder.
+            //
+            // (`carry` and `resume` are never both set: an item suspends only by
+            // running out of bytes, which means it consumed the chunk whole.
+            // `parse` resumes a payload for itself all the same, so nothing
+            // rests on that.)
+            let consumed = if matches!(self.resume, Resume::Payload { .. }) {
+                let pos = self.deliver_payload(chunk, 0, visitor);
+                if matches!(self.resume, Resume::None) {
+                    pos + self
+                        .parse(&chunk[pos..], visitor)
+                        .map_err(|e| self.latch(e))?
+                } else {
+                    pos // the whole chunk went into the payload
+                }
+            } else {
+                self.parse(chunk, visitor).map_err(|e| self.latch(e))?
+            };
             if consumed < chunk.len() {
                 self.carry.extend_from_slice(&chunk[consumed..]);
             }
@@ -734,7 +757,11 @@ impl IStream {
 
     /// Deliver as much of an in-progress string/blob payload as `buf` holds,
     /// updating `self.resume`. Returns the new cursor position.
-    #[inline(never)]
+    ///
+    /// Inlined into its callers: it is the whole of a `feed` that continues a
+    /// streamed payload, and an outlined body would put a second call frame
+    /// under one that is already only a dozen instructions of work.
+    #[inline]
     fn deliver_payload<V: Visitor>(&mut self, buf: &[u8], mut pos: usize, v: &mut V) -> usize {
         if let Resume::Payload {
             id,

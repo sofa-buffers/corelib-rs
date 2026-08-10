@@ -64,7 +64,7 @@ use sofab::{OStream, decode};
 | Streaming **in** | `IStream::feed` takes arbitrarily small chunks and suspends/resumes at any byte boundary; string/blob payloads are delivered incrementally. |
 | Zero unnecessary copies | `decode` parses straight from the input buffer, handing string/blob fields back as borrowed slices; `feed` copies only bytes that straddle a chunk boundary. |
 | Low allocation | Per-field encode/decode allocates nothing; the decoder dispatches into a monomorphized `Visitor` (no `dyn`, no boxing). The encoder's only heap use is the run of held-back sequence headers (see [Sequences](#sequences)), and even that stays inline until you nest more than 8 deep. |
-| Raw speed | `unsafe` pointer-advancing varint decode, bulk `copy_from_slice`, native little-endian loads, `#[inline]`/`#[cold]` hot/error split, `opt-level = 3` + fat-LTO. |
+| Raw speed | `unsafe` pointer-advancing varint decode, bulk `copy_from_slice`, native little-endian loads, `#[inline]`/`#[cold]` hot/error split, `opt-level = 3` + fat-LTO. No array falls back to the scalar path element by element: an integer array is written in runs of whole varints under one capacity check, and an `fp32`/`fp64` array — whose payload on a little-endian host *is* the slice's own memory — as a single bulk run. |
 | Type safety | Wire types and value widths live in the type system; array element widths are generic, so an invalid element size is unrepresentable. |
 | Cross-language compatibility | The shared `assets/test_vectors.json` is replayed — the same bytes every other port produces. |
 
@@ -236,23 +236,23 @@ encoded through a freshly built `OStream`:
 
 | encoder | Ir/op |
 |---|---|
-| **lazy framing, as shipped** (8 inline slots, spill beyond) | **248** |
-| lazy framing, `INLINE_PENDING = 1` | 243 |
-| lazy framing, `INLINE_PENDING = 0` (heap on every sequence) | 523 |
+| **lazy framing, as shipped** (8 inline slots, spill beyond) | **242** |
+| lazy framing, `INLINE_PENDING = 1` | 237 |
+| lazy framing, `INLINE_PENDING = 0` (heap on every sequence) | 381 |
 
 The hold-back is not free — it carries a `PendingRun` in a per-message encoder
 and tests it on every field write. Measured against eager framing when the
 feature landed, it cost **+142 Ir/op (+43%)** on this workload. Keeping the run
-off the heap is what most of the tuning buys (248 vs 523); the width of the
+off the heap is what most of the tuning buys (242 vs 381); the width of the
 inline array is worth about 5 Ir of that, so 8 slots is a depth choice, not a
 speed one.
 
 The absolute figures above are lower than the ones this table carried when the
-feature landed, because the varint codecs and the encoder's capacity handling
-were reworked since (`encode: typical message` 475 → 248, `encode: u64 array
-(1000)` 139928 → 29646, `decode: u64 array (1000)` 94180 → 45724, `decode:
-typical message` 1186 → 521). The ratios the `INLINE_PENDING` choice rests on
-did not move.
+feature landed, because the varint codecs, the encoder's capacity handling and
+the fixlen paths were reworked since (`encode: typical message` 475 → 242,
+`encode: u64 array (1000)` 139928 → 29645, `decode: u64 array (1000)` 94180 →
+47737, `decode: typical message` 1186 → 533). The ratios the `INLINE_PENDING`
+choice rests on did not move.
 
 ### Deserialize
 
