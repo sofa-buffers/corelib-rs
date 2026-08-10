@@ -102,10 +102,14 @@ so this port is **always strict** — the `SOFAB_STRICT_UTF8` option
 (CORELIB_PLAN §6.4) is a **no-op here, pinned ON**, and there is no primitive to
 expose (only byte-container targets need one):
 
-- **Encode is strict by construction.** `OStream::write_str` takes `&str`, which
-  is already guaranteed valid UTF-8 by the type system, so a `string` field can
-  never carry invalid bytes — no runtime check is possible or needed. Put
-  arbitrary bytes in a `blob` (`write_blob`).
+- **Encode is strict.** The typed writer `OStream::write_str` takes `&str`, which
+  is already guaranteed valid UTF-8 by the type system, so that path can never
+  carry invalid bytes and pays no runtime check. The byte-level
+  `OStream::write_fixlen` is public as well and *can* be handed arbitrary bytes
+  under the `Str` subtype — there the check is real: a payload that is not valid
+  UTF-8 is refused with `Error::Argument` (§6.3's `InvalidArgument`), before a
+  single byte reaches the buffer. Put arbitrary bytes in a `blob` (`write_blob`,
+  or `write_fixlen` with `FixlenType::Blob`), which is unconstrained.
 - **Decode strictness lives in generated code.** The corelib hands a `string`
   field's **raw bytes** to `Visitor::string` and never builds a `String`;
   generated code materializes it with `core::str::from_utf8`, turning invalid
@@ -114,8 +118,17 @@ expose (only byte-container targets need one):
   valid UTF-8 and round-trips byte-exact. This matches `corelib-rs-no-std`
   exactly (subsumes generator #80).
 
-The shared `invalid_utf8` negative vectors in `assets/test_vectors.json`
-(tracking corelib-c-cpp#97) are exercised by `tests/utf8_tests.rs`.
+Both halves of the shared `invalid_utf8` negative vectors in
+`assets/test_vectors.json` (tracking corelib-c-cpp#97) are exercised by
+`tests/utf8_tests.rs`: `decode_outcome: invalid` on the decode side and
+`encode_outcome: invalid_argument` on the encode side.
+
+`write_fixlen` validates the payload against the **subtype** it is given, not
+just against the length ceiling, so this byte-level entry point cannot produce a
+message a conformant decoder must reject: `Fp32`/`Fp64` require exactly 4 / 8
+payload bytes (§4.6) and `Str` requires valid UTF-8; anything else is
+`Error::Argument` with nothing written. `write_fp32`/`write_fp64`/`write_str`/
+`write_blob` are correct by construction and skip the check entirely.
 
 ## Usage
 

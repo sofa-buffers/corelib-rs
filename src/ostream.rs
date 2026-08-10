@@ -656,7 +656,38 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
 
     /// Write a fixed-length field: header, `(len << 3) | subtype` varint, then
     /// the raw `data` bytes (already in wire/little-endian order for floats).
+    ///
+    /// The payload is validated **against the requested subtype** before any byte
+    /// is written, so this byte-level entry point cannot produce a message a
+    /// conformant decoder must reject (`Error::Argument`, CORELIB_PLAN §6.3):
+    ///
+    /// * `Fp32` / `Fp64` — the payload is **exactly** 4 / 8 bytes; a
+    ///   `fixlen_word` declaring any other length for these subtypes is
+    ///   malformed, the `INVALID` decode outcome (§4.6, §5.2).
+    /// * `Str` — the payload must be valid UTF-8; a `string` that is not is
+    ///   refused on encode, symmetrically with the decode-side rejection (§6.4,
+    ///   MESSAGE_SPEC §8). Put arbitrary bytes in a `Blob` instead.
+    /// * `Blob` — opaque, no constraint beyond the length ceiling.
+    ///
+    /// The typed writers ([`OStream::write_fp32`], [`OStream::write_fp64`],
+    /// [`OStream::write_str`], [`OStream::write_blob`]) are correct by
+    /// construction — a `&str` is UTF-8, `to_le_bytes` is the right width — and
+    /// pay none of this: they go through the unchecked path.
     pub fn write_fixlen(&mut self, id: Id, data: &[u8], subtype: FixlenType) -> Result<()> {
+        match subtype {
+            FixlenType::Fp32 if data.len() != 4 => return Err(Error::Argument),
+            FixlenType::Fp64 if data.len() != 8 => return Err(Error::Argument),
+            FixlenType::Str if core::str::from_utf8(data).is_err() => return Err(Error::Argument),
+            _ => {}
+        }
+        self.write_fixlen_unchecked(id, data, subtype)
+    }
+
+    /// [`OStream::write_fixlen`] without the subtype/payload agreement check —
+    /// for callers whose payload the type system already constrains. The length
+    /// ceiling is still enforced here; it is the one bound a `&[u8]` can break.
+    #[inline]
+    fn write_fixlen_unchecked(&mut self, id: Id, data: &[u8], subtype: FixlenType) -> Result<()> {
         if data.len() as u64 > FIXLEN_MAX {
             return Err(Error::Argument);
         }
@@ -726,19 +757,20 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// Write a string field (raw UTF-8 bytes, no NUL on the wire).
     ///
     /// The input is `&str`, so it is **already valid UTF-8** by the type system
-    /// — encode is strict by construction and can never emit non-UTF-8 bytes
-    /// (MESSAGE_SPEC §8, CORELIB_PLAN §6.4). For arbitrary bytes use
-    /// [`OStream::write_blob`]. Embedded `U+0000` is permitted and written
-    /// verbatim (the wire is length-framed, no NUL terminator).
+    /// — encode is strict by construction here and costs nothing at runtime
+    /// (MESSAGE_SPEC §8, CORELIB_PLAN §6.4); the byte-level
+    /// [`OStream::write_fixlen`] pays a validation pass instead. For arbitrary
+    /// bytes use [`OStream::write_blob`]. Embedded `U+0000` is permitted and
+    /// written verbatim (the wire is length-framed, no NUL terminator).
     #[inline]
     pub fn write_str(&mut self, id: Id, text: &str) -> Result<()> {
-        self.write_fixlen(id, text.as_bytes(), FixlenType::Str)
+        self.write_fixlen_unchecked(id, text.as_bytes(), FixlenType::Str)
     }
 
     /// Write a binary blob field.
     #[inline]
     pub fn write_blob(&mut self, id: Id, data: &[u8]) -> Result<()> {
-        self.write_fixlen(id, data, FixlenType::Blob)
+        self.write_fixlen_unchecked(id, data, FixlenType::Blob)
     }
 
     // --- array writers ------------------------------------------------------

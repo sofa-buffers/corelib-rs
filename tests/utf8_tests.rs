@@ -5,10 +5,14 @@
 //! strict*: `SOFAB_STRICT_UTF8` is a no-op for this port (always ON) and there
 //! is no primitive to expose. The division of responsibility per §6.4 is:
 //!
-//! * **Encode** is strict *by construction* — [`OStream::write_str`] takes
-//!   `&str`, which the Rust type system already guarantees is valid UTF-8, so a
-//!   `string` field can never carry invalid bytes. There is nothing to check and
-//!   no way to construct a counter-example.
+//! * **Encode** is strict *by construction* on the typed path —
+//!   [`OStream::write_str`] takes `&str`, which the Rust type system already
+//!   guarantees is valid UTF-8, so that path can never carry invalid bytes and
+//!   pays no runtime check. The byte-level [`OStream::write_fixlen`] is public
+//!   too, and it *can* be handed arbitrary bytes under the `Str` subtype: there
+//!   the check is real, and refusing with `Error::Argument` is what makes the
+//!   encode side symmetric with decode (the shared vectors'
+//!   `"encode_outcome": "invalid_argument"`).
 //! * **Decode** — the corelib delivers a `string` field's *raw bytes* to the
 //!   [`Visitor::string`] callback and never builds a `String` itself. Strictness
 //!   is enforced by **generated code**, which materializes the field with
@@ -16,17 +20,19 @@
 //!   `Error::InvalidMsg`, the `INVALID` decode outcome). This subsumes
 //!   generator #80 and makes std and no_std agree.
 //!
-//! These tests therefore exercise the *materialization* boundary: each shared
-//! `invalid_utf8` vector decodes through the corelib into raw bytes, and a
-//! `from_utf8` pass over those bytes — exactly what generated code emits — must
-//! reject it. The corelib frame itself stays structurally valid; the corelib
-//! decode path needs no UTF-8 change.
+//! These tests therefore exercise both halves of each shared `invalid_utf8`
+//! vector: the *materialization* boundary on decode — the vector decodes through
+//! the corelib into raw bytes, and a `from_utf8` pass over those bytes, exactly
+//! what generated code emits, must reject it — and the *encode* refusal, where
+//! `write_fixlen(.., Str)` over the same bytes must return `Error::Argument`.
+//! The corelib frame itself stays structurally valid; the corelib decode path
+//! needs no UTF-8 change.
 
 mod common;
 
 use common::{Event, Recorder};
 use serde_json::Value;
-use sofab::{decode, Error, IStream, OStream};
+use sofab::{decode, Error, FixlenType, IStream, OStream};
 
 /// The shared vectors, embedded from the verbatim asset copy.
 const VECTORS_JSON: &str = include_str!("../assets/test_vectors.json");
@@ -160,6 +166,73 @@ fn from_utf8_rejects_each_invalid_form() {
             core::str::from_utf8(&raw).is_err(),
             "[{name}] from_utf8 must reject",
         );
+    }
+}
+
+#[test]
+fn write_fixlen_str_rejects_the_invalid_utf8_vectors() {
+    // The *encode* half of each shared negative vector ("encode_outcome":
+    // "invalid_argument"): encoding `string_hex` as a `string` must be refused.
+    // `write_str` cannot express these bytes, but the byte-level `write_fixlen`
+    // can — and it is public (§6.1), so it is the path that has to enforce §6.4's
+    // encode-side rule.
+    for v in invalid_utf8_vectors() {
+        let name = v["name"].as_str().unwrap();
+        let id = v["id"].as_u64().unwrap() as u32;
+        let raw = hex_to_bytes(v["string_hex"].as_str().unwrap());
+
+        let mut buf = [0u8; 64];
+        let mut os = OStream::new(&mut buf);
+        assert_eq!(
+            os.write_fixlen(id, &raw, FixlenType::Str),
+            Err(Error::Argument),
+            "[{name}] encoding invalid UTF-8 as a `string` must be InvalidArgument",
+        );
+        // Refused means nothing reached the wire — not even the field header.
+        assert_eq!(
+            os.bytes_used(),
+            0,
+            "[{name}] refused write must emit nothing"
+        );
+
+        // The same bytes as a `blob` are perfectly legal: §6.4 constrains the
+        // `string` subtype, not the opaque one.
+        let mut blob_buf = [0u8; 64];
+        let mut blob_os = OStream::new(&mut blob_buf);
+        blob_os
+            .write_fixlen(id, &raw, FixlenType::Blob)
+            .unwrap_or_else(|e| panic!("[{name}] blob must accept the same bytes: {e:?}"));
+        assert!(blob_os.bytes_used() > 0);
+    }
+}
+
+#[test]
+fn write_fixlen_str_accepts_valid_utf8() {
+    // The check must not cost correctness on the valid side: `write_fixlen` with
+    // `Str` produces exactly `write_str`'s bytes, embedded NUL and multi-byte
+    // sequences included.
+    for text in [
+        "",
+        "Hello Couch!",
+        "a\u{0}b",
+        "äöü€",
+        "𝄞 g-clef",
+        "\u{10FFFF}",
+    ] {
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        let used_a = {
+            let mut os = OStream::new(&mut a);
+            os.write_fixlen(3, text.as_bytes(), FixlenType::Str)
+                .unwrap();
+            os.bytes_used()
+        };
+        let used_b = {
+            let mut os = OStream::new(&mut b);
+            os.write_str(3, text).unwrap();
+            os.bytes_used()
+        };
+        assert_eq!(a[..used_a], b[..used_b], "text {text:?}");
     }
 }
 
