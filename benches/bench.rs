@@ -8,14 +8,19 @@
 //! header). Each workload runs in a ~1 s loop and reports MB/s, and the output
 //! table matches the C/C++ tools so the implementations can be compared directly.
 //!
-//! **Read the `blob 1MB` rows against each other, not against the others.** Five
+//! **The `blob 1MB` rows are not a statement about this port's speed.** Five
 //! bytes of that message are metadata and a million are payload, so its MB/s is
-//! the platform's `memcpy` and the machine's memory bandwidth. The signal is the
-//! *difference* between one-shot and streaming — the cost of the divisible-run
-//! path (CORELIB_PLAN §5.1) — and under MB/s that difference is a low-single-digit
-//! fraction of a bandwidth-bound row. Read it as Callgrind `Ir/op`
-//! (`benches/run_callgrind.sh`), where instruction counts do not care about
-//! bandwidth.
+//! the platform's `memcpy` and the machine's memory bandwidth; the figure does
+//! not belong next to `typical message`. BENCH_SPEC puts the signal in the
+//! *difference* between the one-shot and streaming rows — the cost of the
+//! divisible-run path (CORELIB_PLAN §5.1) — and points at Callgrind `Ir/op`
+//! (`benches/run_callgrind.sh`) to read it, since instruction counts do not care
+//! about bandwidth. On x86-64 glibc that reading does not survive contact:
+//! Callgrind counts every `rep movsb` iteration as an instruction, and glibc
+//! picks that memcpy for the one-shot row's contiguous megabyte and a vector
+//! loop for the streaming row's 4 KB pieces — ~1.0 Ir/byte against ~0.11, which
+//! swamps the flush machinery and inverts the comparison. Compare each of these
+//! rows against the same row on another port instead.
 //!
 //! Throughput is measured against *process CPU time* (`clock()`, not
 //! wall-clock), so the number reflects the cost of the implementation rather
@@ -34,9 +39,19 @@ use std::hint::black_box;
 
 const N: usize = 1000;
 
-/// `blob 1MB` payload length. Encoded size is `BLOB_LEN + 5` on every port — a
+/// `blob 1MB` payload length. Encoded size is [`BLOB_SIZE`] on every port — a
 /// 1-byte header `(1 << 3) | 2` and a 4-byte `fixlen_word` `(1000000 << 3) | 3`.
 const BLOB_LEN: usize = 1_000_000;
+
+/// Encoded size of the `blob 1MB` message, and a cross-port parity check:
+/// BENCH_SPEC states it outright, like the `perf` message's 170 bytes.
+const BLOB_SIZE: usize = 1_000_005;
+
+/// Encoded size of the `composite` message, and its parity check. BENCH_SPEC
+/// takes this number "from the reference implementation" — this file — and then
+/// "it must match on every port", so it is stated here rather than left as
+/// whatever the encoder happens to produce.
+const COMPOSITE_SIZE: usize = 956;
 
 /// The streaming `blob 1MB` row is driven through a buffer of exactly this size
 /// on every port, so the rows stay comparable across languages. `MIN_OUTPUT_BUFFER`
@@ -269,6 +284,12 @@ pub fn run_decode_composite(wire: &[u8]) -> u64 {
     black_box(sink.acc)
 }
 
+/// The `decode: composite skip-all` destination: a visitor that overrides no
+/// callback, so the decoder walks every header, count and payload length and
+/// nothing is read into anything.
+struct SkipAll;
+impl Visitor for SkipAll {}
+
 /// `decode: composite skip-all` — walk the message, materialize nothing.
 ///
 /// In a push/visitor port that is a visitor which overrides no callback: the
@@ -278,12 +299,108 @@ pub fn run_decode_composite(wire: &[u8]) -> u64 {
 #[inline(never)]
 #[unsafe(no_mangle)]
 pub fn run_decode_composite_skip(wire: &[u8]) -> bool {
-    struct SkipAll;
-    impl Visitor for SkipAll {}
-
     let mut sink = SkipAll;
     let mut is = IStream::new();
     black_box(is.feed(black_box(wire), &mut sink).is_ok())
+}
+
+/// Prove each workload does the work its row is named after — before any of
+/// them is timed.
+///
+/// A benchmark row prints a number whatever happens, and the ways these rows can
+/// degenerate all make them look *better*: a chunked decode that goes `INVALID`
+/// on chunk 1 walks 244 chunks of nothing at a spectacular MB/s, and a streaming
+/// encode whose sink is never called is just an encode into a 4 KB buffer. The
+/// three workloads BENCH_SPEC added for their *paths* rather than their size are
+/// therefore checked here, once, against what those paths are supposed to
+/// produce. Cost is one extra op of each; it is outside every measured loop and
+/// outside the Callgrind toggle.
+fn self_check(blob: &[u8], blob_wire: &[u8], comp_wire: &[u8]) {
+    // `encode: blob 1MB streaming` — the whole message reaches the sink, in
+    // buffer-sized pieces. A piece wider than the buffer would mean the payload
+    // reached the sink without passing through it, which is the pass-through
+    // path this row is specifically required *not* to take.
+    let mut scratch = [0u8; BLOB_CHUNK];
+    let (mut flushes, mut flushed, mut widest) = (0usize, 0usize, 0usize);
+    {
+        let mut os = OStream::with_flush(&mut scratch, 0, |data: &[u8]| {
+            flushes += 1;
+            flushed += data.len();
+            widest = widest.max(data.len());
+        });
+        os.write_blob(1, blob).unwrap();
+        os.flush().unwrap();
+    }
+    assert_eq!(
+        flushed, BLOB_SIZE,
+        "streaming encode: bytes reaching the sink"
+    );
+    assert!(
+        flushes >= BLOB_SIZE / BLOB_CHUNK && widest <= BLOB_CHUNK,
+        "streaming encode: {flushes} flush(es), widest {widest} B — the row \
+         measures ~245 buffer-sized handovers, not one big one"
+    );
+
+    // `decode: blob 1MB` — fed in 4096-byte chunks, ending COMPLETE with every
+    // payload byte delivered.
+    #[derive(Default)]
+    struct Seen {
+        payload: usize,
+        strings: usize,
+        sequences: usize,
+        scalars: Vec<(Id, i64)>,
+    }
+    impl Visitor for Seen {
+        fn unsigned(&mut self, id: Id, v: Unsigned) {
+            self.scalars.push((id, v as i64));
+        }
+        fn signed(&mut self, id: Id, v: Signed) {
+            self.scalars.push((id, v));
+        }
+        fn string(&mut self, _id: Id, _total: usize, offset: usize, chunk: &[u8]) {
+            self.strings += usize::from(offset == 0);
+            self.payload += chunk.len();
+        }
+        fn blob(&mut self, _id: Id, _total: usize, _offset: usize, chunk: &[u8]) {
+            self.payload += chunk.len();
+        }
+        fn sequence_begin(&mut self, _id: Id) {
+            self.sequences += 1;
+        }
+    }
+
+    let mut seen = Seen::default();
+    let mut is = IStream::new();
+    let mut last = Err(sofab::Error::Incomplete);
+    for chunk in blob_wire.chunks(BLOB_CHUNK) {
+        last = is.feed(chunk, &mut seen);
+    }
+    assert!(
+        last.is_ok(),
+        "chunked blob decode ended {last:?}, not COMPLETE"
+    );
+    assert_eq!(
+        seen.payload, BLOB_LEN,
+        "chunked blob decode: bytes delivered"
+    );
+
+    // `composite` — the five paths it was added for: 64 wrapper elements plus
+    // the UTF-8 string, four sequences on the wire (field 4 omitted, not
+    // framed), and the scalars from the depth-3 nest and the two-byte header.
+    let mut seen = Seen::default();
+    IStream::new()
+        .feed(comp_wire, &mut seen)
+        .expect("composite decodes COMPLETE");
+    assert_eq!(seen.strings, 65, "composite: wrapper elements + string");
+    assert_eq!(
+        seen.sequences, 4,
+        "composite: the all-default field 4 is omitted"
+    );
+    assert_eq!(
+        seen.scalars,
+        vec![(1, 7), (2, -1), (130, 0xDEAD_BEEF)],
+        "composite: depth-3 nest and the two-byte-header field"
+    );
 }
 
 /// How long one batch of operations should take before the clock is read again.
@@ -362,8 +479,7 @@ fn main() {
     };
     blob_buf.truncate(blob_used);
     assert_eq!(
-        blob_used,
-        BLOB_LEN + 5,
+        blob_used, BLOB_SIZE,
         "the blob 1MB encoded size is a cross-port parity check"
     );
 
@@ -374,6 +490,13 @@ fn main() {
         os.bytes_used()
     };
     comp_buf.truncate(comp_used);
+    assert_eq!(
+        comp_used, COMPOSITE_SIZE,
+        "the composite encoded size is the parity check every other port \
+         compares itself against, and this is the implementation it comes from"
+    );
+
+    self_check(&blob, &blob_buf, &comp_buf);
 
     let ba = enc_u64_used;
     let bt = typ_used;
@@ -473,6 +596,10 @@ fn main() {
         os.write_blob(1, black_box(&blob)).unwrap();
         black_box(os.flush().unwrap());
     });
+    // Every chunk but the last leaves the decode `INCOMPLETE`, which is an
+    // outcome and not an error; the loop therefore feeds them all and lets
+    // `self_check` above be the place that insists the last one is `COMPLETE`
+    // and that the payload arrived.
     let dec_blob = measure(bb, || {
         let mut sink = Checksum::default();
         let mut is = IStream::new();
@@ -494,8 +621,15 @@ fn main() {
         is.feed(black_box(&comp_buf), &mut sink).unwrap();
         black_box(sink.acc);
     });
+    // Written out rather than calling `run_decode_composite_skip`: that entry
+    // point is `#[inline(never)]` for Callgrind's sake, and routing one row of
+    // the table through a call the other rows do not pay would put the
+    // difference this row exists to show — decode versus skip — on the wrong
+    // side of a function call.
     let dec_comp_skip = measure(bc, || {
-        black_box(run_decode_composite_skip(black_box(&comp_buf)));
+        let mut sink = SkipAll;
+        let mut is = IStream::new();
+        is.feed(black_box(&comp_buf), &mut sink).unwrap();
     });
 
     println!("=== SofaBuffers Rust throughput (CPU time, MB/s) ===");
@@ -518,5 +652,5 @@ fn main() {
         "decode: composite skip-all", dec_comp_skip
     );
     println!("\nMB = 1e6 bytes. ~1s CPU-time loop per workload.");
-    println!("blob 1MB is bandwidth-bound: read one-shot vs streaming, not either alone.");
+    println!("blob 1MB is bandwidth-bound: compare it with the same row on another port.");
 }

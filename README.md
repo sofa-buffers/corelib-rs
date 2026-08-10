@@ -568,10 +568,77 @@ independent of clock speed or scheduling, so the numbers compare across
 machines.
 
 The `blob 1MB` rows are bandwidth-bound — five bytes of that message are metadata
-and a million are payload — so read them **against each other**, not next to
-`typical message`. The optional `encode: blob 1MB passthrough` row is absent: this
+and a million are payload — so their MB/s is this machine's `memcpy` and does not
+belong next to `typical message`; the two Callgrind caveats below say how far the
+`Ir/op` figures can be read against each other. The optional
+`encode: blob 1MB passthrough` row is absent: this
 port copies `string`/`blob` runs through the output buffer rather than handing them
 to the sink directly, which CORELIB_PLAN §5.1 permits.
+
+Each workload is self-checked before it is timed: a benchmark row prints a number
+whatever happens, and every way these rows can degenerate makes them look
+*faster* — a chunked decode that gives up on chunk 1 walks the remaining 244 at a
+spectacular MB/s, and a streaming encode whose sink is never called is just an
+encode into a 4 KB buffer. `bench` therefore proves the megabyte reaches the sink
+in ~245 buffer-sized handovers, that the chunked decode ends `COMPLETE` with all
+1,000,000 payload bytes delivered, and that `composite` really is 64 wrapper
+elements, four sequences (field 4 omitted, not framed) and the depth-3 nest —
+before any clock is read.
+
+### Parity sizes
+
+BENCH_SPEC compares ports by encoded size before it compares them by speed: a
+dataset that encodes to a different number of bytes here than there is a wire
+divergence, and every later figure is incomparable. This crate is the spec's
+reference implementation, so these are the numbers other ports check themselves
+against — `bench` and `perf` assert them on every run, and so does
+`tests/bench_shape_tests.rs`:
+
+| dataset | encoded bytes |
+|---|---|
+| `perf` message (12 fields) | **170** |
+| `blob 1MB` (1-byte header + 4-byte `fixlen_word` + payload) | **1000005** |
+| `composite` | **956** |
+| `typical` message | 37 |
+| `u64 array (1000)` | 9491 |
+
+The first two are BENCH_SPEC's own parity checks; `composite`'s comes from here,
+as the spec says it should, and is now written down for the ports that have to
+match it.
+
+### Instruction cost, as measured
+
+`bash benches/run_callgrind.sh` on this crate. These are deterministic and
+machine-independent, unlike the MB/s table — whose numbers belong to whichever
+machine ran it:
+
+| workload | Ir/op | bytes |
+|---|---|---|
+| encode: u64 array (1000) | 29645 | 9491 |
+| encode: typical message | 242 | 37 |
+| encode: blob 1MB one-shot | 1000091 | 1000005 |
+| encode: blob 1MB streaming | 113952 | 1000005 |
+| encode: composite | 21211 | 956 |
+| decode: u64 array (1000) | 47737 | 9491 |
+| decode: typical message | 533 | 37 |
+| decode: blob 1MB | 15887 | 1000005 |
+| decode: composite | 5169 | 956 |
+| decode: composite skip-all | 4606 | 956 |
+
+Two of those read the opposite of how they look:
+
+* **`encode: blob 1MB one-shot` is not nine times the work of the streaming row.**
+  Callgrind counts every iteration of `rep movsb` as an instruction, and glibc
+  picks that memcpy for the one-shot row's contiguous megabyte and a vector loop
+  for the streaming row's 4 KB pieces — ~1.0 Ir/byte against ~0.11. A plain C
+  program copying the same megabyte the same two ways measures 999,991 against
+  128,685 Ir, so essentially the whole gap is that choice and none of it is the
+  flush machinery. Compare each row against the same row on another port.
+* **`decode: blob 1MB` at 15,887 Ir for a megabyte is not a fast copy — it is no
+  copy.** Decoding hands the visitor a slice into the input buffer, so the only
+  work is walking the framing of 245 chunks and nothing ever touches the payload.
+  That is the zero-copy design showing up as a measurement, and it is why the row
+  reports hundreds of GB/s rather than memory bandwidth.
 
 ### Choosing between the two Rust corelibs
 

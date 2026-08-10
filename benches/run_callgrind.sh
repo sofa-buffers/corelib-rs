@@ -86,15 +86,34 @@ echo "==========================================================================
 printf "%-26s %16s %9s\n" "Workload" "instr/op" "bytes"
 printf "%-26s %16s %9s\n" "--------" "--------" "-----"
 
+missing=()
 for w in "${WORKLOADS[@]}"; do
     run_cg "$w"
     ir="$(ir_of "$w")"; b="$(bytes_of "$w")"
+    [ -n "$ir" ] || missing+=("$w")
     printf "%-26s %16s %9s\n" "$(label "$w")" "${ir:--}" "${b:--}"
 done
 echo
 echo "Ir = instructions retired (Callgrind). Independent of CPU clock and OS"
 echo "scheduling; depends only on the executed code, so it compares across machines."
 echo
-echo "The blob 1MB rows are where Ir/op earns its keep: the gap from one-shot to"
-echo "streaming is the divisible-run path (CORELIB_PLAN 5.1) with the memory"
-echo "subsystem taken out of it, which MB/s cannot show on a bandwidth-bound row."
+echo "The blob 1MB rows are where Ir/op earns its keep: it takes the machine's"
+echo "memory subsystem out of a measurement that is otherwise bandwidth-bound."
+echo "Read each of them against the same row on another port, though, and not"
+echo "against each other: on x86-64 glibc, Callgrind counts every 'rep movsb'"
+echo "iteration as an instruction, and glibc picks that memcpy for the one-shot"
+echo "row's contiguous megabyte and a vector loop for the streaming row's 4 KB"
+echo "pieces -- ~1.0 Ir/byte against ~0.11. That choice, not the divisible-run"
+echo "path (CORELIB_PLAN 5.1), is nearly all of the gap between the two rows."
+
+# A workload whose run produced no summary printed a dash above. That is a tool
+# failure, not a measurement: the row is meant to run end to end and report a
+# real number, and exiting 0 with a dash in the table is how a broken workload
+# survives into a comparison.
+if [ ${#missing[@]} -ne 0 ]; then
+    echo >&2
+    echo "error: no instruction count for: ${missing[*]}" >&2
+    echo "       (see the Callgrind logs, or run the bench binary directly:" >&2
+    echo "        $BIN ${missing[0]})" >&2
+    exit 1
+fi
