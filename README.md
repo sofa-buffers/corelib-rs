@@ -225,6 +225,15 @@ still true of an **element**. The choice is static, a property of the position i
 the schema rather than of the value, so generated code makes it at generation
 time. There is no eager `write_sequence_begin`; this is the only opener.
 
+**The frames must balance.** Either closer called with **no sequence open** is
+`Error::Argument` (§6.3's `InvalidArgument`) and writes nothing: the encoder
+refuses to emit a lone end marker, one of the byte sequences §5.2 calls malformed
+*regardless of what follows* and which this port's own decoder answers
+`Error::InvalidMsg` to. It joins the encoder's other two structural argument
+checks — an id above `ID_MAX`, and nesting past `MAX_DEPTH` (255) — and a
+rejected close leaves the stream exactly as it found it, so the open-frame count
+stays truthful for the rest of the message.
+
 ```rust
 use sofab::OStream;
 
