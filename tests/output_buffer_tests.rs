@@ -668,3 +668,45 @@ fn no_foreign_memory_reaches_a_sink() {
     }
     assert!(seen > 1, "the blob should have spanned several flushes");
 }
+
+/// `NoFlush` is public, and it is a `Flush` — so it can be *attached* rather than
+/// only inferred as the sinkless default, and then it is a sink that throws the
+/// bytes away.
+///
+/// Worth pinning because the two spellings over the same buffer behave in
+/// opposite ways where it matters: without a sink, a message larger than the
+/// buffer stops with `BufferFull` and nothing is lost; with `NoFlush` attached,
+/// every write keeps reporting `Ok` while the buffer is recycled underneath and
+/// the flushed bytes go nowhere. That is the sink doing exactly what it says, not
+/// a §5.1 violation — the encoder handed its bytes to a sink, and where the sink
+/// puts them is the caller's business — but it is the one sink for which "every
+/// call returned Ok" does not mean the message survived, so it must not be
+/// reachable by accident.
+#[test]
+fn an_attached_no_flush_sink_discards_what_it_is_handed() {
+    use sofab::NoFlush;
+
+    let blob: Vec<u8> = (0..200u8).collect();
+
+    // Sinkless: the same buffer refuses the oversized message outright.
+    let mut sinkless = [0u8; 16];
+    {
+        let mut os = OStream::new(&mut sinkless);
+        assert_eq!(os.write_blob(1, &blob), Err(Error::BufferFull));
+    }
+
+    // With `NoFlush` attached: the writes succeed, the buffer is reused, and only
+    // the tail that never reached a flush is still in it.
+    let mut buf = [0u8; 16];
+    let (used, flushed) = {
+        let mut os = OStream::with_flush(&mut buf, 0, NoFlush);
+        os.write_blob(1, &blob).unwrap();
+        let used = os.bytes_used();
+        (used, os.flush().unwrap())
+    };
+    assert_eq!(flushed, used, "flush reports the bytes it dropped");
+    assert!(
+        used < blob.len(),
+        "the message is longer than the buffer, so most of it was discarded"
+    );
+}

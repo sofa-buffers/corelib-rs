@@ -538,8 +538,11 @@ profile**, a library-only build at the declared **MSRV 1.70**, the suite on a
 **big-endian** s390x host under QEMU, and llvm-cov coverage.
 Integration tests live in `tests/` (shared-vector replay, fast-path decode,
 encoder/decoder byte-exact checks, round-trip, malformed-input errors, the
-output-buffer and flush-handover contract, non-canonical-but-valid input, and
-chunk lifetime — every chunk scrubbed the moment `feed` returns).
+output-buffer and flush-handover contract, non-canonical-but-valid input,
+chunk lifetime — every chunk scrubbed the moment `feed` returns — the `ID_MAX`
+bound on every writer, skipping a field by walking it, the `feed(&[], …)`
+end-of-input probe from every suspended state, and invalid UTF-8 that begins
+past the first chunk of a streamed payload).
 
 ## Benchmarks
 
