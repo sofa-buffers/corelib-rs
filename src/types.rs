@@ -26,15 +26,17 @@ pub(crate) const ARRAY_MAX: u64 = i32::MAX as u64;
 pub(crate) const FIXLEN_MAX: u64 = i32::MAX as u64;
 
 /// Smallest output buffer this port accepts **for streaming** — the capacity
-/// (`buffer.len() - offset`) every buffer installed **together with a
-/// [`crate::Flush`] sink** must have (CORELIB_PLAN §5.1).
+/// (`buffer.len() - offset`) every buffer installed **together with a flush
+/// sink** — [`crate::Flush`] or [`crate::FlushTake`] — must have
+/// (CORELIB_PLAN §5.1).
 ///
 /// This crate declares **1**: it splits every atomic unit — a field header, a
 /// `fixlen_word`, an element count, a scalar varint, a float — across a flush at
 /// any byte boundary, so no write needs to land contiguously. Nothing above one
 /// byte is ever reserved.
 ///
-/// The constant binds a buffer handed to [`crate::OStream::with_flush`], to
+/// The constant binds a buffer handed to [`crate::OStream::with_flush`] /
+/// [`crate::OStream::try_with_flush`], to
 /// [`crate::OStream::buffer_set`] on a stream that has a sink, and to a
 /// replacement a sink installs from inside its callback. It binds **nothing
 /// else**: a buffer installed *without* a sink is subject to no minimum, because

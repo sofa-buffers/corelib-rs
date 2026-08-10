@@ -405,7 +405,7 @@ fn lazy_sequence_after_content_is_independent() {
 /// argument above.
 #[test]
 fn run_committed_across_flush_boundary_matches_one_shot() {
-    fn script<'a, F: sofab::Flush<'a>>(os: &mut OStream<'a, F>) {
+    fn script<'a, F: sofab::FlushTake<'a>>(os: &mut OStream<'a, F>) {
         os.write_sequence_begin_lazy(1).unwrap();
         os.write_sequence_begin_lazy(2).unwrap();
         os.write_sequence_begin_lazy(3).unwrap();
@@ -430,8 +430,7 @@ fn run_committed_across_flush_boundary_matches_one_shot() {
         let mut buf = vec![0u8; size];
         {
             let mut os =
-                sofab::OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d))
-                    .unwrap();
+                sofab::OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d));
             script(&mut os);
             os.flush().unwrap();
         }
@@ -461,7 +460,7 @@ fn an_explicit_flush_mid_run_matches_one_shot() {
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 64];
     let flushed_at = {
-        let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d)).unwrap();
+        let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d));
         os.write_unsigned(9, 1).unwrap();
         os.write_sequence_begin_lazy(1).unwrap();
         os.write_sequence_begin_lazy(2).unwrap();
@@ -492,7 +491,7 @@ fn an_explicit_flush_mid_run_matches_one_shot() {
 /// `recovery_after_a_cut_is_exact_only_on_a_header_boundary` pins.
 #[test]
 fn a_commit_cut_short_on_a_header_boundary_keeps_the_rest_pending() {
-    fn script<'a, F: sofab::Flush<'a>>(os: &mut OStream<'a, F>) -> Vec<Result<(), Error>> {
+    fn script<'a, F: sofab::FlushTake<'a>>(os: &mut OStream<'a, F>) -> Vec<Result<(), Error>> {
         let mut r = Vec::new();
         for id in 1..=4 {
             r.push(os.write_sequence_begin_lazy(id));
@@ -563,7 +562,7 @@ fn recovery_after_a_cut_is_exact_only_on_a_header_boundary() {
     const FIRST: u32 = 16; // 16 << 3 | 6 = 0x86 0x01 — two bytes, unlike 1..=15
     const RUN_BYTES: usize = 2 * DEPTH as usize;
 
-    fn open_all<'a, F: sofab::Flush<'a>>(os: &mut OStream<'a, F>) {
+    fn open_all<'a, F: sofab::FlushTake<'a>>(os: &mut OStream<'a, F>) {
         for id in FIRST..FIRST + DEPTH {
             os.write_sequence_begin_lazy(id).unwrap();
         }
@@ -1013,8 +1012,7 @@ fn flush_sink_streams_large_message() {
     {
         let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
             collected.extend_from_slice(chunk);
-        })
-        .unwrap();
+        });
         for i in 0..10u32 {
             os.write_unsigned(i, i as u64).unwrap();
         }

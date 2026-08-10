@@ -216,10 +216,12 @@ struct Discard {
     acc: u8,
 }
 
-impl<'a> sofab::Flush<'a> for Discard {
-    fn flush(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize) {
-        self.acc ^= buffer[..used].first().copied().unwrap_or(0);
-        (buffer, 0) // copied — resume in the same buffer
+// A copying sink: it consumes the bytes and hands the buffer straight back
+// through the blanket `FlushTake` impl, which is the shape the streaming row is
+// meant to measure.
+impl sofab::Flush for Discard {
+    fn flush(&mut self, data: &[u8]) {
+        self.acc ^= data.first().copied().unwrap_or(0);
     }
 }
 
@@ -234,7 +236,7 @@ pub fn run_encode_blob_oneshot(blob: &[u8], out: &mut [u8]) -> usize {
 #[inline(never)]
 #[unsafe(no_mangle)]
 pub fn run_encode_blob_streaming(blob: &[u8], scratch: &mut [u8]) -> usize {
-    let mut os = OStream::with_flush(scratch, 0, Discard::default()).unwrap();
+    let mut os = OStream::with_flush(scratch, 0, Discard::default());
     os.write_blob(1, black_box(blob)).unwrap();
     black_box(os.flush().unwrap())
 }
@@ -467,7 +469,7 @@ fn main() {
         black_box(os.bytes_used());
     });
     let enc_blob_s = measure(bb, || {
-        let mut os = OStream::with_flush(&mut enc_blob_scratch, 0, Discard::default()).unwrap();
+        let mut os = OStream::with_flush(&mut enc_blob_scratch, 0, Discard::default());
         os.write_blob(1, black_box(&blob)).unwrap();
         black_box(os.flush().unwrap());
     });
