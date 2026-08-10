@@ -6,7 +6,7 @@
 
 mod common;
 
-use sofab::{Error, OStream, ID_MAX};
+use sofab::{Error, FixlenType, OStream, ID_MAX};
 
 /// Encode with a fresh stack buffer and return the produced bytes.
 fn encode<F: FnOnce(&mut OStream)>(f: F) -> Vec<u8> {
@@ -141,6 +141,53 @@ fn write_blob() {
 #[test]
 fn write_blob_empty() {
     assert_eq!(encode(|os| os.write_blob(0, &[]).unwrap()), [0x02, 0x03]);
+}
+
+/// §4.6: an `fp32`/`fp64` payload is **exactly** 4 / 8 bytes, and a `fixlen_word`
+/// declaring any other length for those subtypes is malformed — the `INVALID`
+/// decode outcome. The byte-level `write_fixlen` is public (§6.1), so it is the
+/// one encode path able to put such a word on the wire; it must refuse the call
+/// (`InvalidArgument`, §6.3) instead of reporting success for a message every
+/// conformant decoder — including this port's own — has to reject.
+#[test]
+fn write_fixlen_rejects_wrong_float_width() {
+    for (subtype, ok_len) in [(FixlenType::Fp32, 4usize), (FixlenType::Fp64, 8usize)] {
+        for bad_len in [0usize, 1, 2, 3, 5, 7, 8, 9, 16] {
+            if bad_len == ok_len {
+                continue;
+            }
+            let mut buf = [0u8; 64];
+            let mut os = OStream::new(&mut buf);
+            assert_eq!(
+                os.write_fixlen(0, &vec![0u8; bad_len], subtype),
+                Err(Error::Argument),
+                "{subtype:?} must refuse a {bad_len}-byte payload",
+            );
+            // Refused means *nothing written*: no header, no length word.
+            assert_eq!(os.bytes_used(), 0);
+        }
+
+        // The exact width still encodes, byte-identically to write_fp32/fp64.
+        let bytes = encode(|os| os.write_fixlen(0, &vec![0u8; ok_len], subtype).unwrap());
+        let reference = if ok_len == 4 {
+            encode(|os| os.write_fp32(0, 0.0).unwrap())
+        } else {
+            encode(|os| os.write_fp64(0, 0.0).unwrap())
+        };
+        assert_eq!(bytes, reference);
+    }
+}
+
+/// `blob` constrains neither width nor content — only the `FIXLEN_MAX` ceiling —
+/// so the subtype check must leave it alone.
+#[test]
+fn write_fixlen_blob_accepts_any_bytes() {
+    for len in [0usize, 1, 3, 5, 8, 33] {
+        let payload = vec![0xFFu8; len];
+        let bytes = encode(|os| os.write_fixlen(7, &payload, FixlenType::Blob).unwrap());
+        let reference = encode(|os| os.write_blob(7, &payload).unwrap());
+        assert_eq!(bytes, reference);
+    }
 }
 
 // --- varint arrays ----------------------------------------------------------

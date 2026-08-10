@@ -53,10 +53,14 @@
 //! `SOFAB_STRICT_UTF8` option (CORELIB_PLAN §6.4) is a **no-op here, pinned ON**,
 //! and there is no primitive to expose (only byte-container targets need one):
 //!
-//! * **Encode is strict by construction.** [`OStream::write_str`] takes `&str`,
-//!   which the type system already guarantees is valid UTF-8, so a `string`
-//!   field can never carry invalid bytes — no runtime check is possible or
-//!   needed. (Arbitrary bytes go in a `blob` via [`OStream::write_blob`].)
+//! * **Encode is strict.** [`OStream::write_str`] takes `&str`, which the type
+//!   system already guarantees is valid UTF-8, so that path can never carry
+//!   invalid bytes and pays no runtime check. The byte-level
+//!   [`OStream::write_fixlen`] *can* be handed arbitrary bytes under the `Str`
+//!   subtype, so it validates: a non-UTF-8 `string` payload — like an
+//!   `fp32`/`fp64` payload of the wrong width (§4.6) — is refused with
+//!   [`Error::Argument`] before anything is written. (Arbitrary bytes go in a
+//!   `blob` via [`OStream::write_blob`].)
 //! * **Decode strictness lives in generated code.** The corelib delivers a
 //!   `string` field's **raw bytes** to [`Visitor::string`] and never builds a
 //!   `String` itself. Generated code materializes the field with
