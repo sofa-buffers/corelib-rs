@@ -11,10 +11,20 @@ use sofab::{Error, FlushTake, OStream, MIN_OUTPUT_BUFFER};
 /// atomic units (headers, counts, scalars, floats) with a divisible run — a
 /// string far longer than any streaming buffer used below.
 fn script<'a, F: FlushTake<'a>>(os: &mut OStream<'a, F>) {
+    script_head(os);
+    script_tail(os);
+}
+
+/// The first half of [`script`], up to and including the long divisible run.
+fn script_head<'a, F: FlushTake<'a>>(os: &mut OStream<'a, F>) {
     os.write_unsigned(1, 42).unwrap();
     os.write_signed(2, -7).unwrap();
     os.write_str(3, "a string payload that no streaming buffer here can hold")
         .unwrap();
+}
+
+/// The second half of [`script`].
+fn script_tail<'a, F: FlushTake<'a>>(os: &mut OStream<'a, F>) {
     os.write_blob(4, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
     os.write_fp64(5, core::f64::consts::PI).unwrap();
     os.write_array_unsigned(6, &[1u64, 300, 70_000]).unwrap();
@@ -101,12 +111,150 @@ fn a_sink_buffer_below_the_minimum_is_rejected_at_handover() {
         Some(Error::Argument)
     );
 
-    // And at a mid-stream buffer-set, which installs a buffer just as much.
+    // And at a mid-stream buffer-set, which installs a buffer just as much. The
+    // capacity is judged *before* anything is drained, so a rejected
+    // installation leaves the stream exactly as it was: the pending bytes are
+    // still in the active buffer and reach the sink at the next flush.
     let mut good = [0u8; 16];
     let mut bad = vec![0u8; short];
-    let mut os = OStream::with_flush(&mut good, 0, |c: &[u8]| sunk.extend_from_slice(c));
-    os.write_unsigned(1, 42).unwrap();
-    assert_eq!(os.buffer_set(&mut bad, 0), Err(Error::Argument));
+    {
+        let mut os = OStream::with_flush(&mut good, 0, |c: &[u8]| sunk.extend_from_slice(c));
+        os.write_unsigned(1, 42).unwrap();
+        assert_eq!(os.buffer_set(&mut bad, 0), Err(Error::Argument));
+        assert_eq!(os.bytes_used(), 2, "a refused install must drain nothing");
+        os.flush().unwrap();
+    }
+    assert_eq!(sunk, [0x08, 0x2A]);
+}
+
+/// §5.1's MUST NOT list: an encoder must not "return partial output as if it
+/// were complete". Replacing the active buffer on a stream that **has** a sink
+/// used to drop whatever was already written into it — every call in the
+/// sequence answered `Ok` and the message came out truncated.
+///
+/// There is somewhere to drain to here, so the bytes go to the sink first. (On a
+/// sinkless stream there is not: they stay in the buffer the caller still owns,
+/// which is the documented recovery from `BufferFull` — see
+/// `the_pending_bytes_of_a_sinkless_stream_stay_in_the_callers_buffer`.)
+#[test]
+fn a_buffer_set_with_a_sink_drains_the_pending_bytes_first() {
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    let mut out: Vec<u8> = Vec::new();
+    {
+        let mut os = OStream::with_flush(&mut a, 0, |c: &[u8]| out.extend_from_slice(c));
+        os.write_unsigned(1, 42).unwrap(); // 08 2A, unflushed in `a`
+        os.buffer_set(&mut b, 0).unwrap();
+        os.write_unsigned(2, 7).unwrap();
+        assert_eq!(os.flush(), Ok(2));
+    }
+    assert_eq!(
+        out,
+        [0x08, 0x2A, 0x10, 0x07],
+        "the one-shot bytes, in order"
+    );
+}
+
+/// The same rule over a whole message, against the reference §5.1 requires the
+/// streaming path to reproduce: a `buffer_set` dropped into the middle of the
+/// script — including one that re-arms header room, offset and all — must leave
+/// the output byte-identical to the one-shot encode.
+#[test]
+fn a_mid_message_buffer_set_with_a_sink_matches_one_shot() {
+    let reference = one_shot();
+
+    // Where the switch falls in the byte stream: everything `script_head` writes
+    // has reached the sink by then, drained by the buffer-set itself.
+    let head_len = {
+        let mut buf = [0u8; 128];
+        let mut os = OStream::new(&mut buf);
+        script_head(&mut os);
+        os.bytes_used()
+    };
+
+    for offset in [0usize, 4] {
+        let mut a = [0u8; 6];
+        let mut b = [0u8; 96]; // holds the whole tail, so `b` is flushed once
+        let mut collected: Vec<u8> = Vec::new();
+        {
+            let mut os = OStream::with_flush(&mut a, 0, |chunk: &[u8]| {
+                collected.extend_from_slice(chunk);
+            });
+            script_head(&mut os);
+            os.buffer_set(&mut b, offset).unwrap();
+            script_tail(&mut os);
+            os.flush().unwrap();
+        }
+        // The reserved head of `b` is the caller's framing room; it travels to
+        // the sink with the unit it belongs to, and the offset is consumed by
+        // that one installation.
+        let mut message = collected;
+        message.drain(head_len..head_len + offset);
+        assert_eq!(message, reference, "offset {offset}");
+    }
+}
+
+/// A **taking** sink gets the pending bytes the same way, and the buffer the
+/// caller installs wins over the replacement the sink returned from that
+/// handover: the caller's `buffer_set` is the later word, and its offset is the
+/// one that binds.
+#[test]
+fn a_buffer_set_hands_the_pending_bytes_to_a_taking_sink() {
+    let mut first = [0u8; 16];
+    let mut spare_a = [0u8; 16];
+    let mut spare_b = [0u8; 16];
+    let mut mine = [0u8; 16];
+    let mut out: Vec<u8> = Vec::new();
+    let mut swaps = 0usize;
+    let mut last: Option<*const u8> = None;
+    let used = {
+        let mut pool = VecDeque::new();
+        pool.push_back(&mut spare_a[..]);
+        pool.push_back(&mut spare_b[..]);
+        let sink = TakingSink {
+            out: &mut out,
+            pool,
+            swaps: &mut swaps,
+            last: &mut last,
+        };
+        let mut os = OStream::with_flush(&mut first, 0, sink);
+        os.write_unsigned(1, 42).unwrap();
+        os.buffer_set(&mut mine, 1).unwrap();
+        os.write_unsigned(2, 7).unwrap();
+        os.bytes_used()
+    };
+
+    // No `flush()` here: the bytes below can only have reached the sink at the
+    // buffer-set, and exactly once.
+    assert_eq!(swaps, 1, "the buffer-set is one handover, not two");
+    assert_eq!(out, [0x08, 0x2A]);
+    assert_eq!(
+        &mine[1..used],
+        &[0x10, 0x07],
+        "written into the caller's buffer, at the caller's offset"
+    );
+}
+
+/// The converse half, unchanged: **without** a sink there is nowhere to drain
+/// to, so `buffer_set` leaves the bytes in the buffer the caller owns and still
+/// holds. That is the documented recovery from `Error::BufferFull` — read
+/// `bytes_used()`, install the next buffer, concatenate.
+#[test]
+fn the_pending_bytes_of_a_sinkless_stream_stay_in_the_callers_buffer() {
+    let mut a = [0u8; 2];
+    let mut b = [0u8; 8];
+    let (used_a, used_b) = {
+        let mut os = OStream::new(&mut a);
+        os.write_unsigned(1, 42).unwrap();
+        assert_eq!(os.write_unsigned(2, 7), Err(Error::BufferFull));
+        let used_a = os.bytes_used();
+        os.buffer_set(&mut b, 0).unwrap();
+        os.write_unsigned(2, 7).unwrap();
+        (used_a, os.bytes_used())
+    };
+    let mut streamed = a[..used_a].to_vec();
+    streamed.extend_from_slice(&b[..used_b]);
+    assert_eq!(streamed, [0x08, 0x2A, 0x10, 0x07]);
 }
 
 /// The other refusal mechanism: `with_flush` is infallible in its return type —

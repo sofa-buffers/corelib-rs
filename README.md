@@ -433,7 +433,15 @@ the buffers on both sides.
   which either copies the bytes (`Flush`) or takes the buffer and installs a
   replacement (`FlushTake`).
   `buffer_set` does the same from the outside, between messages or after a
-  buffer-full. To collect into a `Vec`, drive a small scratch buffer with an
+  buffer-full. **It never drops bytes:** on a stream *with* a sink whatever was
+  already written goes to the sink first — dropping it would truncate the message
+  while every call still returned `Ok`, the "partial output as if it were
+  complete" §5.1 forbids — so a mid-message buffer swap is byte-transparent and
+  needs no `flush()` in front of it. Without a sink there is nowhere to drain to,
+  so the bytes stay in the buffer *you* own and still hold: read `bytes_used()`,
+  take them, install the next buffer, concatenate. (An undersized buffer is
+  refused before anything is drained, leaving the stream as it was.)
+  To collect into a `Vec`, drive a small scratch buffer with an
   appending flush closure — *you* own the `Vec`. The encoder's own memory is the
   run of held-back sequence ids ([Sequences](#sequences)): eight of them inline,
   spilling to the heap only if you nest deeper than that.
