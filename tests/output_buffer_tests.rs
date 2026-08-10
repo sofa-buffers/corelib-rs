@@ -5,12 +5,12 @@
 
 use std::collections::VecDeque;
 
-use sofab::{Error, Flush, OStream, MIN_OUTPUT_BUFFER};
+use sofab::{Error, FlushTake, OStream, MIN_OUTPUT_BUFFER};
 
 /// The reference byte stream, written into a buffer that cannot fill. Mixes
 /// atomic units (headers, counts, scalars, floats) with a divisible run — a
 /// string far longer than any streaming buffer used below.
-fn script<'a, F: Flush<'a>>(os: &mut OStream<'a, F>) {
+fn script<'a, F: FlushTake<'a>>(os: &mut OStream<'a, F>) {
     os.write_unsigned(1, 42).unwrap();
     os.write_signed(2, -7).unwrap();
     os.write_str(3, "a string payload that no streaming buffer here can hold")
@@ -49,8 +49,7 @@ fn encode_at_exactly_min_output_buffer_matches_one_shot() {
     {
         let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
             collected.extend_from_slice(chunk);
-        })
-        .unwrap();
+        });
         script(&mut os);
         os.flush().unwrap();
     }
@@ -68,6 +67,11 @@ const _: () = assert!(MIN_OUTPUT_BUFFER <= 20 && MIN_OUTPUT_BUFFER >= 1);
 ///
 /// At `MIN_OUTPUT_BUFFER == 1` that is the zero-capacity buffer, and it is the
 /// case that used to reach `get_unchecked_mut` on an empty slice.
+///
+/// §5.1 lets a port refuse "by an exception, or an error status". This one offers
+/// both: `try_with_flush` is the status form, tested here, and `with_flush`
+/// panics — the mechanism Rust uses for an out-of-range slice index, tested
+/// below.
 #[test]
 fn a_sink_buffer_below_the_minimum_is_rejected_at_handover() {
     let short = MIN_OUTPUT_BUFFER - 1;
@@ -76,7 +80,7 @@ fn a_sink_buffer_below_the_minimum_is_rejected_at_handover() {
     let mut buf = vec![0u8; short];
     let mut sunk: Vec<u8> = Vec::new();
     assert_eq!(
-        OStream::with_flush(&mut buf, 0, |c: &[u8]| sunk.extend_from_slice(c))
+        OStream::try_with_flush(&mut buf, 0, |c: &[u8]| sunk.extend_from_slice(c))
             .err()
             .map(|e| e == Error::Argument),
         Some(true),
@@ -86,23 +90,45 @@ fn a_sink_buffer_below_the_minimum_is_rejected_at_handover() {
     // The same shortfall produced by the start offset rather than the length.
     let mut buf = vec![0u8; 8];
     assert_eq!(
-        OStream::with_flush(&mut buf, 8 - short, |c: &[u8]| sunk.extend_from_slice(c)).err(),
+        OStream::try_with_flush(&mut buf, 8 - short, |c: &[u8]| sunk.extend_from_slice(c)).err(),
         Some(Error::Argument)
     );
 
     // An offset past the end has no capacity at all — same rejection, same place.
     let mut buf = vec![0u8; 4];
     assert_eq!(
-        OStream::with_flush(&mut buf, 99, |c: &[u8]| sunk.extend_from_slice(c)).err(),
+        OStream::try_with_flush(&mut buf, 99, |c: &[u8]| sunk.extend_from_slice(c)).err(),
         Some(Error::Argument)
     );
 
     // And at a mid-stream buffer-set, which installs a buffer just as much.
     let mut good = [0u8; 16];
     let mut bad = vec![0u8; short];
-    let mut os = OStream::with_flush(&mut good, 0, |c: &[u8]| sunk.extend_from_slice(c)).unwrap();
+    let mut os = OStream::with_flush(&mut good, 0, |c: &[u8]| sunk.extend_from_slice(c));
     os.write_unsigned(1, 42).unwrap();
     assert_eq!(os.buffer_set(&mut bad, 0), Err(Error::Argument));
+}
+
+/// The other refusal mechanism: `with_flush` is infallible in its return type —
+/// that is the shape the generated layer calls (§6.1) — so it refuses an
+/// undersized buffer by panicking, at the handover and before a single byte of
+/// the message exists.
+#[test]
+#[should_panic(expected = "MIN_OUTPUT_BUFFER")]
+fn with_flush_panics_on_a_buffer_below_the_minimum() {
+    let mut buf = vec![0u8; MIN_OUTPUT_BUFFER - 1];
+    let mut sunk: Vec<u8> = Vec::new();
+    let _ = OStream::with_flush(&mut buf, 0, |c: &[u8]| sunk.extend_from_slice(c));
+}
+
+/// And the same refusal when the shortfall comes from the start offset, which is
+/// where an out-of-range offset lands too.
+#[test]
+#[should_panic(expected = "MIN_OUTPUT_BUFFER")]
+fn with_flush_panics_on_an_offset_past_the_end() {
+    let mut buf = vec![0u8; 4];
+    let mut sunk: Vec<u8> = Vec::new();
+    let _ = OStream::with_flush(&mut buf, 99, |c: &[u8]| sunk.extend_from_slice(c));
 }
 
 /// The converse, and the half that keeps the minimum from leaking onto the
@@ -149,8 +175,8 @@ struct TakingSink<'a, 'o> {
     last: &'o mut Option<*const u8>,
 }
 
-impl<'a, 'o> Flush<'a> for TakingSink<'a, 'o> {
-    fn flush(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize) {
+impl<'a, 'o> FlushTake<'a> for TakingSink<'a, 'o> {
+    fn flush_take(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize) {
         self.out.extend_from_slice(&buffer[..used]);
         let handed = buffer.as_ptr();
         assert_ne!(
@@ -187,7 +213,7 @@ fn a_taking_sink_that_swaps_buffers_every_flush_matches_one_shot() {
             swaps: &mut swaps,
             last: &mut last,
         };
-        let mut os = OStream::with_flush(&mut first, 0, sink).unwrap();
+        let mut os = OStream::with_flush(&mut first, 0, sink);
         script(&mut os);
         os.flush().unwrap();
     }
@@ -208,8 +234,7 @@ fn a_copying_sink_that_returns_its_buffer_matches_one_shot() {
     {
         let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
             collected.extend_from_slice(chunk);
-        })
-        .unwrap();
+        });
         script(&mut os);
         os.flush().unwrap();
     }
@@ -239,8 +264,7 @@ fn no_foreign_memory_reaches_a_sink() {
                 "sink received memory outside the installed buffer"
             );
             seen += 1;
-        })
-        .unwrap();
+        });
         os.write_blob(1, &blob).unwrap();
         os.flush().unwrap();
     }

@@ -18,7 +18,49 @@ use crate::varint::{
 };
 use crate::{Id, Signed, Unsigned};
 
-/// Sink that receives the output buffer when it fills (or on an explicit
+/// Sink that receives the bytes buffered so far when the output buffer fills (or
+/// on an explicit [`OStream::flush`]) and **copies** them out — the common case,
+/// and the whole of it for a closure sink.
+///
+/// ```
+/// # use sofab::OStream;
+/// let mut out: Vec<u8> = Vec::new();
+/// let mut scratch = [0u8; 16];
+/// let mut os = OStream::with_flush(&mut scratch, 0, |chunk: &[u8]| {
+///     out.extend_from_slice(chunk)
+/// });
+/// os.write_unsigned(1, 42).unwrap();
+/// os.flush().unwrap();
+/// ```
+///
+/// Any `FnMut(&[u8])` implements this trait, so callbacks can be passed directly;
+/// implement it by hand for a custom transport/writer that copies.
+///
+/// A sink that instead **takes** the buffer — queues it for an asynchronous
+/// write, hands it to a transport, to DMA — cannot be expressed this way,
+/// because it has no way to say what the encoder should write into next. That
+/// half of the §5.1 handover is [`FlushTake`], and this trait feeds into it:
+/// every `Flush` is a copying `FlushTake` at every lifetime, and an [`OStream`]
+/// accepts either.
+///
+/// This trait is also what the generated layer is written against
+/// (CORELIB_PLAN §6.1). `sofabgen` emits
+/// `serialize<_F: sofab::Flush>(&self, os: &mut OStream<'_, _F>)`, which names no
+/// lifetime — so the sink trait a generated crate can spell must not have one.
+pub trait Flush {
+    /// Consume `data` (e.g. push to a transport or storage). Called with the
+    /// bytes accumulated since the last flush.
+    fn flush(&mut self, data: &[u8]);
+}
+
+impl<T: FnMut(&[u8])> Flush for T {
+    #[inline]
+    fn flush(&mut self, data: &[u8]) {
+        self(data)
+    }
+}
+
+/// Sink that receives the output **buffer** when it fills (or on an explicit
 /// [`OStream::flush`]), and says what the encoder writes into next.
 ///
 /// # The handover contract (CORELIB_PLAN §5.1)
@@ -46,36 +88,28 @@ use crate::{Id, Signed, Unsigned};
 /// buffer with a non-zero offset is how a sink re-arms header room in *every*
 /// flushed unit, one framing header per packet.
 ///
-/// # Closures
+/// # Which of the two to implement
 ///
-/// Any `FnMut(&[u8])` implements this trait as a **copying** sink, so the common
-/// case stays a one-liner:
-///
-/// ```
-/// # use sofab::OStream;
-/// let mut out: Vec<u8> = Vec::new();
-/// let mut scratch = [0u8; 16];
-/// let mut os = OStream::with_flush(&mut scratch, 0, |chunk: &[u8]| {
-///     out.extend_from_slice(chunk)
-/// })
-/// .unwrap();
-/// os.write_unsigned(1, 42).unwrap();
-/// os.flush().unwrap();
-/// ```
-///
-/// Implement the trait by hand only for a taking sink — a closure has no way to
-/// return a buffer.
-pub trait Flush<'a> {
+/// Implement this trait by hand only for a **taking** sink: keeping the buffer
+/// means storing a `&'a mut [u8]`, and the lifetime it is stored under is
+/// exactly the `'a` here — which is why the taking half needs a lifetime on the
+/// trait and the copying half does not. Everything that copies, closures
+/// included, implements [`Flush`] and reaches this trait through the blanket
+/// impl below.
+pub trait FlushTake<'a> {
     /// Consume the first `used` bytes of `buffer`, then say what to write into
     /// next: `(buffer, 0)` if the bytes were copied, or `(replacement, offset)`
     /// if `buffer` was taken.
-    fn flush(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize);
+    fn flush_take(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize);
 }
 
-impl<'a, T: FnMut(&[u8])> Flush<'a> for T {
+/// A copying sink is a [`FlushTake`] that hands the buffer straight back, at
+/// **every** lifetime — which is what lets code bound only by [`Flush`], such as
+/// a generated `serialize`, drive a stream over any buffer.
+impl<'a, T: Flush> FlushTake<'a> for T {
     #[inline]
-    fn flush(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize) {
-        self(&buffer[..used]);
+    fn flush_take(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize) {
+        self.flush(&buffer[..used]);
         (buffer, 0)
     }
 }
@@ -86,11 +120,9 @@ impl<'a, T: FnMut(&[u8])> Flush<'a> for T {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoFlush;
 
-impl<'a> Flush<'a> for NoFlush {
+impl Flush for NoFlush {
     #[inline]
-    fn flush(&mut self, buffer: &'a mut [u8], _used: usize) -> (&'a mut [u8], usize) {
-        (buffer, 0)
-    }
+    fn flush(&mut self, _data: &[u8]) {}
 }
 
 /// Whether a buffer may be installed **with a sink**: its capacity must reach
@@ -217,7 +249,7 @@ impl PendingRun {
 }
 
 /// Streaming Sofab encoder writing into a caller-provided buffer.
-pub struct OStream<'a, F: Flush<'a> = NoFlush> {
+pub struct OStream<'a, F: FlushTake<'a> = NoFlush> {
     buffer: &'a mut [u8],
     end: usize,
     offset: usize,
@@ -254,25 +286,48 @@ impl<'a> OStream<'a, NoFlush> {
     }
 }
 
-impl<'a, F: Flush<'a>> OStream<'a, F> {
+impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// Create an encoder with a flush `sink`, starting at `offset`. When the
-    /// buffer fills, it is handed to `sink` under the [`Flush`] handover
+    /// buffer fills, it is handed to `sink` under the [`FlushTake`] handover
     /// contract and writing resumes in whatever the sink left behind.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// [`Error::Argument`] if the buffer's capacity — `buffer.len() - offset`,
-    /// which an offset past the end makes nonexistent — is below
-    /// [`MIN_OUTPUT_BUFFER`]. A buffer that cannot hold a single byte would
-    /// otherwise flush stale content, or none at all, partway through a message;
-    /// the minimum is checked **here**, where the buffer is handed over, and
-    /// nowhere later (CORELIB_PLAN §5.1).
+    /// If the buffer's capacity — `buffer.len() - offset`, which an offset past
+    /// the end makes nonexistent — is below [`MIN_OUTPUT_BUFFER`]. A buffer that
+    /// cannot hold a single byte would otherwise flush stale content, or none at
+    /// all, partway through a message; the minimum is judged **here**, where the
+    /// buffer is handed over, and nowhere later (CORELIB_PLAN §5.1).
+    ///
+    /// The buffer and its offset come from the calling code, never from decoded
+    /// input, so this is a precondition in the same class as an out-of-range
+    /// slice index — and §5.1 lets a port refuse by "an exception, or an error
+    /// status". Use [`OStream::try_with_flush`] for the error-status form when
+    /// the size is computed rather than known.
     ///
     /// The minimum applies only because a sink is attached. Use
     /// [`OStream::new`] / [`OStream::with_offset`] for a buffer without one:
     /// no flush can occur there, so no minimum binds it.
     #[inline]
-    pub fn with_flush(buffer: &'a mut [u8], offset: usize, sink: F) -> Result<Self> {
+    pub fn with_flush(buffer: &'a mut [u8], offset: usize, sink: F) -> Self {
+        match Self::try_with_flush(buffer, offset, sink) {
+            Ok(os) => os,
+            Err(_) => panic!(
+                "output buffer capacity below MIN_OUTPUT_BUFFER ({MIN_OUTPUT_BUFFER}) \
+                 for a stream with a flush sink"
+            ),
+        }
+    }
+
+    /// [`OStream::with_flush`], reporting the capacity precondition as an error
+    /// status instead of a panic.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] if `buffer.len() - offset` is below
+    /// [`MIN_OUTPUT_BUFFER`], including the case of an offset past the end.
+    #[inline]
+    pub fn try_with_flush(buffer: &'a mut [u8], offset: usize, sink: F) -> Result<Self> {
         check_streaming_capacity(buffer.len(), offset)?;
         let end = buffer.len();
         Ok(OStream {
@@ -310,10 +365,11 @@ impl<'a, F: Flush<'a>> OStream<'a, F> {
     /// Replace the active buffer, resuming writes at `offset` in the new one.
     ///
     /// This is the mid-stream buffer-set of CORELIB_PLAN §5.1. A sink does not
-    /// call it — it returns its replacement from [`Flush::flush`] instead, which
-    /// is the only point at which the encoder is between buffers. Use this from
-    /// the *outside*: to install a bigger buffer after a sinkless stream reported
-    /// [`Error::BufferFull`], or to re-arm header room between messages.
+    /// call it — it returns its replacement from [`FlushTake::flush_take`]
+    /// instead, which is the only point at which the encoder is between buffers.
+    /// Use this from the *outside*: to install a bigger buffer after a sinkless
+    /// stream reported [`Error::BufferFull`], or to re-arm header room between
+    /// messages.
     ///
     /// The offset belongs to this installation and is consumed by it.
     ///
@@ -349,7 +405,7 @@ impl<'a, F: Flush<'a>> OStream<'a, F> {
             .flush
             .as_mut()
             .expect("hand_over is only reached with a sink installed");
-        let (buffer, offset) = sink.flush(buffer, used);
+        let (buffer, offset) = sink.flush_take(buffer, used);
         self.end = buffer.len();
         self.buffer = buffer;
         self.offset = offset;

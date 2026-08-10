@@ -27,7 +27,7 @@ mod common;
 use common::{Event, Recorder};
 use serde_json::Value;
 use sofab::ArrayKind;
-use sofab::{Error, Flush, IStream, Id, OStream, Signed, Unsigned, Visitor};
+use sofab::{Error, FlushTake, IStream, Id, OStream, Signed, Unsigned, Visitor};
 
 /// The shared vectors, embedded from the verbatim asset copy.
 ///
@@ -125,7 +125,7 @@ fn array_kind(element_type: &str) -> ArrayKind {
 // --- encode -----------------------------------------------------------------
 
 /// Write a vector's `fields[]` into any stream (buffered or flushing).
-fn write_fields<'a, F: Flush<'a>>(os: &mut OStream<'a, F>, fields: &[Value]) {
+fn write_fields<'a, F: FlushTake<'a>>(os: &mut OStream<'a, F>, fields: &[Value]) {
     // A vector's `serialized` form is the primitive-layer ground truth and always
     // carries the frame, so every sequence closes with `end_keep`: identical bytes
     // once the sequence has content, and the empty-sequence vectors keep their
@@ -155,7 +155,7 @@ fn write_fields<'a, F: Flush<'a>>(os: &mut OStream<'a, F>, fields: &[Value]) {
     }
 }
 
-fn encode_array<'a, F: Flush<'a>>(os: &mut OStream<'a, F>, id: Id, f: &Value) {
+fn encode_array<'a, F: FlushTake<'a>>(os: &mut OStream<'a, F>, id: Id, f: &Value) {
     let et = f["element_type"].as_str().unwrap();
     let vals = f["values"].as_array().unwrap();
     match et {
@@ -218,8 +218,7 @@ fn chunked_encode(fields: &[Value], buf_size: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut scratch = vec![0u8; buf_size];
     {
-        let mut os =
-            OStream::with_flush(&mut scratch, 0, |c: &[u8]| out.extend_from_slice(c)).unwrap();
+        let mut os = OStream::with_flush(&mut scratch, 0, |c: &[u8]| out.extend_from_slice(c));
         write_fields(&mut os, fields);
         os.flush().unwrap();
     }
