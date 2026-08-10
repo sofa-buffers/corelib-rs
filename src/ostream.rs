@@ -373,15 +373,41 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     ///
     /// The offset belongs to this installation and is consumed by it.
     ///
+    /// # What happens to the bytes already written
+    ///
+    /// On a stream **with** a sink they are handed over first, exactly as
+    /// [`OStream::flush`] would: there is somewhere to drain to, and dropping
+    /// them would truncate the message while every call still reported success —
+    /// the "partial output as if it were complete" §5.1 rules out. So a
+    /// buffer-set mid-message is byte-transparent, and no separate `flush()` is
+    /// needed before one. The replacement the sink leaves behind at that handover
+    /// is superseded by `buffer`, the caller's installation being the later word,
+    /// so its capacity is not judged here.
+    ///
+    /// On a stream **without** a sink there is nowhere to drain to, so the bytes
+    /// stay where they are — in the buffer *you* own and still hold. That is the
+    /// documented recovery from [`Error::BufferFull`]: read [`bytes_used`], take
+    /// the bytes, then install the next buffer and concatenate.
+    ///
+    /// [`bytes_used`]: OStream::bytes_used
+    ///
     /// # Errors
     ///
     /// On a stream **with** a sink, [`Error::Argument`] if the new buffer's
-    /// capacity (`buffer.len() - offset`) is below [`MIN_OUTPUT_BUFFER`]. A
-    /// stream without a sink is subject to no minimum and this never fails.
+    /// capacity (`buffer.len() - offset`) is below [`MIN_OUTPUT_BUFFER`]. It is
+    /// judged before anything is drained, so a refused installation leaves the
+    /// stream exactly as it was. A stream without a sink is subject to no
+    /// minimum and this never fails.
     #[inline]
     pub fn buffer_set(&mut self, buffer: &'a mut [u8], offset: usize) -> Result<()> {
         if self.flush.is_some() {
             check_streaming_capacity(buffer.len(), offset)?;
+            if self.offset > 0 {
+                // The only failure `hand_over` reports is a replacement below
+                // the minimum, and that replacement is discarded two lines down
+                // in favour of `buffer`; the bytes reached the sink either way.
+                let _ = self.hand_over();
+            }
         }
         self.end = buffer.len();
         self.buffer = buffer;
