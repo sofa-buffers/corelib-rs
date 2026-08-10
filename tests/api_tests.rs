@@ -1,5 +1,6 @@
 //! Tests for streaming/buffer-management API surface: reserve-offset,
-//! buffer swapping, and large chunked payload streaming.
+//! buffer swapping, and large chunked payload streaming — plus guards on what
+//! the crate exports at all.
 
 mod common;
 
@@ -97,4 +98,35 @@ fn value_type_is_64_bit() {
     // This build is always 64-bit; there is no build-time configuration.
     assert_eq!(sofab::Unsigned::BITS, 64);
     assert_eq!(sofab::Signed::BITS, 64);
+}
+
+#[test]
+fn no_trailing_default_trimming_helper_ships() {
+    // MESSAGE_SPEC §3: the wire count `M` is the array's **length**, so there is
+    // no trailing elision — `[1, 2, 0, 0]` and `[1, 2]` are different values and
+    // encode differently. A helper that hands the encoder `&a[..M']` therefore
+    // shortens the array, and shipping one publicly (under `#![deny(missing_docs)]`,
+    // so its doc text is the crate's advertised contract) instructs callers to
+    // produce a value the sender did not have.
+    //
+    // The guard is a source scan rather than a compile check because an absent
+    // symbol cannot be named from a test that has to compile: `sofab::trim_tail(..)`
+    // in a test body would break the build instead of failing this assertion.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut scanned = 0;
+    for entry in std::fs::read_dir(&src).expect("read src/") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        scanned += 1;
+        let text = std::fs::read_to_string(&path).expect("read source file");
+        assert!(
+            !text.contains("trim_tail"),
+            "{}: MESSAGE_SPEC §3 forbids trailing elision — the crate must not ship \
+             a trailing-default trimming helper",
+            path.display(),
+        );
+    }
+    assert!(scanned > 0, "no crate sources scanned");
 }

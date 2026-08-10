@@ -2,9 +2,11 @@
 name = "sofa-buffers-corelib"
 # 0.11.0, not 0.10.x: under Cargo's 0.x semantics a 0.10.x release must stay
 # API-compatible with 0.10.0, and this series is not — `flush` and `buffer_set`
-# grew a `Result`, and the `FlushTake` half of the §5.1 handover is new. The
-# shapes generated crates use (`Flush` as a lifetime-free bound, `with_flush`
-# returning the stream) are the ones deliberately kept as they were in 0.10.0.
+# grew a `Result`, the `FlushTake` half of the §5.1 handover is new, and
+# `trim_tail`/`trim_tail_f32`/`trim_tail_f64` are gone (MESSAGE_SPEC §3 forbids
+# trailing elision; nothing generated ever called them). The shapes generated
+# crates use (`Flush` as a lifetime-free bound, `with_flush` returning the
+# stream) are the ones deliberately kept as they were in 0.10.0.
 version = "0.11.0"
 edition = "2021"
 rust-version = "1.70"

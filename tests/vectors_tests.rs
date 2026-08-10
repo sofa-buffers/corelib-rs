@@ -494,6 +494,62 @@ fn shared_vectors_present_and_parsed() {
 }
 
 #[test]
+fn trailing_default_array_elements_stay_on_the_wire() {
+    // MESSAGE_SPEC §3: "A default-valued element stays on the wire, trailing ones
+    // included — `M` is the length, so eliding one would shorten the array:
+    // `[1, 2, 3, 0, 0]` and `[1, 2, 3]` are different values and encode
+    // differently." The shared set pins that with a named vector; the loop below
+    // runs it among the rest, but nothing named it, so a drift in the vector file
+    // could drop the case without a test going red. This names it, and states the
+    // rule the corelib must never grow a helper for: the encoder writes **every**
+    // element it is handed, and a shortened one is a *different value*, not a
+    // smaller encoding of the same one.
+    let doc: Value = serde_json::from_str(VECTORS_JSON).unwrap();
+    let vec = doc["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "array_unsigned_trailing_defaults")
+        .expect("shared vector `array_unsigned_trailing_defaults`");
+
+    let fields = vec["fields"].as_array().unwrap();
+    let expected_hex = vec["serialized"]["hex"].as_str().unwrap();
+    assert_eq!(expected_hex, "030401020000", "vector file drifted");
+    assert_eq!(
+        fields[0]["values"].as_array().unwrap().len(),
+        4,
+        "the vector must carry the trailing defaults",
+    );
+
+    // Encode: all four elements, count M = 4.
+    let bytes = encode_fields(fields, 0);
+    assert_eq!(bytes_to_hex(&bytes), expected_hex);
+
+    // Decode: the array reports length 4 and yields both trailing zeros.
+    assert_eq!(
+        decode(&bytes),
+        vec![
+            Event::ArrayBegin(0, ArrayKind::Unsigned, 4),
+            Event::Unsigned(0, 1),
+            Event::Unsigned(0, 2),
+            Event::Unsigned(0, 0),
+            Event::Unsigned(0, 0),
+        ],
+    );
+
+    // The trimmed form is a different value, not a shorter spelling of this one:
+    // different bytes, and a decoded length of 2.
+    let mut buf = [0u8; 8];
+    let trimmed = {
+        let mut os = OStream::new(&mut buf);
+        os.write_array_unsigned(0, &[1u32, 2]).unwrap();
+        os.bytes_used()
+    };
+    assert_eq!(bytes_to_hex(&buf[..trimmed]), "03020102");
+    assert_ne!(&buf[..trimmed], &bytes[..]);
+}
+
+#[test]
 fn all_shared_vectors_conform() {
     let doc: Value = serde_json::from_str(VECTORS_JSON).unwrap();
     let vectors = doc["vectors"].as_array().unwrap();
