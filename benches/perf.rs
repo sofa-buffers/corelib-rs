@@ -79,6 +79,12 @@ fn cpu_now() -> f64 {
 // ---------------------------------------------------------------------------
 const PERF_STRING: &str = "perf-benchmark-message";
 
+/// Encoded size of the `perf` message. BENCH_SPEC pins it: "The encoded size of
+/// the `perf` message (170 bytes on every implementation) is a quick parity
+/// check: if your `perf` prints a different `message size`, your encoding
+/// diverges." Printing it is not the same as checking it, so it is checked.
+const PERF_SIZE: usize = 170;
+
 const PERF_SAMPLES: [u32; 8] = [
     1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000, 6_000_000, 7_000_000, 8_000_000,
 ];
@@ -322,6 +328,14 @@ fn main() {
 
     let (enc, msg_size) = measure_encode(|| perf_encode(&mut buffer));
     perf_report("serialize (stream API)", &enc, msg_size);
+
+    // Cross-port parity check (BENCH_SPEC): the perf message is 170 bytes on
+    // every implementation, so a different size means this port's encoding has
+    // diverged and none of the numbers below are comparable with anyone else's.
+    if msg_size != PERF_SIZE {
+        eprintln!("perf: message size {msg_size} bytes, expected {PERF_SIZE} — encoding diverged");
+        std::process::exit(1);
+    }
 
     // Sanity check that the decode actually reproduced the data.
     let mut out = PerfOut::default();
