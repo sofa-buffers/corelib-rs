@@ -410,7 +410,7 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// whose capacity is below [`MIN_OUTPUT_BUFFER`]. The bytes reached the sink
     /// either way; what failed is the next installation — and it kills the
     /// stream, so every later call reports the same error rather than a silent
-    /// `Ok(0)` tail (see [`OStream::hand_over`]).
+    /// `Ok(0)` tail (see `hand_over`).
     pub fn flush(&mut self) -> Result<usize> {
         if self.dead {
             return Err(Error::Argument);
@@ -444,7 +444,7 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// is superseded by `buffer`, the caller's installation being the later word,
     /// so its capacity is not judged here — and a replacement below
     /// [`MIN_OUTPUT_BUFFER`], which would kill the stream anywhere else
-    /// ([`OStream::hand_over`]), does not kill it here either: nothing was lost,
+    /// (`hand_over`), does not kill it here either: nothing was lost,
     /// nothing was written into the refused buffer, and the buffer that ends up
     /// installed is the one already judged above.
     ///
