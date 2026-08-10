@@ -521,13 +521,21 @@ never larger than the depth you actually nest to.
 ```bash
 cargo build --release            # opt-level 3, fat LTO
 cargo test                       # unit + integration + doctests (incl. shared vectors)
+cargo test --release             # the same suite in the shipped configuration
 ./coverage.sh                    # llvm-cov: summary + HTML + lcov.info
 ```
 
+Run both test lines. The debug run is the one where the `debug_assert!`s fire;
+the `--release` run is the one that exercises the optimized code the crate
+actually ships — the decoder's unchecked unaligned loads and the encoder's
+unchecked stores are guarded by reasoning the inliner can see through, so they
+have to be asserted on at `opt-level = 3` with fat LTO, not only at
+`opt-level = 0`.
+
 CI runs fmt + clippy (`-D warnings`), the full suite on **stable** and the three
-most recent pinned stable releases, a library-only build at the declared
-**MSRV 1.70**, the same suite on a **big-endian** s390x host under QEMU, and
-llvm-cov coverage.
+most recent pinned stable releases, that same suite again in the **release
+profile**, a library-only build at the declared **MSRV 1.70**, the suite on a
+**big-endian** s390x host under QEMU, and llvm-cov coverage.
 Integration tests live in `tests/` (shared-vector replay, fast-path decode,
 encoder/decoder byte-exact checks, round-trip, malformed-input errors, the
 output-buffer and flush-handover contract, non-canonical-but-valid input, and

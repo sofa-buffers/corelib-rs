@@ -40,6 +40,23 @@ jobs:
       - run: cargo build --release --verbose
       - run: cargo test --verbose
 
+  # The same suite against the build users actually link against. `cargo test`
+  # on its own only ever asserts on the unoptimized artifact, and this port's
+  # correctness arguments are optimizer-visible: the varint reader's unchecked
+  # unaligned loads, `push_byte`'s `get_unchecked_mut` and
+  # `write_varint_unchecked`'s eight-byte store for a one-byte varint all sit
+  # behind guards the inliner can see through. `--release` compiles the test
+  # targets with `[profile.release]`'s opt-level 3 / fat LTO / single codegen
+  # unit (CORELIB_PLAN §12.1, steps 4-5). Stable only — the pinned-toolchain
+  # legs above already prove the release *build* compiles on each of them.
+  test-release:
+    name: Test (release profile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+      - run: cargo test --release --verbose
+
   # The MSRV declared in Cargo.toml (`rust-version`). Library-only: the dev-
   # dependency tree (serde_json -> zmij) needs 1.71+, so `cargo test` can't run
   # this far back — the MSRV promise covers what users compile, not our tests.
