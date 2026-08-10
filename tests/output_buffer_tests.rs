@@ -306,6 +306,70 @@ fn the_same_undersized_buffer_without_a_sink_is_accepted() {
     assert_eq!(os.write_unsigned(1, 42), Err(Error::BufferFull));
 }
 
+/// What the sinkless waiver does **not** cover: §5.1 waives `MIN_OUTPUT_BUFFER`
+/// for a buffer installed without a sink, not the *range* of the start offset —
+/// the offset is a position in the buffer, and one past its end names no
+/// installation at all. §5.1 describes the minimum as being refused "by the same
+/// mechanism the port uses for an out-of-range offset", so both installation
+/// paths must have that mechanism and must agree.
+///
+/// The boundary case `offset == len` is a real installation: capacity zero, no
+/// minimum binds it, and the first write reports `BufferFull`.
+#[test]
+fn a_start_offset_past_the_end_is_refused_without_a_sink() {
+    // Construction, error-status form.
+    let mut buf = [0u8; 4];
+    assert_eq!(
+        OStream::try_with_offset(&mut buf, 5).err(),
+        Some(Error::Argument)
+    );
+
+    // The zero-capacity boundary is accepted: a buffer that holds nothing, not an
+    // offset outside the buffer.
+    let mut buf = [0u8; 4];
+    let mut os = OStream::try_with_offset(&mut buf, 4).expect("offset == len is in range");
+    assert_eq!(os.bytes_used(), 4);
+    assert_eq!(os.write_unsigned(1, 42), Err(Error::BufferFull));
+
+    // A mid-stream buffer-set on a sinkless stream, which is where the two paths
+    // used to disagree: the sink path folds the range into its capacity check and
+    // this one had no check at all, so the offset was accepted and surfaced only
+    // as a late `BufferFull` — or as a caller reading `bytes_used()` past the end
+    // of its own buffer.
+    let mut a = [0u8; 8];
+    let mut b = [0u8; 4];
+    let mut os = OStream::new(&mut a);
+    os.write_unsigned(1, 42).unwrap();
+    assert_eq!(os.buffer_set(&mut b, 5), Err(Error::Argument));
+
+    // A refused installation leaves the stream exactly as it was: still on the
+    // first buffer, still holding its two bytes, still writable.
+    assert_eq!(os.bytes_used(), 2);
+    os.write_signed(2, -7).unwrap();
+    let used = os.bytes_used();
+    drop(os);
+    assert_eq!(&a[..used], &[0x08, 0x2A, 0x11, 0x0D]);
+
+    // And the boundary again, this time installed mid-stream.
+    let mut a = [0u8; 8];
+    let mut b = [0u8; 4];
+    let mut os = OStream::new(&mut a);
+    assert_eq!(os.buffer_set(&mut b, 4), Ok(()));
+    assert_eq!(os.bytes_used(), 4);
+    assert_eq!(os.write_unsigned(1, 42), Err(Error::BufferFull));
+}
+
+/// The exception form of the same refusal, matching `with_flush`: `with_offset`
+/// cannot report a status — it returns `Self` — so an offset outside the buffer
+/// panics there, like an out-of-range slice index. `try_with_offset` is the
+/// status form.
+#[test]
+#[should_panic(expected = "start offset")]
+fn with_offset_panics_on_an_offset_past_the_end() {
+    let mut buf = [0u8; 4];
+    let _ = OStream::with_offset(&mut buf, 99);
+}
+
 /// A sink that **takes** every buffer it is handed: it copies the bytes out,
 /// scrubs the storage, retains it, and installs a different buffer before
 /// returning (§5.1 take-and-replace).
