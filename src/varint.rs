@@ -174,23 +174,26 @@ unsafe fn read_varint_wide(p: *const u8, start: usize, pos: &mut usize) -> Resul
 /// Checked byte loop for the last [`MAX_VARINT_LEN`] − 1 bytes of a buffer,
 /// where the varint may legitimately be split across chunks. Returns the value
 /// and the number of bytes it occupied.
+///
+/// **Fewer than [`MAX_VARINT_LEN`] readable bytes is a precondition, not a
+/// hint**: a varint with a full ten bytes in front of it is
+/// [`read_varint_wide`]'s job, and that is where — and only where — the 64-bit
+/// bound is enforced. At most nine bytes are readable here, so `shift` tops out
+/// at 56 and no byte this loop reads can overflow the value; a run of
+/// continuations that reaches the end of the buffer is [`Error::Incomplete`],
+/// because the byte that terminates it may still arrive in the next chunk.
 #[inline]
 fn read_varint_tail(buf: &[u8], start: usize) -> Result<(Unsigned, usize)> {
+    debug_assert!(
+        buf.len() - start < MAX_VARINT_LEN,
+        "a full-width varint run belongs to read_varint_wide"
+    );
     let mut value: Unsigned = 0;
     let mut shift: u32 = 0;
     let mut i = start;
     while i < buf.len() {
         let byte = buf[i];
         i += 1;
-        if shift == Unsigned::BITS - 1 {
-            // Final byte that can still fit: only bit 63 remains, so a payload
-            // above 1 (or a continuation bit) overflows the value.
-            if byte > 1 {
-                return Err(Error::InvalidMsg);
-            }
-            value |= (byte as Unsigned) << shift;
-            return Ok((value, i - start));
-        }
         value |= ((byte & 0x7F) as Unsigned) << shift;
         if byte & 0x80 == 0 {
             return Ok((value, i - start));
@@ -293,4 +296,115 @@ pub(crate) fn zigzag_encode(v: Signed) -> Unsigned {
 #[inline]
 pub(crate) fn zigzag_decode(u: Unsigned) -> Signed {
     ((u >> 1) as Signed) ^ -((u & 1) as Signed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal base-128 encoding of `value`, written the slow obvious way so the
+    /// decoder tests do not lean on the writer they sit next to.
+    fn encode(mut value: Unsigned) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// Widest value that still encodes in `len` bytes, for `len` in 1..=9.
+    fn widest_in(len: u32) -> Unsigned {
+        Unsigned::MAX >> (Unsigned::BITS - 7 * len)
+    }
+
+    /// `read_varint` takes the tail path only when fewer than `MAX_VARINT_LEN`
+    /// bytes are readable, so hand it a buffer that is exactly the varint.
+    fn decode_via_tail(bytes: &[u8]) -> Result<(Unsigned, usize)> {
+        assert!(
+            bytes.len() < MAX_VARINT_LEN,
+            "that buffer takes the wide path"
+        );
+        let mut pos = 0;
+        let value = read_varint(bytes, &mut pos)?;
+        let direct = read_varint_tail(bytes, 0);
+        assert_eq!(direct, Ok((value, pos)), "tail and read_varint disagree");
+        Ok((value, pos))
+    }
+
+    /// Every length the tail can be handed — 1..=`MAX_VARINT_LEN` − 1 — decodes.
+    /// The nine-byte row is the widest one: its last byte is read with `shift`
+    /// at 56, which is the largest shift this loop can ever reach.
+    #[test]
+    fn tail_decodes_every_length_it_can_be_handed() {
+        for len in 1..MAX_VARINT_LEN as u32 + 1 - 1 {
+            let value = widest_in(len);
+            let bytes = encode(value);
+            assert_eq!(bytes.len(), len as usize);
+            assert_eq!(decode_via_tail(&bytes), Ok((value, len as usize)));
+        }
+        // The widest nine-byte varint carries 63 payload bits.
+        assert_eq!(widest_in(9), (1 << 63) - 1);
+    }
+
+    /// A varint cut short is `Incomplete` — the truncation outcome — and the
+    /// cursor stays put so the streaming decoder can carry the bytes forward.
+    #[test]
+    fn tail_reports_incomplete_for_every_truncation() {
+        for len in 2..MAX_VARINT_LEN as u32 {
+            let bytes = encode(widest_in(len));
+            for cut in 1..bytes.len() {
+                let head = &bytes[..cut];
+                let mut pos = 0;
+                assert_eq!(read_varint(head, &mut pos), Err(Error::Incomplete));
+                assert_eq!(pos, 0);
+                assert_eq!(read_varint_tail(head, 0), Err(Error::Incomplete));
+            }
+        }
+    }
+
+    /// Nine continuing bytes are *not* a rejection: a tenth byte may still
+    /// arrive and terminate the varint legitimately, so the tail defers. The
+    /// 64-bit bound is the wide path's business, not the tail's.
+    #[test]
+    fn tail_defers_a_run_of_continuations() {
+        let all_continue = [0x80u8; MAX_VARINT_LEN - 1];
+        assert_eq!(read_varint_tail(&all_continue, 0), Err(Error::Incomplete));
+        let mut pos = 0;
+        assert_eq!(read_varint(&all_continue, &mut pos), Err(Error::Incomplete));
+    }
+
+    /// The 64-bit bound is enforced in exactly one place — the wide path — and
+    /// it is enforced on the tenth byte.
+    #[test]
+    fn the_wide_path_owns_the_64_bit_bound() {
+        let ten = encode(Unsigned::MAX); // ends in 0x01: bit 63, the widest tenth byte
+        assert_eq!(ten.len(), MAX_VARINT_LEN);
+        assert_eq!(ten[MAX_VARINT_LEN - 1], 0x01);
+        let mut pos = 0;
+        assert_eq!(read_varint(&ten, &mut pos), Ok(Unsigned::MAX));
+        assert_eq!(pos, MAX_VARINT_LEN);
+
+        for tenth in [0x02u8, 0x7F, 0x80, 0xFF] {
+            let mut over = vec![0x80u8; MAX_VARINT_LEN - 1];
+            over.push(tenth);
+            let mut pos = 0;
+            assert_eq!(read_varint(&over, &mut pos), Err(Error::InvalidMsg));
+        }
+    }
+
+    /// `read_varint_tail` may only be handed the last `MAX_VARINT_LEN` − 1
+    /// bytes of a buffer; anything wider belongs to `read_varint_wide`, which is
+    /// where the 64-bit bound is checked. The debug assertion documents that
+    /// invariant and catches a caller that forgets it.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "read_varint_wide")]
+    fn tail_refuses_a_run_the_wide_path_owns() {
+        let _ = read_varint_tail(&[0x80u8; MAX_VARINT_LEN], 0);
+    }
 }
