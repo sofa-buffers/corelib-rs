@@ -699,3 +699,141 @@ fn header_fires_exactly_once_even_when_the_field_straddles_a_chunk() {
         );
     }
 }
+
+// --- INVALID is terminal for the stream (CORELIB_PLAN §5.2) ------------------
+//
+// The §5.2 outcome table marks `INVALID` "no — terminal" in the *can more bytes
+// change it?* column: the bytes consumed so far are malformed regardless of what
+// follows, so no later chunk may talk the same decoder back into `COMPLETE` or
+// `INCOMPLETE`. §7.2 item 4 turns that into a testable property — feeding an
+// input one byte at a time (and in odd-sized chunks) must yield the same verdict
+// as feeding it whole — which a decoder that resynchronizes after a rejection
+// cannot satisfy: its answer becomes chunk-size dependent.
+
+/// Every collection of malformed inputs used below, each paired with well-formed
+/// bytes that follow the malformed construct. A decoder that resynchronizes
+/// would decode those trailing bytes and report `Ok`/`Incomplete`.
+fn malformed_with_valid_tail() -> Vec<(&'static str, Vec<u8>)> {
+    let mut v: Vec<(&'static str, Vec<u8>)> = Vec::new();
+
+    // fp64 fixlen word declaring length 11 (≠ 8), then a whole unsigned field.
+    v.push(("fp64 wrong width", vec![0x0A, 0x59, 0x08, 0x2A]));
+    // Reserved fixlen subtype 0x4, then a whole unsigned field.
+    v.push(("reserved subtype", vec![0x02, (4 << 3) | 0x04, 0x08, 0x2A]));
+    // A value varint wider than 64 bits, then a whole unsigned field.
+    let mut overlong = vec![0x00];
+    overlong.extend(core::iter::repeat(0x80).take(10));
+    overlong.extend_from_slice(&[0x01, 0x08, 0x2A]);
+    v.push(("overlong value varint", overlong));
+    // A header varint wider than 64 bits.
+    v.push(("overlong header varint", vec![0x80; 12]));
+    // A sequence-end marker with no open sequence, then a whole unsigned field.
+    v.push(("dangling sequence end", vec![0x00, 0x2A, 0x07, 0x08, 0x2A]));
+    // An array count above ARRAY_MAX, then a whole unsigned field.
+    let mut over_count = vec![0x03];
+    push_varint(&mut over_count, i32::MAX as u64 + 1);
+    over_count.extend_from_slice(&[0x08, 0x2A]);
+    v.push(("count above ARRAY_MAX", over_count));
+
+    v
+}
+
+/// Once a `feed` has answered `InvalidMsg`, the same `IStream` keeps answering
+/// `InvalidMsg` — for a complete valid message, for an empty probe chunk and for
+/// a truncated prefix alike. `reset()` is the documented reuse hook and is the
+/// only thing that brings the decoder back.
+#[test]
+fn invalid_is_terminal_and_only_reset_clears_it() {
+    for (name, bytes) in malformed_with_valid_tail() {
+        let mut rec = Recorder::new();
+        let mut is = IStream::new();
+        assert_eq!(
+            is.feed(&bytes, &mut rec),
+            Err(Error::InvalidMsg),
+            "[{name}] not rejected in the first place"
+        );
+
+        // A complete, perfectly valid message afterwards changes nothing.
+        assert_eq!(
+            is.feed(&[0x08, 0x2A], &mut rec),
+            Err(Error::InvalidMsg),
+            "[{name}] resynchronized on a valid message"
+        );
+        // Neither does the empty end-of-input probe …
+        assert_eq!(
+            is.feed(&[], &mut rec),
+            Err(Error::InvalidMsg),
+            "[{name}] empty probe escaped the rejection"
+        );
+        // … nor a truncated prefix, which must not degrade to Incomplete.
+        assert_eq!(
+            is.feed(&[0x08], &mut rec),
+            Err(Error::InvalidMsg),
+            "[{name}] degraded to Incomplete"
+        );
+
+        // `reset()` is the reuse hook: after it the decoder is new again.
+        is.reset();
+        let mut fresh = Recorder::new();
+        assert_eq!(
+            is.feed(&[0x08, 0x2A], &mut fresh),
+            Ok(()),
+            "[{name}] reset did not restore the decoder"
+        );
+        assert_eq!(fresh.events, [Event::Unsigned(1, 42)]);
+    }
+}
+
+/// A rejection latched mid-way through a construct must survive the states that
+/// carry bytes across the boundary — a non-empty carry and an open sequence —
+/// neither of which may be "recovered" by later bytes.
+#[test]
+fn invalid_survives_a_pending_carry_and_an_open_sequence() {
+    // Open sequence (depth 1), then a malformed fixlen word, then a
+    // sequence-end that would balance the depth the decoder still holds.
+    let mut rec = Recorder::new();
+    let mut is = IStream::new();
+    assert_eq!(is.feed(&[0x0E], &mut rec), Err(Error::Incomplete));
+    assert_eq!(is.feed(&[0x0A, 0x59], &mut rec), Err(Error::InvalidMsg));
+    assert_eq!(is.feed(&[0x07], &mut rec), Err(Error::InvalidMsg));
+
+    // A header carried over the boundary, then bytes that make the *carried*
+    // field malformed, then a whole valid field.
+    let mut rec = Recorder::new();
+    let mut is = IStream::new();
+    assert_eq!(is.feed(&[0x02], &mut rec), Err(Error::Incomplete));
+    assert_eq!(
+        is.feed(&[(4 << 3) | 0x04], &mut rec),
+        Err(Error::InvalidMsg)
+    );
+    assert_eq!(is.feed(&[0x08, 0x01], &mut rec), Err(Error::InvalidMsg));
+}
+
+/// §7.2 item 4: the verdict is a property of the bytes, not of how they were
+/// cut. For every malformed input, the status of the *last* `feed` of a chunked
+/// run equals the one-shot status, at every chunk size — which only holds if the
+/// rejection sticks.
+#[test]
+fn the_chunked_verdict_matches_the_one_shot_verdict_at_every_chunk_size() {
+    fn final_status(msg: &[u8], size: usize) -> Result<(), Error> {
+        let mut rec = Recorder::new();
+        let mut is = IStream::new();
+        let mut last = Ok(());
+        for chunk in msg.chunks(size) {
+            last = is.feed(chunk, &mut rec);
+        }
+        last
+    }
+
+    for (name, bytes) in malformed_with_valid_tail() {
+        let one_shot = IStream::new().feed(&bytes, &mut Recorder::new());
+        assert_eq!(one_shot, Err(Error::InvalidMsg), "[{name}] one-shot");
+        for size in 1..=bytes.len() {
+            assert_eq!(
+                final_status(&bytes, size),
+                one_shot,
+                "[{name}] chunk size {size} disagrees with the one-shot verdict"
+            );
+        }
+    }
+}
