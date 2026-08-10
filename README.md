@@ -158,6 +158,18 @@ let used = {
 let message = &buf[..used];
 ```
 
+#### Scalar arrays: the slice you pass is the value
+
+`write_array_unsigned` / `write_array_signed` / `write_array_fp32` / `write_array_fp64`
+write **every element of the slice**, gap-free, behind one count prefix. That count is
+the array's **length** (MESSAGE_SPEC §3) — a schema `count: N` is a *capacity*, never
+appears on the wire, and nothing is filled up to it. Trailing default elements are
+therefore ordinary elements: `[1, 2, 0, 0]` encodes as `03 04 01 02 00 00` and
+`[1, 2]` as `03 02 01 02`; they are **different values**, not two spellings of one, so
+dropping a trailing zero on the way in loses data. The crate ships no helper that
+shortens a slice for the encoder, and passing a shortened slice is the caller
+declaring a shorter array.
+
 ### Serialize stream
 
 Attach a `Flush` sink with `OStream::with_flush`. When the scratch buffer fills, it
