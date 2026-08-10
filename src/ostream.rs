@@ -125,6 +125,21 @@ impl Flush for NoFlush {
     fn flush(&mut self, _data: &[u8]) {}
 }
 
+/// Whether the start offset names a position **in** the buffer, which every
+/// installation requires — with a sink or without one. `offset == len` is in
+/// range: that is a buffer of capacity zero, which a sinkless stream may hold
+/// (the first write reports [`Error::BufferFull`]). Past the end it names no
+/// installation at all, and §5.1's minimum — waived without a sink — has nothing
+/// to say about it either way.
+#[inline]
+fn check_offset_in_range(len: usize, offset: usize) -> Result<()> {
+    if offset <= len {
+        Ok(())
+    } else {
+        Err(Error::Argument)
+    }
+}
+
 /// Whether a buffer may be installed **with a sink**: its capacity must reach
 /// [`MIN_OUTPUT_BUFFER`] (CORELIB_PLAN §5.1). `checked_sub` folds the
 /// out-of-range-offset case in — an offset past the end has no capacity at all.
@@ -276,10 +291,44 @@ impl<'a> OStream<'a, NoFlush> {
 
     /// Like [`OStream::new`] but begin writing at `offset` bytes into the
     /// buffer, reserving space for a lower-layer protocol header.
+    ///
+    /// # Panics
+    ///
+    /// If `offset` is past the end of `buffer`. No sink is attached, so
+    /// [`MIN_OUTPUT_BUFFER`] does not bind here (§5.1) — but the waiver is of the
+    /// *minimum*, not of the offset's range: an offset outside the buffer names
+    /// no installation, and accepting it would hand back a stream whose
+    /// [`bytes_used`] already points past the caller's own memory. `offset ==
+    /// buffer.len()` is in range: a capacity of zero, where the first write
+    /// reports [`Error::BufferFull`].
+    ///
+    /// The buffer and its offset come from the calling code, never from decoded
+    /// input, so this is a precondition in the same class as an out-of-range
+    /// slice index — the mechanism [`OStream::with_flush`] uses for its own, and
+    /// the one §5.1 has in mind ("an exception, or an error status"). Use
+    /// [`OStream::try_with_offset`] for the error-status form when the offset is
+    /// computed rather than known.
+    ///
+    /// [`bytes_used`]: OStream::bytes_used
     #[inline]
     pub fn with_offset(buffer: &'a mut [u8], offset: usize) -> Self {
+        match Self::try_with_offset(buffer, offset) {
+            Ok(os) => os,
+            Err(_) => panic!("start offset out of range for the output buffer"),
+        }
+    }
+
+    /// [`OStream::with_offset`], reporting the range precondition as an error
+    /// status instead of a panic.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Argument`] if `offset > buffer.len()`.
+    #[inline]
+    pub fn try_with_offset(buffer: &'a mut [u8], offset: usize) -> Result<Self> {
+        check_offset_in_range(buffer.len(), offset)?;
         let end = buffer.len();
-        OStream {
+        Ok(OStream {
             buffer,
             end,
             offset,
@@ -287,7 +336,7 @@ impl<'a> OStream<'a, NoFlush> {
             pending: PendingRun::default(), // heap-free until nesting spills
             flush: None,
             dead: false,
-        }
+        })
     }
 }
 
@@ -408,11 +457,15 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     ///
     /// # Errors
     ///
-    /// On a stream **with** a sink, [`Error::Argument`] if the new buffer's
-    /// capacity (`buffer.len() - offset`) is below [`MIN_OUTPUT_BUFFER`]. It is
-    /// judged before anything is drained, so a refused installation leaves the
-    /// stream exactly as it was. A stream without a sink is subject to no
-    /// minimum and this never fails.
+    /// [`Error::Argument`] if `offset` is past the end of `buffer` — with a sink
+    /// or without one, since that offset names no installation at all (see
+    /// [`OStream::with_offset`]).
+    ///
+    /// On a stream **with** a sink, also [`Error::Argument`] if the new buffer's
+    /// capacity (`buffer.len() - offset`) is below [`MIN_OUTPUT_BUFFER`]. A
+    /// stream without a sink is subject to no minimum, so an in-range offset
+    /// never fails there. Either way it is judged before anything is drained, so
+    /// a refused installation leaves the stream exactly as it was.
     ///
     /// Also [`Error::Argument`] on a stream a refused replacement already killed:
     /// that stream is missing the write it died on, so there is nothing to resume
@@ -422,6 +475,9 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
         if self.dead {
             return Err(Error::Argument);
         }
+        // The offset must name a position in the buffer whether or not a sink is
+        // attached; only the *minimum* below is waived without one (§5.1).
+        check_offset_in_range(buffer.len(), offset)?;
         if self.flush.is_some() {
             check_streaming_capacity(buffer.len(), offset)?;
             if self.offset > 0 {

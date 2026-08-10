@@ -489,6 +489,14 @@ the buffers on both sides.
   because the encoder splits every atomic unit — header, `fixlen_word`, count,
   scalar, float — across a flush at any byte boundary, so nothing needs to land
   contiguously.
+- **The start offset is in range on every path.** What the sinkless case waives is
+  the *minimum*, not the offset: `offset > buffer.len()` names no installation at
+  all and is refused wherever a buffer is installed, sink or no sink —
+  `with_offset` **panics** (the `try_with_offset` / `buffer_set` /
+  `try_with_flush` status form is `Error::Argument`, and `with_flush` panics).
+  `offset == buffer.len()` is in range: a capacity of zero, where the first write
+  reports `BufferFull`. Like the minimum, a refused `buffer_set` is judged before
+  anything is drained and leaves the stream exactly as it was.
 - **No pass-through.** A sink is only ever handed the output buffer; a `string` or
   `blob` payload is copied through it rather than passed to the sink directly. Your
   sink never receives memory it did not get from you.
