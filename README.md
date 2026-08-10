@@ -326,7 +326,16 @@ ends mid-field (feed more — this is not an error), and `Err(Error::InvalidMsg)
 for malformed bytes. There is no separate finalize step; the caller owns
 end-of-input, so a truncated tail is `Incomplete`, never promoted to a rejection.
 To probe whether the stream ended cleanly, feed an empty chunk: `feed(&[], …)`
-returns `Ok(())` iff the last byte landed on a field boundary:
+returns `Ok(())` iff the last byte landed on a field boundary.
+
+`Err(Error::InvalidMsg)` is **terminal for that `IStream`** (§5.2: "can more
+bytes change it? — no"). The decoder latches the rejection, so every later `feed`
+answers `InvalidMsg` again instead of resynchronizing on the bytes that follow
+the malformed construct — that is what keeps the verdict a property of the bytes
+rather than of where your chunk boundaries happened to fall. `IStream::reset()`
+clears the latch (along with the carry and the sequence depth) so the decoder can
+be reused for the next message; `Incomplete` never latches — it is not an error,
+just "feed more":
 
 ```rust
 use sofab::{Error, IStream, Visitor};

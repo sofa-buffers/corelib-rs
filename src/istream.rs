@@ -239,6 +239,11 @@ pub struct IStream {
     resume: Resume,
     /// Nested sequence depth, for balanced start/end validation.
     depth: u32,
+    /// Latched `INVALID` verdict. §5.2 marks that outcome **terminal**: once the
+    /// consumed bytes are malformed no continuation can make them well-formed,
+    /// so every later [`IStream::feed`] repeats the rejection instead of parsing
+    /// a fresh field out of the following bytes. [`IStream::reset`] clears it.
+    invalid: bool,
 }
 
 impl Default for IStream {
@@ -254,15 +259,20 @@ impl IStream {
             carry: Vec::new(),
             resume: Resume::None,
             depth: 0,
+            invalid: false,
         }
     }
 
     /// Reset to the initial state so the decoder can be reused for a new message
     /// without reallocating its carry buffer.
+    ///
+    /// This is also the only way out of a latched `INVALID` verdict: a decoder
+    /// that has rejected its input stays rejecting until it is reset (§5.2).
     pub fn reset(&mut self) {
         self.carry.clear();
         self.resume = Resume::None;
         self.depth = 0;
+        self.invalid = false;
     }
 
     /// Feed a chunk of encoded bytes, pushing decoded fields to `visitor`.
@@ -281,10 +291,23 @@ impl IStream {
     ///
     /// The distinction matters: a truncated tail returns `Incomplete`, never
     /// `InvalidMsg`. The caller — not the decoder — owns end-of-input.
+    ///
+    /// `InvalidMsg` is **terminal for this decoder** (§5.2, "can more bytes
+    /// change it? — no"). Once a `feed` has reported it, every further `feed`
+    /// reports it again — a complete valid message, an empty end-of-input probe
+    /// and a truncated prefix alike — rather than resynchronizing on the bytes
+    /// that follow the malformed construct. Without that latch the verdict would
+    /// depend on where the chunk boundaries fell, which §7.2 forbids: the same
+    /// bytes must decode to the same outcome fed whole or one byte at a time.
+    /// [`reset`](Self::reset) clears the latch and readies the decoder for a new
+    /// message.
     pub fn feed<V: Visitor>(&mut self, chunk: &[u8], visitor: &mut V) -> Result<()> {
+        if self.invalid {
+            return Err(Error::InvalidMsg);
+        }
         if self.carry.is_empty() {
             // Fast path: parse straight from the caller's slice, no copy.
-            let consumed = self.parse(chunk, visitor)?;
+            let consumed = self.parse(chunk, visitor).map_err(|e| self.latch(e))?;
             if consumed < chunk.len() {
                 self.carry.extend_from_slice(&chunk[consumed..]);
             }
@@ -292,7 +315,9 @@ impl IStream {
             // A small item straddled the previous boundary: stitch it together.
             let mut buf = core::mem::take(&mut self.carry);
             buf.extend_from_slice(chunk);
-            let consumed = self.parse(&buf, visitor)?;
+            // On the error path the carry stays taken: the verdict is terminal,
+            // so there is nothing left to stitch the next chunk onto.
+            let consumed = self.parse(&buf, visitor).map_err(|e| self.latch(e))?;
             buf.drain(..consumed);
             self.carry = buf;
         }
@@ -303,6 +328,21 @@ impl IStream {
             // from both COMPLETE (Ok) and INVALID (InvalidMsg). Not a rejection.
             Err(Error::Incomplete)
         }
+    }
+
+    /// Record a terminal verdict and hand the error straight back.
+    ///
+    /// Only `InvalidMsg` latches: it is the one outcome §5.2 calls terminal.
+    /// `Incomplete` is not an error on this path (it is derived from
+    /// `at_boundary` after a successful parse), and a receiver-side
+    /// `LimitExceeded` is policy rather than malformation, so neither may
+    /// poison a decoder here.
+    #[cold]
+    fn latch(&mut self, e: Error) -> Error {
+        if e == Error::InvalidMsg {
+            self.invalid = true;
+        }
+        e
     }
 
     /// True when the decoder sits at a clean message boundary: no half-read
