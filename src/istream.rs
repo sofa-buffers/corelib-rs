@@ -414,7 +414,11 @@ impl IStream {
                         Err(Error::Incomplete) => return Ok(field_start),
                         Err(e) => return Err(e),
                     };
-                    if (word >> 3) as u64 > ARRAY_MAX {
+                    // A scalar fixlen field's declared length is bounded by
+                    // `FIXLEN_MAX` (§4.6, §6.2) — the fixlen ceiling, not the
+                    // array one: §6.2 lists the two as independently settable,
+                    // and a count word is what `ARRAY_MAX` bounds (§4.7/§4.8).
+                    if (word >> 3) as u64 > FIXLEN_MAX {
                         return Err(Error::InvalidMsg);
                     }
                     let len = (word >> 3) as usize;
@@ -819,4 +823,85 @@ pub fn decode<V: Visitor>(buf: &[u8], visitor: &mut V) -> Result<()> {
     // single feed of the whole buffer is the complete verdict — no separate
     // finish step (which would only re-report the same state).
     IStream::new().feed(buf, visitor)
+}
+
+// Which §6.2 ceiling bounds which wire word is a choice the integration tests
+// cannot see: `FIXLEN_MAX` and `ARRAY_MAX` are crate-internal, and this build
+// sets both to `i32::MAX`, so a test written over literals passes either way.
+// These unit tests state the bound in terms of the constant itself, so that the
+// pairing survives a profile that takes §6.2's allowance to set the two ceilings
+// differently (`FIXLEN_MAX` = 65,535 with an unchanged `ARRAY_MAX`, say).
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    struct Sink;
+    impl Visitor for Sink {}
+
+    fn push_varint(out: &mut Vec<u8>, mut value: Unsigned) {
+        loop {
+            let mut b = (value as u8) & 0x7F;
+            value >>= 7;
+            if value != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    /// A field header (id 0) for the given wire type, followed by `word`.
+    fn field(wire: u8, word: Unsigned) -> Vec<u8> {
+        let mut bytes = vec![wire];
+        push_varint(&mut bytes, word);
+        bytes
+    }
+
+    /// §4.6 bounds a **scalar fixlen** field's declared length, and §6.2 names
+    /// that ceiling `FIXLEN_MAX` — not `ARRAY_MAX`, which bounds an element
+    /// *count* (§4.7/§4.8) and is separately settable.
+    #[test]
+    fn scalar_fixlen_length_is_bounded_by_fixlen_max() {
+        for subtype in [FX_STR, FX_BLOB] {
+            // One past `FIXLEN_MAX`: INVALID, and rejected on the length word
+            // itself — before a single payload byte is read or reserved. Only
+            // the variable-width subtypes discriminate: a float length is
+            // additionally pinned to exactly 4 / 8 bytes.
+            let bytes = field(T_FIXLEN, ((FIXLEN_MAX + 1) << 3) | subtype as Unsigned);
+            assert_eq!(
+                IStream::new().feed(&bytes, &mut Sink),
+                Err(Error::InvalidMsg),
+                "fixlen subtype {subtype} above FIXLEN_MAX must be INVALID"
+            );
+        }
+
+        // `FIXLEN_MAX` itself is a legal length: the message is merely short of
+        // its payload, which is INCOMPLETE, not malformed — and reaching that
+        // verdict allocates nothing on the declared length.
+        for subtype in [FX_STR, FX_BLOB] {
+            let mut bytes = field(T_FIXLEN, (FIXLEN_MAX << 3) | subtype as Unsigned);
+            bytes.extend_from_slice(b"hi");
+            assert_eq!(
+                IStream::new().feed(&bytes, &mut Sink),
+                Err(Error::Incomplete),
+                "fixlen subtype {subtype} at FIXLEN_MAX must stay decodable"
+            );
+        }
+    }
+
+    /// The array wire types bound their **element count** against `ARRAY_MAX`,
+    /// the twin of the assertion above.
+    #[test]
+    fn array_element_count_is_bounded_by_array_max() {
+        for wire in [T_VARINTARRAY_UNSIGNED, T_VARINTARRAY_SIGNED, T_FIXLENARRAY] {
+            let bytes = field(wire, ARRAY_MAX + 1);
+            assert_eq!(
+                IStream::new().feed(&bytes, &mut Sink),
+                Err(Error::InvalidMsg),
+                "wire type {wire} count above ARRAY_MAX must be INVALID"
+            );
+        }
+    }
 }

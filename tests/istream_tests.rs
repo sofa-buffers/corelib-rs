@@ -372,15 +372,29 @@ fn oversized_count_or_length_is_invalid() {
     let mut is = IStream::new();
     assert_eq!(is.feed(&bytes, &mut rec), Err(Error::InvalidMsg));
 
-    // A FIXLEN string (wire tag 2) whose declared length exceeds ARRAY_MAX:
-    // fixlen word = (len << 3) | Str(0x2), len = i32::MAX + 1. Rejected by the
-    // `(word >> 3) > ARRAY_MAX` guard, again distinct from Incomplete.
+    // A FIXLEN string (wire tag 2) whose declared length exceeds FIXLEN_MAX —
+    // the *fixlen* ceiling of §6.2, which §4.6 puts on a fixlen field's length
+    // and which a profile may set independently of ARRAY_MAX (both are i32::MAX
+    // here). Fixlen word = (len << 3) | Str(0x2), len = i32::MAX + 1. Rejected
+    // by the `(word >> 3) > FIXLEN_MAX` guard, again distinct from Incomplete.
+    // The constant behind the guard is pinned by the crate-internal unit test
+    // `istream::ceiling_tests` — from out here the two ceilings are one number.
     let mut bytes2 = vec![0x02];
     let word = ((i32::MAX as u64 + 1) << 3) | 0x02; // Str subtype, oversized len
     push_varint(&mut bytes2, word);
     let mut rec2 = Recorder::new();
     let mut is2 = IStream::new();
     assert_eq!(is2.feed(&bytes2, &mut rec2), Err(Error::InvalidMsg));
+
+    // The ceiling itself is a legal length: a string declaring i32::MAX bytes
+    // and carrying two is short of its payload — Incomplete, not malformed —
+    // and nothing is allocated on the strength of the declared length.
+    let mut bytes3 = vec![0x02];
+    push_varint(&mut bytes3, ((i32::MAX as u64) << 3) | 0x02);
+    bytes3.extend_from_slice(b"hi");
+    let mut rec3 = Recorder::new();
+    let mut is3 = IStream::new();
+    assert_eq!(is3.feed(&bytes3, &mut rec3), Err(Error::Incomplete));
 }
 
 // --- F-0042: the fixlen array's element subtype must reach the visitor -------
