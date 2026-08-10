@@ -669,23 +669,22 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
         }
     }
 
-    /// Write a field header: the `(id << 3) | wire_type` tag as a varint.
-    /// Returns [`Error::Argument`] for an `id` above [`ID_MAX`].
+    /// Write the sequence-end marker: the header `(0 << 3) | T_SEQUENCE_END`,
+    /// which is the single byte `0x07`.
     ///
-    /// This is the single choke point every field write passes through, so it is
-    /// also where a held-back sequence run is committed: the field about to be
-    /// written is content, which means every enclosing sequence is non-default and
-    /// must be framed after all.
+    /// The marker carries **no id** — a sequence end is matched positionally
+    /// against the innermost open sequence start, so there is no id to encode
+    /// (CORELIB_PLAN §4.9) and nothing to bound against [`ID_MAX`]. Nor does it
+    /// commit the held-back run: an end marker is framing, not content, and by
+    /// the time one is written the run is already resolved — dropped by
+    /// [`OStream::write_sequence_end`], committed by
+    /// [`OStream::write_sequence_end_keep`] before the call. The two writers that
+    /// do carry the id bound and the hold-back commit are
+    /// [`OStream::write_field_varint`] and [`OStream::write_fixlen_fixed`], the
+    /// choke points every *content* write passes through.
     #[inline]
-    fn write_id_type(&mut self, id: Id, wire_type: u8) -> Result<()> {
-        if id > ID_MAX {
-            return Err(Error::Argument);
-        }
-        let is_content = wire_type != T_SEQUENCE_START && wire_type != T_SEQUENCE_END;
-        if is_content && !self.pending.is_empty() {
-            self.commit_pending()?;
-        }
-        self.write_varint(((id as Unsigned) << 3) | wire_type as Unsigned)
+    fn write_sequence_end_marker(&mut self) -> Result<()> {
+        self.write_varint(T_SEQUENCE_END as Unsigned)
     }
 
     /// Write out the held-back sequence headers, outermost first.
@@ -734,12 +733,14 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// compare, store `offset`. Reserving both up front leaves the field as two
     /// register-to-memory encodings and one cursor update.
     ///
-    /// This is a second choke point for field writes, so it carries
-    /// [`OStream::write_id_type`]'s obligation too: writing a field is content,
-    /// which proves every enclosing held-back sequence non-default. Only content
-    /// wire types reach here — the sequence markers keep going through
-    /// `write_id_type` — so the commit is unconditional rather than
-    /// type-dependent.
+    /// This is the choke point every scalar and array write passes through, so it
+    /// is where both per-field obligations live: the id bound, and committing the
+    /// held-back sequence run — writing a field is content, which proves every
+    /// enclosing held-back sequence non-default. Only content wire types reach
+    /// here — the debug assertion in the body pins that — so the commit is
+    /// unconditional rather than type-dependent.
+    /// [`OStream::write_fixlen_fixed`] is the one other content writer and
+    /// carries the same pair.
     #[inline]
     fn write_field_varint(&mut self, id: Id, wire_type: u8, value: Unsigned) -> Result<()> {
         debug_assert!(wire_type != T_SEQUENCE_START && wire_type != T_SEQUENCE_END);
@@ -838,11 +839,10 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// check. Same bytes as [`OStream::write_fixlen`], minus the length check an
     /// `N`-byte payload cannot fail.
     ///
-    /// Like [`OStream::write_field_varint`], this bypasses
-    /// [`OStream::write_id_type`] and so carries its held-back-sequence
-    /// obligation directly: a float field is content, and a struct whose first
-    /// member is a float is exactly the case that proves the enclosing sequence
-    /// non-default.
+    /// Like [`OStream::write_field_varint`] — the other content choke point —
+    /// this carries the id bound and the held-back-sequence commit directly: a
+    /// float field is content, and a struct whose first member is a float is
+    /// exactly the case that proves the enclosing sequence non-default.
     #[inline]
     fn write_fixlen_fixed<const N: usize>(
         &mut self,
@@ -1117,7 +1117,7 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
             self.depth -= 1;
             return Ok(());
         }
-        self.write_id_type(0, T_SEQUENCE_END)?;
+        self.write_sequence_end_marker()?;
         self.depth -= 1;
         Ok(())
     }
@@ -1155,7 +1155,7 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
         if !self.pending.is_empty() {
             self.commit_pending()?;
         }
-        self.write_id_type(0, T_SEQUENCE_END)?;
+        self.write_sequence_end_marker()?;
         self.depth -= 1;
         Ok(())
     }
