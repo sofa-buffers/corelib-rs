@@ -260,6 +260,10 @@ pub struct OStream<'a, F: FlushTake<'a> = NoFlush> {
     pending: PendingRun,
     /// `None` means "no sink": a full buffer is an error rather than a flush.
     flush: Option<F>,
+    /// Set when a handover left the stream with no buffer it may write into: the
+    /// sink took ours and returned a replacement below [`MIN_OUTPUT_BUFFER`]. The
+    /// stream is dead from there on — see [`OStream::hand_over`].
+    dead: bool,
 }
 
 impl<'a> OStream<'a, NoFlush> {
@@ -282,6 +286,7 @@ impl<'a> OStream<'a, NoFlush> {
             depth: 0,
             pending: PendingRun::default(), // heap-free until nesting spills
             flush: None,
+            dead: false,
         }
     }
 }
@@ -337,6 +342,7 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
             depth: 0,
             pending: PendingRun::default(), // heap-free until nesting spills
             flush: Some(sink),
+            dead: false,
         })
     }
 
@@ -351,10 +357,15 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     ///
     /// # Errors
     ///
-    /// [`Error::Argument`] if the sink took the buffer and installed a
-    /// replacement whose capacity is below [`MIN_OUTPUT_BUFFER`]. The bytes
-    /// reached the sink either way; what failed is the next installation.
+    /// [`Error::Argument`] if the sink took the buffer and returned a replacement
+    /// whose capacity is below [`MIN_OUTPUT_BUFFER`]. The bytes reached the sink
+    /// either way; what failed is the next installation — and it kills the
+    /// stream, so every later call reports the same error rather than a silent
+    /// `Ok(0)` tail (see [`OStream::hand_over`]).
     pub fn flush(&mut self) -> Result<usize> {
+        if self.dead {
+            return Err(Error::Argument);
+        }
         let used = self.offset;
         if used > 0 && self.flush.is_some() {
             self.hand_over()?;
@@ -382,7 +393,11 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// buffer-set mid-message is byte-transparent, and no separate `flush()` is
     /// needed before one. The replacement the sink leaves behind at that handover
     /// is superseded by `buffer`, the caller's installation being the later word,
-    /// so its capacity is not judged here.
+    /// so its capacity is not judged here — and a replacement below
+    /// [`MIN_OUTPUT_BUFFER`], which would kill the stream anywhere else
+    /// ([`OStream::hand_over`]), does not kill it here either: nothing was lost,
+    /// nothing was written into the refused buffer, and the buffer that ends up
+    /// installed is the one already judged above.
     ///
     /// On a stream **without** a sink there is nowhere to drain to, so the bytes
     /// stay where they are — in the buffer *you* own and still hold. That is the
@@ -398,15 +413,24 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// judged before anything is drained, so a refused installation leaves the
     /// stream exactly as it was. A stream without a sink is subject to no
     /// minimum and this never fails.
+    ///
+    /// Also [`Error::Argument`] on a stream a refused replacement already killed:
+    /// that stream is missing the write it died on, so there is nothing to resume
+    /// into a new buffer.
     #[inline]
     pub fn buffer_set(&mut self, buffer: &'a mut [u8], offset: usize) -> Result<()> {
+        if self.dead {
+            return Err(Error::Argument);
+        }
         if self.flush.is_some() {
             check_streaming_capacity(buffer.len(), offset)?;
             if self.offset > 0 {
-                // The only failure `hand_over` reports is a replacement below
-                // the minimum, and that replacement is discarded two lines down
-                // in favour of `buffer`; the bytes reached the sink either way.
+                // The only failure `hand_over` reports is a replacement below the
+                // minimum, which it refuses without installing; `buffer` — judged
+                // above — takes its place, so the stream is whole and the death it
+                // marks is undone. The bytes reached the sink either way.
                 let _ = self.hand_over();
+                self.dead = false;
             }
         }
         self.end = buffer.len();
@@ -420,10 +444,24 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     ///
     /// The buffer is moved out with a `mem::take`, because handing a sink
     /// `&'a mut [u8]` is what lets it *keep* the memory; an empty slice stands in
-    /// for the moment in between. Whatever comes back is installed before the
-    /// capacity is judged, so a rejected replacement still cannot be written
-    /// into: below [`MIN_OUTPUT_BUFFER`] means `offset >= end`, which routes the
-    /// next write back through here rather than into the buffer.
+    /// for the moment in between.
+    ///
+    /// The replacement is judged **before** it is installed, and a refused one is
+    /// never installed at all: the stream drops it on the floor and marks itself
+    /// `dead`. §5.1 refuses such a buffer "where it is handed over", and installing
+    /// it anyway would leave the encoder with only one place to go — back here, at
+    /// the next write, handing the sink `offset` bytes of a buffer nothing ever
+    /// wrote into, and then carrying on as if the refused write had happened
+    /// ("partial output as if it were complete", §5.1's MUST NOT list).
+    ///
+    /// Dead means the sink is never called again and every later call that would
+    /// put a byte on the wire — any write, [`OStream::flush`],
+    /// [`OStream::buffer_set`] — reports [`Error::Argument`]. The stream has a hole
+    /// in it where the refused write belongs, so there is nothing to resume:
+    /// encode the message again over a buffer that is big enough. (A held-back
+    /// sequence that emits nothing, opened lazily and closed empty, still answers
+    /// `Ok`; it writes no bytes, and the `flush` that would complete the message
+    /// does not.)
     fn hand_over(&mut self) -> Result<()> {
         let used = self.offset;
         let buffer = core::mem::take(&mut self.buffer);
@@ -432,10 +470,20 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
             .as_mut()
             .expect("hand_over is only reached with a sink installed");
         let (buffer, offset) = sink.flush_take(buffer, used);
+        if check_streaming_capacity(buffer.len(), offset).is_err() {
+            // `buffer` is dropped here, unwritten and unread — the sink keeps the
+            // memory it handed us, and none of it becomes output. The empty slice
+            // left behind by the `mem::take` above stays active: `offset == end`
+            // routes every write to `drain_full`, which the flag stops there.
+            self.end = 0;
+            self.offset = 0;
+            self.dead = true;
+            return Err(Error::Argument);
+        }
         self.end = buffer.len();
         self.buffer = buffer;
         self.offset = offset;
-        check_streaming_capacity(self.end, offset)
+        Ok(())
     }
 
     // --- primitives ---------------------------------------------------------
@@ -456,6 +504,10 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     #[cold]
     #[inline(never)]
     fn drain_full(&mut self) -> Result<()> {
+        if self.dead {
+            // A refused replacement: the sink is not called again (`hand_over`).
+            return Err(Error::Argument);
+        }
         if self.flush.is_none() {
             return Err(Error::BufferFull);
         }

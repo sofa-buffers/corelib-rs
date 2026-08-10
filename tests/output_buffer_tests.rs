@@ -389,6 +389,192 @@ fn a_copying_sink_that_returns_its_buffer_matches_one_shot() {
     assert_eq!(collected, reference);
 }
 
+/// A sink that hands back a replacement whose capacity is below
+/// `MIN_OUTPUT_BUFFER`, pre-filled so anything the encoder emits out of it is
+/// visible. Every buffer it is handed is *taken*: the bytes are copied out and
+/// the storage retained, so the replacement is the only thing the encoder could
+/// write into next.
+struct ShortReplacementSink<'a, 'o> {
+    /// Every unit the sink was handed, in order.
+    units: &'o mut Vec<Vec<u8>>,
+    /// Retained buffers, so the encoder can never be handed one back.
+    kept: Vec<&'a mut [u8]>,
+    /// The undersized replacement, handed out at the first flush.
+    replacement: Option<&'a mut [u8]>,
+    /// Where the replacement starts — `replacement.len() - offset` is below the
+    /// minimum.
+    offset: usize,
+}
+
+impl<'a, 'o> FlushTake<'a> for ShortReplacementSink<'a, 'o> {
+    fn flush_take(&mut self, buffer: &'a mut [u8], used: usize) -> (&'a mut [u8], usize) {
+        self.units.push(buffer[..used].to_vec());
+        self.kept.push(buffer);
+        match self.replacement.take() {
+            Some(short) => (short, self.offset),
+            // The stream must never come back here: the replacement above was
+            // refused, so the handover that returned it is the last one.
+            None => panic!("the sink was called again after its replacement was refused"),
+        }
+    }
+}
+
+/// §5.1: a replacement below `MIN_OUTPUT_BUFFER` is refused **where it is handed
+/// over**, and a corelib "MUST NOT return partial output as if it were complete".
+///
+/// The refusal used to be a bare return value: the rejected buffer was installed
+/// anyway, so the next write routed straight back into a handover that handed the
+/// sink `offset` bytes of a buffer no write had touched — the replacement's own
+/// fill pattern, emitted into the stream — and every write after the rejection
+/// answered `Ok(())` while its field went missing.
+///
+/// So the rejection is terminal: the stream is dead, no later call reports
+/// success, and the sink is never handed the rejected buffer's contents.
+#[test]
+fn a_refused_replacement_kills_the_stream_and_never_reaches_the_sink() {
+    const FILL: u8 = 0xAA;
+    let short = MIN_OUTPUT_BUFFER - 1;
+
+    let mut first = [0u8; 2];
+    let mut replacement = vec![FILL; 4];
+    let offset = replacement.len() - short; // capacity one byte short
+    let mut units: Vec<Vec<u8>> = Vec::new();
+    let (w2, w3, flushed) = {
+        let sink = ShortReplacementSink {
+            units: &mut units,
+            kept: Vec::new(),
+            replacement: Some(&mut replacement[..]),
+            offset,
+        };
+        let mut os = OStream::with_flush(&mut first, 0, sink);
+        os.write_unsigned(1, 42).unwrap(); // fills the 2-byte buffer
+
+        // The write that triggers the handover: the sink takes the buffer and
+        // returns one the encoder must refuse.
+        let w2 = os.write_unsigned(2, 7);
+        // ...and every call after it.
+        let w3 = os.write_unsigned(3, 9);
+        let flushed = os.flush();
+        (w2, w3, flushed)
+    };
+
+    assert_eq!(w2, Err(Error::Argument), "the refusal is reported");
+    assert_eq!(w3, Err(Error::Argument), "and the stream stays refused");
+    assert_eq!(flushed, Err(Error::Argument), "flush too — no silent tail");
+
+    assert_eq!(
+        units,
+        vec![vec![0x08, 0x2A]],
+        "only the bytes the encoder actually wrote reach the sink"
+    );
+    assert!(
+        !units.iter().any(|u| u.contains(&FILL)),
+        "a refused buffer's contents must never reach the sink: {units:?}"
+    );
+    assert_eq!(
+        replacement,
+        vec![FILL; 4],
+        "the refused buffer must not be written into either"
+    );
+}
+
+/// The same refusal reached through an explicit `flush()` rather than a full
+/// buffer: the bytes handed over are the caller's, the replacement is refused,
+/// and the stream is dead from there on.
+#[test]
+fn a_replacement_refused_at_an_explicit_flush_is_terminal_too() {
+    const FILL: u8 = 0xAA;
+    let short = MIN_OUTPUT_BUFFER - 1;
+
+    let mut first = [0u8; 16];
+    let mut replacement = vec![FILL; 4];
+    let offset = replacement.len() - short;
+    let mut units: Vec<Vec<u8>> = Vec::new();
+    let (first_flush, after, second_flush) = {
+        let sink = ShortReplacementSink {
+            units: &mut units,
+            kept: Vec::new(),
+            replacement: Some(&mut replacement[..]),
+            offset,
+        };
+        let mut os = OStream::with_flush(&mut first, 0, sink);
+        os.write_unsigned(1, 42).unwrap();
+        let first_flush = os.flush();
+        let after = os.write_unsigned(2, 7);
+        let second_flush = os.flush();
+        (first_flush, after, second_flush)
+    };
+
+    assert_eq!(first_flush, Err(Error::Argument), "the bytes went out, the");
+    assert_eq!(after, Err(Error::Argument));
+    assert_eq!(second_flush, Err(Error::Argument));
+    assert_eq!(units, vec![vec![0x08, 0x2A]]);
+    assert_eq!(replacement, vec![FILL; 4]);
+}
+
+/// A dead stream stays dead: `buffer_set` cannot revive it either. The write that
+/// hit the refusal never landed, so resuming into a fresh buffer would splice a
+/// message with a hole in it — "partial output as if it were complete". Start a
+/// new `OStream` instead.
+#[test]
+fn a_buffer_set_cannot_revive_a_refused_stream() {
+    let short = MIN_OUTPUT_BUFFER - 1;
+
+    let mut first = [0u8; 2];
+    let mut replacement = [0xAAu8; 4];
+    let offset = replacement.len() - short;
+    let mut fresh = [0u8; 32];
+    let mut units: Vec<Vec<u8>> = Vec::new();
+    {
+        let sink = ShortReplacementSink {
+            units: &mut units,
+            kept: Vec::new(),
+            replacement: Some(&mut replacement[..]),
+            offset,
+        };
+        let mut os = OStream::with_flush(&mut first, 0, sink);
+        os.write_unsigned(1, 42).unwrap();
+        assert_eq!(os.write_unsigned(2, 7), Err(Error::Argument));
+        assert_eq!(os.buffer_set(&mut fresh, 0), Err(Error::Argument));
+        assert_eq!(os.write_unsigned(3, 9), Err(Error::Argument));
+    }
+    assert_eq!(units, vec![vec![0x08, 0x2A]]);
+}
+
+/// The one place a refused replacement is *not* terminal, and the reason it is
+/// not: `buffer_set` supersedes it. The drain it performs hands the sink every
+/// byte written so far, and the buffer the caller installs — judged before
+/// anything is drained — replaces whatever the sink left behind, so the stream
+/// never holds the refused buffer. Nothing is lost and nothing is written into a
+/// refused buffer, so the stream continues (commit 308295b's contract).
+#[test]
+fn a_buffer_set_supersedes_a_replacement_the_sink_returned() {
+    let short = MIN_OUTPUT_BUFFER - 1;
+
+    let mut first = [0u8; 16];
+    let mut replacement = vec![0xAAu8; 4];
+    let offset = replacement.len() - short;
+    let mut mine = [0u8; 16];
+    let mut units: Vec<Vec<u8>> = Vec::new();
+    let used = {
+        let sink = ShortReplacementSink {
+            units: &mut units,
+            kept: Vec::new(),
+            replacement: Some(&mut replacement[..]),
+            offset,
+        };
+        let mut os = OStream::with_flush(&mut first, 0, sink);
+        os.write_unsigned(1, 42).unwrap();
+        os.buffer_set(&mut mine, 0).unwrap(); // drains, then supersedes
+        os.write_unsigned(2, 7).unwrap();
+        os.bytes_used()
+    };
+
+    assert_eq!(units, vec![vec![0x08, 0x2A]], "drained at the buffer-set");
+    assert_eq!(&mine[..used], &[0x10, 0x07], "and the stream carries on");
+    assert_eq!(replacement, vec![0xAAu8; 4]);
+}
+
 /// §7.2 item 4: no foreign memory reaches a sink that was not granted
 /// pass-through. This port implements no pass-through at all, so it holds by
 /// construction — but a blob several times the buffer size is where it would

@@ -454,6 +454,14 @@ the buffers on both sides.
   a shortfall as a precondition violation and **panics**, like an out-of-range slice
   index; `try_with_flush` and `buffer_set` report it as `Error::Argument`, and so
   does a replacement a sink returns.
+  A refused **replacement** additionally **kills the stream**: it is dropped
+  unwritten — the encoder never puts a byte in it, and the sink is never handed its
+  contents back as output — and since the write that hit the refusal never landed,
+  every later write, `flush` and `buffer_set` reports `Error::Argument` rather than
+  resuming into a message with a hole in it. Encode again over a bigger buffer.
+  (The one exception is a `buffer_set` that supersedes the replacement in the same
+  call: it drains through the sink first and then installs the buffer *you* passed
+  — judged before anything was drained — so nothing is lost and the stream lives.)
   It binds **nothing else**: a buffer installed *without* a sink has no minimum,
   because no flush can occur there, so a caller sizing from `MAX_SIZE` keeps it
   exact and a two-byte message still encodes into a two-byte buffer. The value is 1
