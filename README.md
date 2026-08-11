@@ -157,8 +157,8 @@ let mut out = Vec::new();                  // or a socket / file
 {
     let mut os = OStream::with_flush(&mut scratch, 0, |chunk: &[u8]| {
         out.extend_from_slice(chunk);
-    });                                    // panics below MIN_OUTPUT_BUFFER;
-                                           // try_with_flush returns Err instead
+    }).unwrap();                           // Err(Argument) below MIN_OUTPUT_BUFFER,
+                                           // or if the offset is past the end
     for i in 0..1000u32 { os.write_unsigned(i, i as u64).unwrap(); }
     os.flush().unwrap();                   // push the tail
 }
@@ -469,10 +469,12 @@ the buffers on both sides.
   `with_flush`, `buffer_set` on a stream that has one, and a replacement a sink
   returns — which must have `buffer.len() - offset >= 1`; a smaller one is refused
   where it is handed over, never partway through a message. The buffer and its
-  offset come from your code rather than from decoded input, so `with_flush` treats
-  a shortfall as a precondition violation and **panics**, like an out-of-range slice
-  index; `try_with_flush` and `buffer_set` report it as `Error::Argument`, and so
-  does a replacement a sink returns.
+  offset come from your code rather than from decoded input, so a shortfall is a
+  precondition violation — but it is reported as a **status**, not a panic:
+  `with_flush`, `with_offset` and `buffer_set` all return `Error::Argument`, and so
+  does a replacement a sink returns. The status form is what `corelib-rs-no-std`
+  can express (a reachable panic would break its no-`core::panicking` guarantee and
+  hard-fault on bare metal), and the two crates spell the installation identically.
   A refused **replacement** additionally **kills the stream**: it is dropped
   unwritten — the encoder never puts a byte in it, and the sink is never handed its
   contents back as output — and since the write that hit the refusal never landed,
@@ -490,8 +492,8 @@ the buffers on both sides.
 - **The start offset is in range on every path.** What the sinkless case waives is
   the *minimum*, not the offset: `offset > buffer.len()` names no installation at
   all and is refused wherever a buffer is installed, sink or no sink —
-  `with_offset` **panics** (the `try_with_offset` / `buffer_set` /
-  `try_with_flush` status form is `Error::Argument`, and `with_flush` panics).
+  `with_offset`, `with_flush` and `buffer_set` all report `Error::Argument`.
+  Only `new` is infallible, because offset `0` is in range for every buffer.
   `offset == buffer.len()` is in range: a capacity of zero, where the first write
   reports `BufferFull`. Like the minimum, a refused `buffer_set` is judged before
   anything is drained and leaves the stream exactly as it was.

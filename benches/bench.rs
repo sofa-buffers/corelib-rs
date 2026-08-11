@@ -251,7 +251,7 @@ pub fn run_encode_blob_oneshot(blob: &[u8], out: &mut [u8]) -> usize {
 #[inline(never)]
 #[unsafe(no_mangle)]
 pub fn run_encode_blob_streaming(blob: &[u8], scratch: &mut [u8]) -> usize {
-    let mut os = OStream::with_flush(scratch, 0, Discard::default());
+    let mut os = OStream::with_flush(scratch, 0, Discard::default()).unwrap();
     os.write_blob(1, black_box(blob)).unwrap();
     black_box(os.flush().unwrap())
 }
@@ -327,7 +327,8 @@ fn self_check(blob: &[u8], blob_wire: &[u8], comp_wire: &[u8]) {
             flushes += 1;
             flushed += data.len();
             widest = widest.max(data.len());
-        });
+        })
+        .unwrap();
         os.write_blob(1, blob).unwrap();
         os.flush().unwrap();
     }
@@ -592,7 +593,7 @@ fn main() {
         black_box(os.bytes_used());
     });
     let enc_blob_s = measure(bb, || {
-        let mut os = OStream::with_flush(&mut enc_blob_scratch, 0, Discard::default());
+        let mut os = OStream::with_flush(&mut enc_blob_scratch, 0, Discard::default()).unwrap();
         os.write_blob(1, black_box(&blob)).unwrap();
         black_box(os.flush().unwrap());
     });
