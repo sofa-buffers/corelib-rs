@@ -218,7 +218,8 @@ fn chunked_encode(fields: &[Value], buf_size: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut scratch = vec![0u8; buf_size];
     {
-        let mut os = OStream::with_flush(&mut scratch, 0, |c: &[u8]| out.extend_from_slice(c)).unwrap();
+        let mut os =
+            OStream::with_flush(&mut scratch, 0, |c: &[u8]| out.extend_from_slice(c)).unwrap();
         write_fields(&mut os, fields);
         os.flush().unwrap();
     }

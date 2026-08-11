@@ -327,7 +327,8 @@ fn self_check(blob: &[u8], blob_wire: &[u8], comp_wire: &[u8]) {
             flushes += 1;
             flushed += data.len();
             widest = widest.max(data.len());
-        }).unwrap();
+        })
+        .unwrap();
         os.write_blob(1, blob).unwrap();
         os.flush().unwrap();
     }

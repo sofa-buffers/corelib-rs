@@ -278,7 +278,8 @@ fn the_streaming_blob_row_drives_the_flush_handover_it_claims_to_measure() {
             calls += 1;
             bytes += data.len();
             widest = widest.max(data.len());
-        }).unwrap();
+        })
+        .unwrap();
         os.write_blob(1, &blob).unwrap();
         os.flush().unwrap();
     }

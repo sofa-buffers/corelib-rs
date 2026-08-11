@@ -59,7 +59,8 @@ fn encode_at_exactly_min_output_buffer_matches_one_shot() {
     {
         let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
             collected.extend_from_slice(chunk);
-        }).unwrap();
+        })
+        .unwrap();
         script(&mut os);
         os.flush().unwrap();
     }
@@ -78,10 +79,10 @@ const _: () = assert!(MIN_OUTPUT_BUFFER <= 20 && MIN_OUTPUT_BUFFER >= 1);
 /// At `MIN_OUTPUT_BUFFER == 1` that is the zero-capacity buffer, and it is the
 /// case that used to reach `get_unchecked_mut` on an empty slice.
 ///
-/// §5.1 lets a port refuse "by an exception, or an error status". This one offers
-/// both: `try_with_flush` is the status form, tested here, and `with_flush`
-/// panics — the mechanism Rust uses for an out-of-range slice index, tested
-/// below.
+/// §5.1 lets a port refuse "by an exception, or an error status". This port
+/// reports the **status**, from every installation path — `with_flush`,
+/// `with_offset` and `buffer_set` alike — so that the spelling means the same
+/// thing here and in `corelib-rs-no-std`, which cannot panic at all.
 #[test]
 fn a_sink_buffer_below_the_minimum_is_rejected_at_handover() {
     let short = MIN_OUTPUT_BUFFER - 1;
@@ -118,7 +119,8 @@ fn a_sink_buffer_below_the_minimum_is_rejected_at_handover() {
     let mut good = [0u8; 16];
     let mut bad = vec![0u8; short];
     {
-        let mut os = OStream::with_flush(&mut good, 0, |c: &[u8]| sunk.extend_from_slice(c)).unwrap();
+        let mut os =
+            OStream::with_flush(&mut good, 0, |c: &[u8]| sunk.extend_from_slice(c)).unwrap();
         os.write_unsigned(1, 42).unwrap();
         assert_eq!(os.buffer_set(&mut bad, 0), Err(Error::Argument));
         assert_eq!(os.bytes_used(), 2, "a refused install must drain nothing");
@@ -179,7 +181,8 @@ fn a_mid_message_buffer_set_with_a_sink_matches_one_shot() {
         {
             let mut os = OStream::with_flush(&mut a, 0, |chunk: &[u8]| {
                 collected.extend_from_slice(chunk);
-            }).unwrap();
+            })
+            .unwrap();
             script_head(&mut os);
             os.buffer_set(&mut b, offset).unwrap();
             script_tail(&mut os);
@@ -269,7 +272,10 @@ fn with_flush_refuses_a_buffer_below_the_minimum() {
     let r = OStream::with_flush(&mut buf, 0, |c: &[u8]| sunk.extend_from_slice(c));
     assert!(r.is_err(), "a buffer below the minimum must be refused");
     drop(r);
-    assert!(sunk.is_empty(), "a refused installation must not reach the sink");
+    assert!(
+        sunk.is_empty(),
+        "a refused installation must not reach the sink"
+    );
 }
 
 /// And the same refusal when the shortfall comes from the start offset, which is
@@ -281,7 +287,10 @@ fn with_flush_refuses_an_offset_past_the_end() {
     let r = OStream::with_flush(&mut buf, 99, |c: &[u8]| sunk.extend_from_slice(c));
     assert!(r.is_err(), "an offset past the end must be refused");
     drop(r);
-    assert!(sunk.is_empty(), "a refused installation must not reach the sink");
+    assert!(
+        sunk.is_empty(),
+        "a refused installation must not reach the sink"
+    );
 }
 
 /// The converse, and the half that keeps the minimum from leaking onto the
@@ -376,7 +385,10 @@ fn with_offset_refuses_an_offset_past_the_end() {
     );
     // offset == len is in range: a capacity of zero, and bytes_used counts from
     // the buffer's start, so the reserved room is already accounted for.
-    assert_eq!(OStream::with_offset(&mut buf, 4).map(|os| os.bytes_used()), Ok(4));
+    assert_eq!(
+        OStream::with_offset(&mut buf, 4).map(|os| os.bytes_used()),
+        Ok(4)
+    );
 }
 
 /// A sink that **takes** every buffer it is handed: it copies the bytes out,
@@ -455,7 +467,8 @@ fn a_copying_sink_that_returns_its_buffer_matches_one_shot() {
     {
         let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
             collected.extend_from_slice(chunk);
-        }).unwrap();
+        })
+        .unwrap();
         script(&mut os);
         os.flush().unwrap();
     }
@@ -671,7 +684,8 @@ fn no_foreign_memory_reaches_a_sink() {
                 "sink received memory outside the installed buffer"
             );
             seen += 1;
-        }).unwrap();
+        })
+        .unwrap();
         os.write_blob(1, &blob).unwrap();
         os.flush().unwrap();
     }

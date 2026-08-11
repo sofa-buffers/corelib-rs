@@ -199,7 +199,8 @@ impl Unbounded {
         {
             let mut scratch = [0u8; 512];
             let mut os =
-                OStream::with_flush(&mut scratch, 0, |_d: &[u8]| out.extend_from_slice(_d)).unwrap();
+                OStream::with_flush(&mut scratch, 0, |_d: &[u8]| out.extend_from_slice(_d))
+                    .unwrap();
             self.serialize(&mut os);
             os.flush();
         }
@@ -254,7 +255,8 @@ fn the_generated_serialize_streams_through_a_buffer_smaller_than_the_message() {
         let mut scratch = [0u8; 4];
         let mut os = OStream::with_flush(&mut scratch, 0, |chunk: &[u8]| {
             collected.extend_from_slice(chunk)
-        }).unwrap();
+        })
+        .unwrap();
         m.serialize(&mut os);
         os.flush().unwrap();
     }
