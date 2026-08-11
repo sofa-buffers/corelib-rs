@@ -204,7 +204,7 @@ fn i_vec<T: TryFrom<i64>>(vals: &[Value]) -> Vec<T> {
 fn encode_fields(fields: &[Value], offset: usize) -> Vec<u8> {
     let mut buf = vec![0u8; 4096];
     let used = {
-        let mut os = OStream::with_offset(&mut buf, offset);
+        let mut os = OStream::with_offset(&mut buf, offset).unwrap();
         write_fields(&mut os, fields);
         os.bytes_used()
     };
@@ -218,7 +218,7 @@ fn chunked_encode(fields: &[Value], buf_size: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let mut scratch = vec![0u8; buf_size];
     {
-        let mut os = OStream::with_flush(&mut scratch, 0, |c: &[u8]| out.extend_from_slice(c));
+        let mut os = OStream::with_flush(&mut scratch, 0, |c: &[u8]| out.extend_from_slice(c)).unwrap();
         write_fields(&mut os, fields);
         os.flush().unwrap();
     }

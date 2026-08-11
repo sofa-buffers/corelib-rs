@@ -35,8 +35,7 @@ pub(crate) const FIXLEN_MAX: u64 = i32::MAX as u64;
 /// any byte boundary, so no write needs to land contiguously. Nothing above one
 /// byte is ever reserved.
 ///
-/// The constant binds a buffer handed to [`crate::OStream::with_flush`] /
-/// [`crate::OStream::try_with_flush`], to
+/// The constant binds a buffer handed to [`crate::OStream::with_flush`], to
 /// [`crate::OStream::buffer_set`] on a stream that has a sink, and to a
 /// replacement a sink installs from inside its callback. It binds **nothing
 /// else**: a buffer installed *without* a sink is subject to no minimum, because

@@ -360,7 +360,7 @@ fn a_float_array_is_bit_exact_at_every_buffer_size() {
         let mut out32: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; size];
         {
-            let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out32.extend_from_slice(d));
+            let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out32.extend_from_slice(d)).unwrap();
             os.write_array_fp32(0, &a32).unwrap();
             os.flush().unwrap();
         }
@@ -369,7 +369,7 @@ fn a_float_array_is_bit_exact_at_every_buffer_size() {
         let mut out64: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; size];
         {
-            let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out64.extend_from_slice(d));
+            let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out64.extend_from_slice(d)).unwrap();
             os.write_array_fp64(0, &a64).unwrap();
             os.flush().unwrap();
         }
@@ -550,7 +550,7 @@ fn run_committed_across_flush_boundary_matches_one_shot() {
         let mut buf = vec![0u8; size];
         {
             let mut os =
-                sofab::OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d));
+                sofab::OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d)).unwrap();
             script(&mut os);
             os.flush().unwrap();
         }
@@ -580,7 +580,7 @@ fn an_explicit_flush_mid_run_matches_one_shot() {
     let mut out: Vec<u8> = Vec::new();
     let mut buf = [0u8; 64];
     let flushed_at = {
-        let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d));
+        let mut os = OStream::with_flush(&mut buf, 0, |d: &[u8]| out.extend_from_slice(d)).unwrap();
         os.write_unsigned(9, 1).unwrap();
         os.write_sequence_begin_lazy(1).unwrap();
         os.write_sequence_begin_lazy(2).unwrap();
@@ -1274,7 +1274,7 @@ fn flush_sink_streams_large_message() {
     {
         let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
             collected.extend_from_slice(chunk);
-        });
+        }).unwrap();
         for i in 0..10u32 {
             os.write_unsigned(i, i as u64).unwrap();
         }

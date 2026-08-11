@@ -11,7 +11,7 @@ use sofab::{Error, IStream, OStream};
 fn with_offset_reserves_header_space() {
     let mut buf = [0xAAu8; 16];
     let used = {
-        let mut os = OStream::with_offset(&mut buf, 4); // reserve 4 header bytes
+        let mut os = OStream::with_offset(&mut buf, 4).unwrap(); // reserve 4 header bytes
         os.write_unsigned(0, 42).unwrap();
         os.bytes_used()
     };

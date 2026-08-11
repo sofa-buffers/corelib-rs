@@ -28,7 +28,7 @@ use crate::{Id, Signed, Unsigned};
 /// let mut scratch = [0u8; 16];
 /// let mut os = OStream::with_flush(&mut scratch, 0, |chunk: &[u8]| {
 ///     out.extend_from_slice(chunk)
-/// });
+/// }).unwrap();
 /// os.write_unsigned(1, 42).unwrap();
 /// os.flush().unwrap();
 /// ```
@@ -284,48 +284,47 @@ pub struct OStream<'a, F: FlushTake<'a> = NoFlush> {
 impl<'a> OStream<'a, NoFlush> {
     /// Create an encoder over `buffer` with no flush sink. Writing past the end
     /// of the buffer returns [`Error::BufferFull`].
+    ///
+    /// Infallible: the cursor starts at `0`, which is in range for every buffer
+    /// including an empty one, and no sink means no [`MIN_OUTPUT_BUFFER`]
+    /// (§5.1). Use [`OStream::with_offset`] to reserve header room.
     #[inline]
     pub fn new(buffer: &'a mut [u8]) -> Self {
-        Self::with_offset(buffer, 0)
+        let end = buffer.len();
+        OStream {
+            buffer,
+            end,
+            offset: 0,
+            depth: 0,
+            pending: PendingRun::default(), // heap-free until nesting spills
+            flush: None,
+            dead: false,
+        }
     }
 
     /// Like [`OStream::new`] but begin writing at `offset` bytes into the
     /// buffer, reserving space for a lower-layer protocol header.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// If `offset` is past the end of `buffer`. No sink is attached, so
-    /// [`MIN_OUTPUT_BUFFER`] does not bind here (§5.1) — but the waiver is of the
-    /// *minimum*, not of the offset's range: an offset outside the buffer names
-    /// no installation, and accepting it would hand back a stream whose
-    /// [`bytes_used`] already points past the caller's own memory. `offset ==
-    /// buffer.len()` is in range: a capacity of zero, where the first write
-    /// reports [`Error::BufferFull`].
+    /// [`Error::Argument`] if `offset` is past the end of `buffer`. No sink is
+    /// attached, so [`MIN_OUTPUT_BUFFER`] does not bind here (§5.1) — but the
+    /// waiver is of the *minimum*, not of the offset's range: an offset outside
+    /// the buffer names no installation, and accepting it would hand back a
+    /// stream whose [`bytes_used`] already points past the caller's own memory.
+    /// `offset == buffer.len()` is in range: a capacity of zero, where the first
+    /// write reports [`Error::BufferFull`].
     ///
-    /// The buffer and its offset come from the calling code, never from decoded
-    /// input, so this is a precondition in the same class as an out-of-range
-    /// slice index — the mechanism [`OStream::with_flush`] uses for its own, and
-    /// the one §5.1 has in mind ("an exception, or an error status"). Use
-    /// [`OStream::try_with_offset`] for the error-status form when the offset is
-    /// computed rather than known.
+    /// §5.1 allows either "an exception, or an error status" here. This port
+    /// reports the status, because `corelib-rs-no-std` cannot do otherwise — a
+    /// reachable panic would break that crate's no-`core::panicking` guarantee
+    /// and hard-fault on bare metal — and one spelling that means the same thing
+    /// in both ports is worth more than an infallible signature in this one.
+    /// The two crates therefore share this shape exactly.
     ///
     /// [`bytes_used`]: OStream::bytes_used
     #[inline]
-    pub fn with_offset(buffer: &'a mut [u8], offset: usize) -> Self {
-        match Self::try_with_offset(buffer, offset) {
-            Ok(os) => os,
-            Err(_) => panic!("start offset out of range for the output buffer"),
-        }
-    }
-
-    /// [`OStream::with_offset`], reporting the range precondition as an error
-    /// status instead of a panic.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Argument`] if `offset > buffer.len()`.
-    #[inline]
-    pub fn try_with_offset(buffer: &'a mut [u8], offset: usize) -> Result<Self> {
+    pub fn with_offset(buffer: &'a mut [u8], offset: usize) -> Result<Self> {
         check_offset_in_range(buffer.len(), offset)?;
         let end = buffer.len();
         Ok(OStream {
@@ -356,32 +355,24 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// The buffer and its offset come from the calling code, never from decoded
     /// input, so this is a precondition in the same class as an out-of-range
     /// slice index — and §5.1 lets a port refuse by "an exception, or an error
-    /// status". Use [`OStream::try_with_flush`] for the error-status form when
-    /// the size is computed rather than known.
+    /// status".
+    ///
+    /// This port reports the status rather than panicking, so that the spelling
+    /// means the same thing here and in `corelib-rs-no-std`, which has no choice:
+    /// a reachable panic would break that crate's no-`core::panicking` guarantee
+    /// and hard-fault on bare metal. Code written against either crate now
+    /// compiles against both.
     ///
     /// The minimum applies only because a sink is attached. Use
     /// [`OStream::new`] / [`OStream::with_offset`] for a buffer without one:
     /// no flush can occur there, so no minimum binds it.
-    #[inline]
-    pub fn with_flush(buffer: &'a mut [u8], offset: usize, sink: F) -> Self {
-        match Self::try_with_flush(buffer, offset, sink) {
-            Ok(os) => os,
-            Err(_) => panic!(
-                "output buffer capacity below MIN_OUTPUT_BUFFER ({MIN_OUTPUT_BUFFER}) \
-                 for a stream with a flush sink"
-            ),
-        }
-    }
-
-    /// [`OStream::with_flush`], reporting the capacity precondition as an error
-    /// status instead of a panic.
     ///
     /// # Errors
     ///
     /// [`Error::Argument`] if `buffer.len() - offset` is below
     /// [`MIN_OUTPUT_BUFFER`], including the case of an offset past the end.
     #[inline]
-    pub fn try_with_flush(buffer: &'a mut [u8], offset: usize, sink: F) -> Result<Self> {
+    pub fn with_flush(buffer: &'a mut [u8], offset: usize, sink: F) -> Result<Self> {
         check_streaming_capacity(buffer.len(), offset)?;
         let end = buffer.len();
         Ok(OStream {

@@ -69,7 +69,7 @@ fn every_buffer_size_produces_the_one_shot_bytes() {
         {
             let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
                 collected.extend_from_slice(chunk);
-            });
+            }).unwrap();
             write_everything(&mut os);
             os.flush().unwrap();
         }
@@ -131,7 +131,7 @@ fn an_array_larger_than_the_buffer_streams_out_whole() {
         {
             let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
                 collected.extend_from_slice(chunk);
-            });
+            }).unwrap();
             os.write_array_unsigned(7, &src).unwrap();
             os.flush().unwrap();
         }

@@ -59,7 +59,7 @@ fn encode_at_exactly_min_output_buffer_matches_one_shot() {
     {
         let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
             collected.extend_from_slice(chunk);
-        });
+        }).unwrap();
         script(&mut os);
         os.flush().unwrap();
     }
@@ -90,7 +90,7 @@ fn a_sink_buffer_below_the_minimum_is_rejected_at_handover() {
     let mut buf = vec![0u8; short];
     let mut sunk: Vec<u8> = Vec::new();
     assert_eq!(
-        OStream::try_with_flush(&mut buf, 0, |c: &[u8]| sunk.extend_from_slice(c))
+        OStream::with_flush(&mut buf, 0, |c: &[u8]| sunk.extend_from_slice(c))
             .err()
             .map(|e| e == Error::Argument),
         Some(true),
@@ -100,14 +100,14 @@ fn a_sink_buffer_below_the_minimum_is_rejected_at_handover() {
     // The same shortfall produced by the start offset rather than the length.
     let mut buf = vec![0u8; 8];
     assert_eq!(
-        OStream::try_with_flush(&mut buf, 8 - short, |c: &[u8]| sunk.extend_from_slice(c)).err(),
+        OStream::with_flush(&mut buf, 8 - short, |c: &[u8]| sunk.extend_from_slice(c)).err(),
         Some(Error::Argument)
     );
 
     // An offset past the end has no capacity at all — same rejection, same place.
     let mut buf = vec![0u8; 4];
     assert_eq!(
-        OStream::try_with_flush(&mut buf, 99, |c: &[u8]| sunk.extend_from_slice(c)).err(),
+        OStream::with_flush(&mut buf, 99, |c: &[u8]| sunk.extend_from_slice(c)).err(),
         Some(Error::Argument)
     );
 
@@ -118,7 +118,7 @@ fn a_sink_buffer_below_the_minimum_is_rejected_at_handover() {
     let mut good = [0u8; 16];
     let mut bad = vec![0u8; short];
     {
-        let mut os = OStream::with_flush(&mut good, 0, |c: &[u8]| sunk.extend_from_slice(c));
+        let mut os = OStream::with_flush(&mut good, 0, |c: &[u8]| sunk.extend_from_slice(c)).unwrap();
         os.write_unsigned(1, 42).unwrap();
         assert_eq!(os.buffer_set(&mut bad, 0), Err(Error::Argument));
         assert_eq!(os.bytes_used(), 2, "a refused install must drain nothing");
@@ -142,7 +142,7 @@ fn a_buffer_set_with_a_sink_drains_the_pending_bytes_first() {
     let mut b = [0u8; 32];
     let mut out: Vec<u8> = Vec::new();
     {
-        let mut os = OStream::with_flush(&mut a, 0, |c: &[u8]| out.extend_from_slice(c));
+        let mut os = OStream::with_flush(&mut a, 0, |c: &[u8]| out.extend_from_slice(c)).unwrap();
         os.write_unsigned(1, 42).unwrap(); // 08 2A, unflushed in `a`
         os.buffer_set(&mut b, 0).unwrap();
         os.write_unsigned(2, 7).unwrap();
@@ -179,7 +179,7 @@ fn a_mid_message_buffer_set_with_a_sink_matches_one_shot() {
         {
             let mut os = OStream::with_flush(&mut a, 0, |chunk: &[u8]| {
                 collected.extend_from_slice(chunk);
-            });
+            }).unwrap();
             script_head(&mut os);
             os.buffer_set(&mut b, offset).unwrap();
             script_tail(&mut os);
@@ -217,7 +217,7 @@ fn a_buffer_set_hands_the_pending_bytes_to_a_taking_sink() {
             swaps: &mut swaps,
             last: &mut last,
         };
-        let mut os = OStream::with_flush(&mut first, 0, sink);
+        let mut os = OStream::with_flush(&mut first, 0, sink).unwrap();
         os.write_unsigned(1, 42).unwrap();
         os.buffer_set(&mut mine, 1).unwrap();
         os.write_unsigned(2, 7).unwrap();
@@ -257,26 +257,31 @@ fn the_pending_bytes_of_a_sinkless_stream_stay_in_the_callers_buffer() {
     assert_eq!(streamed, [0x08, 0x2A, 0x10, 0x07]);
 }
 
-/// The other refusal mechanism: `with_flush` is infallible in its return type —
-/// that is the shape the generated layer calls (§6.1) — so it refuses an
-/// undersized buffer by panicking, at the handover and before a single byte of
-/// the message exists.
+/// The other refusal mechanism: `with_flush` reports the capacity precondition
+/// as `Error::Argument`, at the handover and before a single byte of the message
+/// exists. A status rather than a panic, so that this crate and
+/// `corelib-rs-no-std` spell the installation identically — that crate cannot
+/// panic at all (no `core::panicking`; on bare metal a panic is a hard fault).
 #[test]
-#[should_panic(expected = "MIN_OUTPUT_BUFFER")]
-fn with_flush_panics_on_a_buffer_below_the_minimum() {
+fn with_flush_refuses_a_buffer_below_the_minimum() {
     let mut buf = vec![0u8; MIN_OUTPUT_BUFFER - 1];
     let mut sunk: Vec<u8> = Vec::new();
-    let _ = OStream::with_flush(&mut buf, 0, |c: &[u8]| sunk.extend_from_slice(c));
+    let r = OStream::with_flush(&mut buf, 0, |c: &[u8]| sunk.extend_from_slice(c));
+    assert!(r.is_err(), "a buffer below the minimum must be refused");
+    drop(r);
+    assert!(sunk.is_empty(), "a refused installation must not reach the sink");
 }
 
 /// And the same refusal when the shortfall comes from the start offset, which is
 /// where an out-of-range offset lands too.
 #[test]
-#[should_panic(expected = "MIN_OUTPUT_BUFFER")]
-fn with_flush_panics_on_an_offset_past_the_end() {
+fn with_flush_refuses_an_offset_past_the_end() {
     let mut buf = vec![0u8; 4];
     let mut sunk: Vec<u8> = Vec::new();
-    let _ = OStream::with_flush(&mut buf, 99, |c: &[u8]| sunk.extend_from_slice(c));
+    let r = OStream::with_flush(&mut buf, 99, |c: &[u8]| sunk.extend_from_slice(c));
+    assert!(r.is_err(), "an offset past the end must be refused");
+    drop(r);
+    assert!(sunk.is_empty(), "a refused installation must not reach the sink");
 }
 
 /// The converse, and the half that keeps the minimum from leaking onto the
@@ -320,14 +325,14 @@ fn a_start_offset_past_the_end_is_refused_without_a_sink() {
     // Construction, error-status form.
     let mut buf = [0u8; 4];
     assert_eq!(
-        OStream::try_with_offset(&mut buf, 5).err(),
+        OStream::with_offset(&mut buf, 5).err(),
         Some(Error::Argument)
     );
 
     // The zero-capacity boundary is accepted: a buffer that holds nothing, not an
     // offset outside the buffer.
     let mut buf = [0u8; 4];
-    let mut os = OStream::try_with_offset(&mut buf, 4).expect("offset == len is in range");
+    let mut os = OStream::with_offset(&mut buf, 4).expect("offset == len is in range");
     assert_eq!(os.bytes_used(), 4);
     assert_eq!(os.write_unsigned(1, 42), Err(Error::BufferFull));
 
@@ -359,15 +364,19 @@ fn a_start_offset_past_the_end_is_refused_without_a_sink() {
     assert_eq!(os.write_unsigned(1, 42), Err(Error::BufferFull));
 }
 
-/// The exception form of the same refusal, matching `with_flush`: `with_offset`
-/// cannot report a status — it returns `Self` — so an offset outside the buffer
-/// panics there, like an out-of-range slice index. `try_with_offset` is the
-/// status form.
+/// The same refusal on the sink-less installation: an offset outside the buffer
+/// names no installation, so `with_offset` reports `Error::Argument`. `new` stays
+/// infallible — offset 0 is in range for every buffer, including an empty one.
 #[test]
-#[should_panic(expected = "start offset")]
-fn with_offset_panics_on_an_offset_past_the_end() {
+fn with_offset_refuses_an_offset_past_the_end() {
     let mut buf = [0u8; 4];
-    let _ = OStream::with_offset(&mut buf, 99);
+    assert!(
+        OStream::with_offset(&mut buf, 99).is_err(),
+        "an offset past the end must be refused"
+    );
+    // offset == len is in range: a capacity of zero, and bytes_used counts from
+    // the buffer's start, so the reserved room is already accounted for.
+    assert_eq!(OStream::with_offset(&mut buf, 4).map(|os| os.bytes_used()), Ok(4));
 }
 
 /// A sink that **takes** every buffer it is handed: it copies the bytes out,
@@ -425,7 +434,7 @@ fn a_taking_sink_that_swaps_buffers_every_flush_matches_one_shot() {
             swaps: &mut swaps,
             last: &mut last,
         };
-        let mut os = OStream::with_flush(&mut first, 0, sink);
+        let mut os = OStream::with_flush(&mut first, 0, sink).unwrap();
         script(&mut os);
         os.flush().unwrap();
     }
@@ -446,7 +455,7 @@ fn a_copying_sink_that_returns_its_buffer_matches_one_shot() {
     {
         let mut os = OStream::with_flush(&mut buf, 0, |chunk: &[u8]| {
             collected.extend_from_slice(chunk);
-        });
+        }).unwrap();
         script(&mut os);
         os.flush().unwrap();
     }
@@ -510,7 +519,7 @@ fn a_refused_replacement_kills_the_stream_and_never_reaches_the_sink() {
             replacement: Some(&mut replacement[..]),
             offset,
         };
-        let mut os = OStream::with_flush(&mut first, 0, sink);
+        let mut os = OStream::with_flush(&mut first, 0, sink).unwrap();
         os.write_unsigned(1, 42).unwrap(); // fills the 2-byte buffer
 
         // The write that triggers the handover: the sink takes the buffer and
@@ -561,7 +570,7 @@ fn a_replacement_refused_at_an_explicit_flush_is_terminal_too() {
             replacement: Some(&mut replacement[..]),
             offset,
         };
-        let mut os = OStream::with_flush(&mut first, 0, sink);
+        let mut os = OStream::with_flush(&mut first, 0, sink).unwrap();
         os.write_unsigned(1, 42).unwrap();
         let first_flush = os.flush();
         let after = os.write_unsigned(2, 7);
@@ -596,7 +605,7 @@ fn a_buffer_set_cannot_revive_a_refused_stream() {
             replacement: Some(&mut replacement[..]),
             offset,
         };
-        let mut os = OStream::with_flush(&mut first, 0, sink);
+        let mut os = OStream::with_flush(&mut first, 0, sink).unwrap();
         os.write_unsigned(1, 42).unwrap();
         assert_eq!(os.write_unsigned(2, 7), Err(Error::Argument));
         assert_eq!(os.buffer_set(&mut fresh, 0), Err(Error::Argument));
@@ -627,7 +636,7 @@ fn a_buffer_set_supersedes_a_replacement_the_sink_returned() {
             replacement: Some(&mut replacement[..]),
             offset,
         };
-        let mut os = OStream::with_flush(&mut first, 0, sink);
+        let mut os = OStream::with_flush(&mut first, 0, sink).unwrap();
         os.write_unsigned(1, 42).unwrap();
         os.buffer_set(&mut mine, 0).unwrap(); // drains, then supersedes
         os.write_unsigned(2, 7).unwrap();
@@ -662,7 +671,7 @@ fn no_foreign_memory_reaches_a_sink() {
                 "sink received memory outside the installed buffer"
             );
             seen += 1;
-        });
+        }).unwrap();
         os.write_blob(1, &blob).unwrap();
         os.flush().unwrap();
     }
@@ -699,7 +708,7 @@ fn an_attached_no_flush_sink_discards_what_it_is_handed() {
     // the tail that never reached a flush is still in it.
     let mut buf = [0u8; 16];
     let (used, flushed) = {
-        let mut os = OStream::with_flush(&mut buf, 0, NoFlush);
+        let mut os = OStream::with_flush(&mut buf, 0, NoFlush).unwrap();
         os.write_blob(1, &blob).unwrap();
         let used = os.bytes_used();
         (used, os.flush().unwrap())
