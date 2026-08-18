@@ -504,7 +504,10 @@ the buffers on both sides.
   must outlive the call. On the zero-copy `decode` fast path (and self-contained
   `feed` chunks) string/blob `&[u8]` chunks **borrow** directly from it, valid
   only during the callback — copy them out (`String::push_str`,
-  `Vec::extend_from_slice`) to keep them. Scalars/floats arrive by value.
+  `Vec::extend_from_slice`) to keep them. Scalars/floats arrive by value. A
+  payload the transport split across chunks is put back together by
+  `PayloadAcc`, which buffers only while a field is genuinely split and hands a
+  whole-payload chunk straight through, unbuffered and uncopied.
 
 | Buffer | Owner / lifetime |
 |--------|------------------|

@@ -65,7 +65,10 @@
 //!   `string` field's **raw bytes** to [`Visitor::string`] and never builds a
 //!   `String` itself. Generated code materializes the field with
 //!   `core::str::from_utf8`; an `Err` becomes the sticky `inv` flag →
-//!   [`Error::InvalidMsg`] (the `INVALID` decode outcome). Invalid UTF-8 is
+//!   [`Error::InvalidMsg`] (the `INVALID` decode outcome). A payload split
+//!   across `feed` chunks is reassembled first — that is what [`PayloadAcc`] is
+//!   for — so the verdict is passed on the whole field, never on a chunk that
+//!   may cut a multi-byte sequence in half. Invalid UTF-8 is
 //!   therefore **rejected, never replaced** with `U+FFFD` or truncated
 //!   (MESSAGE_SPEC §8). Embedded `U+0000` is valid UTF-8 and round-trips
 //!   byte-exact. This matches `corelib-rs-no-std` exactly (generator #80).
@@ -103,12 +106,14 @@
 mod error;
 mod istream;
 mod ostream;
+mod payload;
 mod types;
 mod varint;
 
 pub use error::{Error, Result};
 pub use istream::{decode, IStream, Visitor};
 pub use ostream::{Flush, FlushTake, NoFlush, OStream, SignedElem, UnsignedElem};
+pub use payload::PayloadAcc;
 pub use types::{
     ArrayKind, FixlenType, Id, Signed, Unsigned, API_VERSION, ID_MAX, MAX_DEPTH, MIN_OUTPUT_BUFFER,
 };
