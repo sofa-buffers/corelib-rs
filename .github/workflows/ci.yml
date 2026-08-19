@@ -6,14 +6,26 @@ on:
   pull_request:
   workflow_dispatch:
 
+# One in-flight run per branch: a new push supersedes the old one everywhere
+# except on main, whose runs publish the coverage badge and are kept.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
 
+# Every job below carries an explicit `timeout-minutes`, sized at roughly four
+# times its observed runtime. A hung step has to fail fast and say which job it
+# was: the account gets 20 concurrent Actions slots, so a job wedged on
+# GitHub's 6-hour default holds a slot that every other repo in the family is
+# queuing for.
 jobs:
   # Formatting + clippy, denying all warnings.
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
@@ -27,7 +39,9 @@ jobs:
   #   1.97 / 1.96 / 1.95 = the three most recent releases, pinned
   test:
     name: Test (${{ matrix.toolchain }})
+    needs: [lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -51,7 +65,9 @@ jobs:
   # legs above already prove the release *build* compiles on each of them.
   test-release:
     name: Test (release profile)
+    needs: [lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
@@ -62,7 +78,9 @@ jobs:
   # this far back — the MSRV promise covers what users compile, not our tests.
   msrv:
     name: Build (MSRV 1.70)
+    needs: [lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
@@ -74,7 +92,9 @@ jobs:
   # little-endian wire format round-trips correctly off little-endian hardware.
   test-big-endian:
     name: Test (big-endian, s390x)
+    needs: [lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
@@ -84,7 +104,9 @@ jobs:
   # Line coverage via llvm-cov; publishes the README's coverage badge from main.
   coverage:
     name: Coverage
+    needs: [lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write   # push the badge JSON to the `badges` branch
     steps:

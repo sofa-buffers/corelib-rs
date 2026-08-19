@@ -19,10 +19,15 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Both jobs carry an explicit `timeout-minutes`, sized at roughly four times
+# their observed runtime. A hung step has to fail fast and name itself: the
+# account gets 20 concurrent Actions slots, and a job left on GitHub's 6-hour
+# default holds one of them against every other repo in the family.
 jobs:
   build:
     name: Build rustdoc
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
@@ -47,6 +52,7 @@ jobs:
     name: Deploy to GitHub Pages
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
