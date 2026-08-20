@@ -1,0 +1,61 @@
+name: "Version consistency"
+
+# The git tag is the source of truth for the release version: on `v<x.y.z>`,
+# Cargo.toml's `package.version` must be exactly that.
+#
+# Tags only, deliberately. Between releases the manifest legitimately runs
+# ahead of the newest tag — today Cargo.toml says 0.11.0 while the newest tag
+# is v0.10.0, because the 0.11 series is API-incompatible with 0.10.x and the
+# version was bumped when the break landed, not when it ships. Running this on
+# every push and pull request would flag that healthy state as a failure and
+# burn a runner slot per run; on a tag push the comparison is the only thing
+# that can catch a release cut from an unbumped manifest.
+on:
+  push:
+    tags: [ 'v*' ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  check-versions:
+    name: Check versions
+    runs-on: ubuntu-latest
+    # Four times the observed runtime of the slowest job in this repo is still
+    # far above what a checkout plus two greps needs; 10 is the floor used
+    # across these workflows so a wedged step gives back its concurrency slot.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # need tags for the reference version
+
+      - name: Reference version (git tag)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            ref_version=${GITHUB_REF_NAME#v}
+          else
+            # Manual/branch runs: fall back to the latest tag, empty if the repo
+            # has no tags yet, in which case the comparison is skipped.
+            ref_version=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
+            [[ -n "$ref_version" ]] || echo "::notice::no git tag found; skipping version comparison"
+          fi
+          echo "REF_VERSION=$ref_version" >> "$GITHUB_ENV"
+
+      - name: Check Cargo (Cargo.toml)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `package.version` is the first `version = "..."` in the manifest —
+          # read it from the [package] table only, so a dependency's version
+          # can never be mistaken for the crate's.
+          version=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p' Cargo.toml \
+                    | grep -oP '^\s*version\s*=\s*"\K[^"]+' | head -1)
+          [[ -n "$version" ]] || { echo "::error::Cargo.toml: no [package] version found"; exit 1; }
+          [[ -z "$REF_VERSION" || "$version" == "$REF_VERSION" ]] \
+            || { echo "::error::Cargo.toml version: '$version' != '$REF_VERSION'"; exit 1; }
+          echo "Cargo.toml version: $version (tag: ${REF_VERSION:-none})"
