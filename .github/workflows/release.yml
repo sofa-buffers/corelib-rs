@@ -150,11 +150,19 @@ jobs:
       - name: Require a successful CI run for the tagged commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GATING_WORKFLOW: ci.yml
         run: |
           set -euo pipefail
           SHA="$(git rev-parse HEAD)"
-          CONCLUSIONS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=$SHA" \
-                          --jq '.workflow_runs[] | select(.status == "completed") | .conclusion')"
+          # A workflow that was renamed or folded into another file answers 404
+          # here. Saying so is the point: silently reading that as "no successful
+          # run" would tell a maintainer to re-run something that no longer
+          # exists. The twin repo lost three workflow files exactly that way.
+          if ! RUNS="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/$GATING_WORKFLOW/runs?head_sha=$SHA" 2>&1)"; then
+            echo "::error::cannot read runs for '$GATING_WORKFLOW' — renamed or removed? Then GATING_WORKFLOW in this file is stale. ($RUNS)"
+            exit 1
+          fi
+          CONCLUSIONS="$(jq -r '.workflow_runs[] | select(.status == "completed") | .conclusion' <<<"$RUNS")"
           echo "CI runs for $SHA: ${CONCLUSIONS:-<none>}"
           if grep -qx success <<<"$CONCLUSIONS"; then
             echo "CI is green on the tagged commit."
