@@ -128,10 +128,13 @@ jobs:
           fi
 
   # ---------------------------------------------------------------------------
-  # A release tag can point at any commit, while CI triggers on pushes to main
-  # and on pull requests. Asserting that CI actually ran — and passed — on this
-  # exact commit is what keeps a tag placed on an unreviewed branch from
-  # reaching crates.io with nothing but this workflow's own subset behind it.
+  # The quality gate, and the only one: `ci.yml` already ran fmt, clippy, the
+  # toolchain matrix, the release-profile suite, the MSRV build and the s390x
+  # big-endian leg. Re-running any of that here would prove nothing new and
+  # would be a second copy of a list that drifts — so this job asserts instead
+  # that CI actually ran, and passed, on this *exact* commit. That matters
+  # because a release tag can point at any commit, while CI triggers on pushes
+  # to main and on pull requests.
   # ---------------------------------------------------------------------------
   ci-status:
     name: CI passed on this commit
@@ -159,70 +162,6 @@ jobs:
             echo "::error::No successful CI run for $SHA. Push the commit to main (or open a PR for it), let CI finish, then re-cut the release."
             exit 1
           fi
-
-  # ---------------------------------------------------------------------------
-  # The release-critical subset of ci.yml, re-run on the tag itself so this
-  # workflow also stands on its own. The pinned-toolchain matrix is deliberately
-  # not duplicated here — `ci-status` above is what covers it, and a second copy
-  # of that list is a copy that drifts.
-  # ---------------------------------------------------------------------------
-  lint:
-    name: Lint
-    needs: guard
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.guard.outputs.ref }}
-      - uses: ./.github/actions/rust
-        with:
-          components: rustfmt, clippy
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-
-  test:
-    name: Test
-    needs: guard
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.guard.outputs.ref }}
-      - uses: ./.github/actions/rust
-      - run: cargo test --verbose
-      # The build users actually link against: this port's correctness
-      # arguments are optimizer-visible (see ci.yml's `test-release`).
-      - run: cargo test --release --verbose
-
-  msrv:
-    name: Build (MSRV 1.70)
-    needs: guard
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.guard.outputs.ref }}
-      - uses: ./.github/actions/rust
-        with:
-          toolchain: "1.70"
-      # Library only — the dev-dependency tree needs 1.71+, so the MSRV promise
-      # covers what users compile, not our tests (ci.yml says the same).
-      - run: cargo build --release --verbose
-
-  big-endian:
-    name: Test (big-endian, s390x)
-    needs: guard
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.guard.outputs.ref }}
-      - uses: ./.github/actions/rust
-      - uses: taiki-e/install-action@cross
-      # A wire format whose bytes are little-endian by definition: shipping a
-      # release that was never run off little-endian hardware is the one
-      # regression that would be invisible everywhere else.
-      - run: cross test --target s390x-unknown-linux-gnu --verbose
 
   # ---------------------------------------------------------------------------
   # The artifact, not the working tree. `cargo package` builds the exact file
@@ -281,7 +220,7 @@ jobs:
   # ---------------------------------------------------------------------------
   publish:
     name: Publish to crates.io
-    needs: [guard, ci-status, lint, test, msrv, big-endian, package-smoke]
+    needs: [guard, ci-status, package-smoke]
     if: needs.guard.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
