@@ -529,35 +529,22 @@ every run, and so does `tests/bench_shape_tests.rs`:
 The first two are BENCH_SPEC's own parity checks; `composite`'s comes from here,
 as the spec says it should, for the ports that have to match it.
 
-### Instruction cost, as measured
+### How to read two of the rows
 
-`bash benches/run_callgrind.sh` on this crate:
+Measured figures are not reproduced here — they belong to the cross-language
+benchmark arena, which runs every port on one host under one methodology.
+`bash benches/run_callgrind.sh` produces them for this crate. Two rows read the
+opposite of how they look:
 
-| workload | Ir/op | bytes |
-|---|---|---|
-| encode: u64 array (1000) | 29645 | 9491 |
-| encode: typical message | 242 | 37 |
-| encode: blob 1MB one-shot | 1000091 | 1000005 |
-| encode: blob 1MB streaming | 113952 | 1000005 |
-| encode: composite | 21211 | 956 |
-| decode: u64 array (1000) | 47737 | 9491 |
-| decode: typical message | 533 | 37 |
-| decode: blob 1MB | 15887 | 1000005 |
-| decode: composite | 5169 | 956 |
-| decode: composite skip-all | 4606 | 956 |
-
-Two of those read the opposite of how they look:
-
-* **`encode: blob 1MB one-shot` is not nine times the work of the streaming row.**
-  Callgrind counts every iteration of `rep movsb` as an instruction, and glibc
-  picks that memcpy for the one-shot row's contiguous megabyte and a vector loop
-  for the streaming row's 4 KB pieces — ~1.0 Ir/byte against ~0.11. The gap is
-  that choice, not the flush machinery; compare each row against the same row on
-  another port.
-* **`decode: blob 1MB` at 15,887 Ir for a megabyte is not a fast copy — it is no
-  copy.** Decoding hands the visitor a slice into the input buffer, so the only
-  work is walking the framing of 245 chunks and nothing ever touches the payload.
-  That is why the row reports hundreds of GB/s rather than memory bandwidth.
+* **`encode: blob 1MB one-shot` is not many times the work of the streaming
+  row.** Callgrind counts every iteration of `rep movsb` as an instruction, and
+  glibc picks that memcpy for the one-shot row's contiguous megabyte and a vector
+  loop for the streaming row's 4 KB pieces. The gap is that choice, not the flush
+  machinery; compare each row against the same row on another port.
+* **`decode: blob 1MB` is not a fast copy — it is no copy.** Decoding hands the
+  visitor a slice into the input buffer, so the only work is walking the framing
+  of 245 chunks and nothing ever touches the payload. That is why the row reports
+  hundreds of GB/s rather than memory bandwidth.
 
 ### Choosing between the two Rust corelibs
 
@@ -569,8 +556,8 @@ format, each built for its target:
   for the benchmark tools; roughly **1.4× prost throughput** in the arena.
 - **[`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std)** —
   `#![no_std]`, no allocator, `opt-level = "z"` + LTO, size-tuned for bare-metal
-  firmware. About **1.3× micropb throughput** at a Cortex-M flash footprint of
-  roughly **7.0 KB vs ~8.5 KB**.
+  firmware. About **1.4× micropb throughput** at a Cortex-M flash footprint of
+  roughly **6.8 KB vs ~8.5 KB**.
 
 | | `corelib-rs` (this crate) | `corelib-rs-no-std` |
 |---|---|---|
@@ -579,7 +566,7 @@ format, each built for its target:
 | Release profile | `opt-level = 3`, fat LTO | `opt-level = "z"`, LTO |
 | Optimized for | raw throughput | small `.text` footprint |
 | Configurable format | no — always full | Cargo features trim wire types / value width |
-| Arena reference | ~1.4× prost | ~1.3× micropb; Cortex-M ~7.0 KB vs ~8.5 KB |
+| Arena reference | ~1.4× prost | ~1.4× micropb; Cortex-M ~6.8 KB vs ~8.5 KB |
 
 The public API mirrors between the two, so moving code across is at most a profile
 change. Arena figures are approximate (best-of-5, comparable only within a
