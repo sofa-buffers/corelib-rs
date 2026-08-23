@@ -38,6 +38,19 @@ env:
   CARGO_TERM_COLOR: always
   CRATE: sofa-buffers-corelib
 
+# Every job below carries an explicit `timeout-minutes`. GitHub's default is
+# 360 minutes, and this family has already spent it: a wedged job in
+# corelib-dart held a runner slot for six hours on 2026-08-19 before anyone
+# noticed. The org's Actions concurrency is 20 slots for every corelib, so one
+# stuck release job is a slot every other repository queues behind.
+#
+# The bounds are NOT four times a measured runtime. This workflow has run once
+# (run 32476462532), and that run skipped `publish` and `verify` -- a
+# rehearsal against an existing tag publishes nothing -- so neither has an
+# observed duration at all. Each number below says what it rests on. 10 minutes
+# is the floor the family's CI files use even for ten-second jobs: a bound is
+# there to catch a wedge, not to police a healthy run.
+
 jobs:
   # ---------------------------------------------------------------------------
   # Everything that can be decided without a build, decided first: a bad tag or
@@ -46,6 +59,9 @@ jobs:
   guard:
     name: Guard
     runs-on: ubuntu-latest
+    # 9 s observed: two crates.io calls and some shell. The floor, not 4x --
+    # 4x would be under a minute, tighter than a runner takes to warm up.
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       ref: ${{ steps.resolve.outputs.ref }}
@@ -106,13 +122,25 @@ jobs:
           set -euo pipefail
           # 200 = this exact version is published; 404 = free (also the answer
           # for a crate that does not exist yet, which is the first release).
-          CODE="$(curl -sS -o /dev/null -w '%{http_code}' \
-                    -H "User-Agent: $CRATE release workflow (github.com/${GITHUB_REPOSITORY})" \
-                    "https://crates.io/api/v1/crates/$CRATE/$VERSION")"
+          # Anything else is not an answer, and a single 5xx from crates.io
+          # would abort the release on the spot — so retry, bounded, and only
+          # then refuse. `--max-time` is what stops a stalled connection
+          # sitting here until the job's timeout-minutes fires.
+          for attempt in 1 2 3 4 5; do
+            # On a connection failure curl prints 000 *and* exits non-zero;
+            # the `||` catches the exit status without appending a second 000.
+            CODE="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' \
+                      -H "User-Agent: $CRATE release workflow (github.com/${GITHUB_REPOSITORY})" \
+                      "https://crates.io/api/v1/crates/$CRATE/$VERSION")" || CODE=000
+            case "$CODE" in
+              404|200) break ;;
+              *) echo "attempt $attempt: crates.io answered HTTP $CODE — retrying"; sleep 5 ;;
+            esac
+          done
           case "$CODE" in
             404) echo "$CRATE $VERSION is free — clear to publish." ;;
             200) echo "::error::$CRATE $VERSION is already on crates.io. A published version is immutable; bump and re-tag."; exit 1 ;;
-            *)   echo "::error::crates.io answered HTTP $CODE for $CRATE/$VERSION — refusing to guess."; exit 1 ;;
+            *)   echo "::error::crates.io answered HTTP $CODE for $CRATE/$VERSION after 5 attempts — refusing to guess."; exit 1 ;;
           esac
 
       # Not a gate: a hotfix release off a maintenance branch is legitimate.
@@ -140,6 +168,8 @@ jobs:
     name: CI passed on this commit
     needs: guard
     runs-on: ubuntu-latest
+    # 7 s observed: a checkout and one GitHub API query. Floor again.
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -183,6 +213,10 @@ jobs:
     name: Package & smoke
     needs: guard
     runs-on: ubuntu-latest
+    # 19 s observed with a warm Swatinem cache. A release runs on a cold
+    # one -- toolchain install, `cargo package`, then a fresh build of the
+    # throwaway smoke crate -- so this is sized for the cold path.
+    timeout-minutes: 15
     env:
       VERSION: ${{ needs.guard.outputs.version }}
     steps:
@@ -231,6 +265,11 @@ jobs:
     needs: [guard, ci-status, package-smoke]
     if: needs.guard.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    # Never observed: the one run so far was a rehearsal and skipped this job.
+    # Deliberately generous. Aborting a publish part-way is worse than any
+    # slot it holds -- a half-uploaded version cannot be re-published, only
+    # yanked and bumped -- so this bounds a wedge and nothing tighter.
+    timeout-minutes: 20
     permissions:
       id-token: write
       contents: read
@@ -261,6 +300,12 @@ jobs:
     name: Verify from crates.io
     needs: [guard, publish]
     runs-on: ubuntu-latest
+    # Never observed either, and this job legitimately waits on someone
+    # else's server: the index poll below is 30 attempts x 10 s, so 5 minutes
+    # of waiting is a healthy worst case, on top of a cold toolchain and the
+    # smoke build. 20 leaves better than 3x headroom over that; anything near
+    # 4x a warm run would fire on a slow-but-fine propagation.
+    timeout-minutes: 20
     env:
       VERSION: ${{ needs.guard.outputs.version }}
     steps:
