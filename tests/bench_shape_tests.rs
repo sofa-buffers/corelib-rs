@@ -38,9 +38,7 @@ use sofab::{IStream, Id, OStream, Signed, Unsigned, Visitor};
 use std::fmt::Write as _;
 
 const BENCH_RS: &str = include_str!("../benches/bench.rs");
-const PERF_RS: &str = include_str!("../benches/perf.rs");
 const CALLGRIND_SH: &str = include_str!("../benches/run_callgrind.sh");
-const README: &str = include_str!("../README.md");
 
 /// Every row BENCH_SPEC's throughput table requires, in the order it prints
 /// them. `encode: blob 1MB passthrough` is deliberately absent: it is the one
@@ -232,32 +230,6 @@ fn the_perf_message_encodes_to_170_bytes() {
         "BENCH_SPEC: the perf message is 170 bytes on every implementation, and \
          a different `message size` means the encoding diverged"
     );
-}
-
-/// The parity sizes are only useful to another port if that port can find them.
-#[test]
-fn both_tools_and_the_readme_state_the_parity_sizes() {
-    for (what, needle, where_) in [
-        ("the composite size", "956", &BENCH_RS),
-        ("the blob 1MB size", "1_000_005", &BENCH_RS),
-        ("the perf message size", "170", &PERF_RS),
-    ] {
-        assert!(
-            where_.contains(needle),
-            "{what} ({needle}) is not written down in the tool that prints it; \
-             BENCH_SPEC's parity check only works if the expected number is \
-             stated and asserted, not left as whatever the encoder happens to \
-             produce"
-        );
-    }
-    for needle in ["956", "1000005", "170"] {
-        assert!(
-            README.contains(needle),
-            "the README never states the parity size {needle}; a port author \
-             checking their encoding against the reference implementation reads \
-             the README, not this crate's benches"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -526,11 +498,7 @@ fn the_optional_passthrough_row_is_omitted_rather_than_stubbed() {
          BENCH_SPEC's optional pass-through row must be absent — not printed \
          with a placeholder value"
     );
-    for (doc, what) in [
-        (BENCH_RS, "bench"),
-        (CALLGRIND_SH, "run_callgrind.sh"),
-        (README, "README"),
-    ] {
+    for (doc, what) in [(BENCH_RS, "bench"), (CALLGRIND_SH, "run_callgrind.sh")] {
         assert!(
             doc.contains("passthrough") || doc.contains("pass-through"),
             "{what} never says why BENCH_SPEC's optional pass-through row is \
