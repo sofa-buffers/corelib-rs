@@ -38,7 +38,6 @@ use sofab::{IStream, Id, OStream, Signed, Unsigned, Visitor};
 use std::fmt::Write as _;
 
 const BENCH_RS: &str = include_str!("../benches/bench.rs");
-const PERF_RS: &str = include_str!("../benches/perf.rs");
 const CALLGRIND_SH: &str = include_str!("../benches/run_callgrind.sh");
 
 /// Every row BENCH_SPEC's throughput table requires, in the order it prints
