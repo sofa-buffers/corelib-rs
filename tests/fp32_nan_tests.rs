@@ -19,6 +19,23 @@
 //!
 //! JSON cannot represent NaN (§4.6, §7.1), which is why this is an
 //! implementation-level suite rather than a shared vector.
+//!
+//! ## Why there is no test *of* the hazard here
+//!
+//! An obvious extra test — assert that `f32 -> f64 -> f32` destroys the payload,
+//! so the suite cannot pass vacuously — is not written, because what a widening
+//! does to a signaling NaN is neither the port's choice nor stable:
+//!
+//! * on **x86-64** at runtime the IEEE widening sets the quiet bit, exactly as
+//!   §6.5's diagram shows: `0x7F80_0001 -> 0x7FC0_0001`;
+//! * on **s390x** (the `test-big-endian` CI job) the payload survives intact;
+//! * **const-folded** at `opt-level = 3` on x86-64 it collapses to the default
+//!   quiet NaN, `0x7FC0_0000` — the payload gone rather than quieted.
+//!
+//! Three answers on the platforms this crate's own CI runs. Non-vacuity comes
+//! instead from `each_nan_payload_survives_the_scalar_round_trip`, which asserts
+//! the four **wire bytes** the encoder writes: any widening anywhere on the path
+//! changes them, on every one of those platforms.
 
 use sofab::{decode, IStream, Id, OStream, Visitor};
 
@@ -148,34 +165,4 @@ fn each_nan_payload_survives_the_scalar_round_trip() {
         assert_eq!(one_shot(&buf[..used]), [bits], "[{name}] decode");
         assert_eq!(byte_at_a_time(&buf[..used]), [bits], "[{name}] feed(1)");
     }
-}
-
-/// The hazard itself, as an executable statement of what the tests above guard
-/// against: a payload that passes through an `f64` may come back **quiet**, and
-/// "no later code can recover it" (§6.5).
-///
-/// What a widening does to a signaling NaN is the *platform's* choice, not the
-/// port's, and the family's two CI hosts disagree: on x86-64 the IEEE widening
-/// sets the quiet bit, exactly as §6.5's diagram shows; on s390x (the
-/// `test-big-endian` job) the payload survives the round trip. So the assertion
-/// is the one statement true on both — the result is still a NaN, and if it moved
-/// at all it moved **only** by the quiet bit being set. Either way it is a reason
-/// never to route an `fp32` through a double, which this port does not: the two
-/// tests above assert the port's own path keeps the four wire bytes at both
-/// positions and on both decode surfaces, which is why this one is an observation
-/// rather than a requirement.
-#[test]
-fn widening_through_a_double_can_quiet_the_payload() {
-    let sig = f32::from_bits(0x7F80_0001);
-    let widened = (sig as f64 as f32).to_bits();
-
-    assert!(
-        f32::from_bits(widened).is_nan(),
-        "a NaN stopped being a NaN"
-    );
-    assert!(
-        widened == sig.to_bits() || widened == sig.to_bits() | 0x0040_0000,
-        "widening changed more than the quiet bit: {:#010X} -> {widened:#010X}",
-        sig.to_bits()
-    );
 }
