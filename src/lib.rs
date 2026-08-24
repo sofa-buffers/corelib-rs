@@ -2,11 +2,18 @@
 //!
 //! A compact, **streaming** implementation of the SofaBuffers (Sofab)
 //! serialization format, tuned for **throughput on big machines**. Where the
-//! sibling crate [`corelib-rs-no-std`] targets microcontrollers (heap-free,
-//! `#![no_std]`, optimized for size), this crate targets servers: it uses `std`,
-//! allocates freely, and reaches for the fastest decode strategy available —
-//! **advancing a cursor over a contiguous buffer** with zero copies, the
-//! technique from the C++ high-speed port and Protocol Buffers.
+//! sibling crate [`corelib-rs-no-std`] targets microcontrollers (`#![no_std]`,
+//! no allocator at all, optimized for size), this crate targets servers: it uses
+//! `std` and reaches for the fastest decode strategy available — **advancing a
+//! cursor over a contiguous buffer** with zero copies, the technique from the C++
+//! high-speed port and Protocol Buffers.
+//!
+//! The **codec** allocates nothing after construction, on either side, on any
+//! path (CORELIB_PLAN §6.6): `IStream`'s carry and `OStream`'s run of held-back
+//! sequence headers are fixed arrays sized when the stream is built, and no wire
+//! number sizes anything either of them holds. What uses the heap is the static
+//! helper layer beside the codec — [`PayloadAcc`], which the *generated* layer
+//! drives to reassemble a split payload — and the caller's own destinations.
 //!
 //! Every wire type is always compiled in — there are **no Cargo feature flags
 //! and no build-time configuration**. The scalar value type is always 64-bit
