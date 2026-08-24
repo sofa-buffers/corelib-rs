@@ -49,6 +49,23 @@ const FX_BLOB: u8 = FixlenType::Blob as u8;
 /// §2), so no method fires for it — including whole sequences, see
 /// [`Visitor::sequence_begin`]. Initialise the destination to its defaults
 /// *before* decoding rather than from a callback (§5.1).
+///
+/// # Nesting: the flat shape
+///
+/// CORELIB_PLAN §6.0 admits two conformant shapes for descending into a nested
+/// sequence — a **child handler** returned per level, or **flat begin/end** where
+/// the visitor is told a level opened and closed and tracks its own depth — and
+/// says they are "functionally identical: same bytes, same outcomes, same
+/// auto-skip", differing "only in which the language makes cheaper … handing back
+/// a borrowed handler per level is natural in Go, Dart and Python, and awkward
+/// under Rust's borrow rules". This port implements the **flat** shape:
+/// [`Visitor::sequence_begin`] and [`Visitor::sequence_end`] are the whole
+/// nesting surface.
+///
+/// What is normative is the capability, and it is met: the decoder consumes a
+/// nested sequence without the caller parsing it, and a sub-sequence the visitor
+/// ignores is skipped whole — a visitor that overrides nothing walks any depth of
+/// nesting and reports no fields at all.
 #[allow(unused_variables)]
 pub trait Visitor {
     /// An unsigned integer field, or an unsigned array element.
