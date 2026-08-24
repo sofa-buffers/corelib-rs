@@ -8,7 +8,7 @@
 //! test suite would notice: every other chunked test hands `feed` memory that
 //! happens to stay alive.
 
-use sofab::{ArrayKind, Error, IStream, Id, OStream, Signed, Unsigned, Visitor};
+use sofab::{decode, ArrayKind, Error, IStream, Id, OStream, Signed, Unsigned, Visitor};
 
 const SCRUB: u8 = 0xA5;
 
@@ -152,4 +152,36 @@ fn a_payload_whole_inside_one_chunk_is_still_copied_out() {
     }
 
     assert_eq!(sink.strings, [(1, b"self-contained".to_vec())]);
+}
+
+/// **The one-shot buffer too** (§7.2 item 4, last bullet; §6.7.1).
+///
+/// "Run `decode(buffer)`, scrub the whole buffer, and assert the decoded message
+/// is unchanged. The one-shot path has no view exemption, and **this is the test
+/// that proves it**; a port that borrows from the buffer it was handed passes
+/// every other item on this list."
+///
+/// The two tests above both go through `IStream::feed`. That `decode` is
+/// `IStream::new().feed(…)` in this port makes the outcome certain — it does not
+/// make the test present, and §13 lists this as the proof of §6.7.
+#[test]
+fn scrubbing_the_one_shot_buffer_leaves_the_message_unchanged() {
+    let reference_wire = wire();
+    let mut reference = Message::default();
+    decode(&reference_wire, &mut reference).unwrap();
+    assert_eq!(reference.strings.len(), 2);
+    assert_eq!(reference.blobs.len(), 1);
+
+    // A buffer of its own, so the scrub cannot be confused with the reference's.
+    let mut owned = wire();
+    let mut sink = Message::default();
+    decode(&owned, &mut sink).unwrap();
+    owned.fill(SCRUB);
+
+    assert_eq!(
+        sink, reference,
+        "the one-shot decode borrowed from its buffer"
+    );
+    assert!(!sink.strings[0].1.contains(&SCRUB));
+    assert!(!sink.blobs[0].1.contains(&SCRUB));
 }

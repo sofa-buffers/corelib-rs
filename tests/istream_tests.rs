@@ -361,6 +361,65 @@ fn reserved_fixlen_subtype_is_invalid() {
     );
 }
 
+/// §7.2 item 6, the **no-partial-evaluation** case: a `fixlen_word` cut after
+/// its first byte, with that byte carrying a **reserved** subtype (`0x4`–`0x7`).
+///
+/// The subtype is already settled by the low three bits, so an implementation
+/// that evaluates it early answers `INVALID` where §4.1.1 requires `INCOMPLETE`
+/// ("no value before the final byte"). Nothing else in §7.2's list exercises the
+/// rule — the dangling `0x80` of the ordinary truncation cases carries no settled
+/// sub-field to peek at, and the reserved-subtype cases above all use a
+/// **complete** one-byte word, which is item 5's rejection, not this.
+///
+/// The verdict flips to `INVALID` the moment the word completes, and the
+/// completion is what proves the first half was a deferral rather than a miss.
+#[test]
+fn a_reserved_subtype_in_a_truncated_fixlen_word_is_incomplete_not_invalid() {
+    // `0x84`: continuation bit set, low three bits `0x4` — a reserved subtype in
+    // a word that is not over yet.
+    for (name, truncated, completed) in [
+        (
+            "scalar fixlen",
+            &[0x02u8, 0x84][..],
+            &[0x02u8, 0x84, 0x00][..],
+        ),
+        (
+            "fixlen array",
+            &[0x05, 0x01, 0x84][..],
+            &[0x05, 0x01, 0x84, 0x00][..],
+        ),
+    ] {
+        let mut rec = Recorder::new();
+        assert_eq!(
+            IStream::new().feed(truncated, &mut rec),
+            Err(Error::Incomplete),
+            "[{name}] a settled subtype in an unfinished word must not decide the verdict"
+        );
+        assert!(rec.events.is_empty(), "[{name}] nothing may be announced");
+
+        // Byte by byte, which is where an early evaluation is likeliest to show.
+        let mut rec = Recorder::new();
+        let mut is = IStream::new();
+        let mut last = Ok(());
+        for i in 0..truncated.len() {
+            last = is.feed(&truncated[i..i + 1], &mut rec);
+        }
+        assert_eq!(last, Err(Error::Incomplete), "[{name}] chunked");
+
+        // The terminator arrives: now the reserved subtype is a real verdict.
+        assert_eq!(
+            IStream::new().feed(completed, &mut Recorder::new()),
+            Err(Error::InvalidMsg),
+            "[{name}] the completed word carries a reserved subtype"
+        );
+        assert_eq!(
+            is.feed(&[0x00], &mut rec),
+            Err(Error::InvalidMsg),
+            "[{name}] the same, one byte at a time"
+        );
+    }
+}
+
 #[test]
 fn oversized_count_or_length_is_invalid() {
     // An unsigned varint array (wire tag 3) whose count exceeds ARRAY_MAX
