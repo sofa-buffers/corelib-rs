@@ -352,16 +352,17 @@ fn a_start_offset_past_the_end_is_refused_without_a_sink() {
     // of its own buffer.
     let mut a = [0u8; 8];
     let mut b = [0u8; 4];
-    let mut os = OStream::new(&mut a);
-    os.write_unsigned(1, 42).unwrap();
-    assert_eq!(os.buffer_set(&mut b, 5), Err(Error::Argument));
+    let used = {
+        let mut os = OStream::new(&mut a);
+        os.write_unsigned(1, 42).unwrap();
+        assert_eq!(os.buffer_set(&mut b, 5), Err(Error::Argument));
 
-    // A refused installation leaves the stream exactly as it was: still on the
-    // first buffer, still holding its two bytes, still writable.
-    assert_eq!(os.bytes_used(), 2);
-    os.write_signed(2, -7).unwrap();
-    let used = os.bytes_used();
-    drop(os);
+        // A refused installation leaves the stream exactly as it was: still on
+        // the first buffer, still holding its two bytes, still writable.
+        assert_eq!(os.bytes_used(), 2);
+        os.write_signed(2, -7).unwrap();
+        os.bytes_used()
+    };
     assert_eq!(&a[..used], &[0x08, 0x2A, 0x11, 0x0D]);
 
     // And the boundary again, this time installed mid-stream.

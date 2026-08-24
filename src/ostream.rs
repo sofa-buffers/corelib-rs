@@ -17,6 +17,7 @@ use crate::varint::{
     write_varint_unchecked, write_varint_unchecked_narrow, zigzag_encode, MAX_VARINT_LEN,
 };
 use crate::{Id, Signed, Unsigned};
+use core::mem::MaybeUninit;
 
 /// Sink that receives the bytes buffered so far when the output buffer fills (or
 /// on an explicit [`OStream::flush`]) and **copies** them out — the common case,
@@ -151,90 +152,79 @@ fn check_streaming_capacity(len: usize, offset: usize) -> Result<()> {
     }
 }
 
-/// How many held-back sequence headers fit without touching the heap. Nesting
-/// deeper than this spills into a `Vec` and the run keeps growing — this is a
-/// storage split, **not** a bound on the hold-back: past it the encoder still
-/// holds back, it just pays an allocation (see [`PendingRun`]).
-const INLINE_PENDING: usize = 8;
-
 /// The run of held-back sequence ids: the ids of the innermost open sequences
 /// whose header has not been written yet (MESSAGE_SPEC §2 lazy framing).
 ///
-/// A stack that lives inline for the first [`INLINE_PENDING`] levels and spills
-/// to the heap beyond, so it is **unbounded** up to the format's [`MAX_DEPTH`]
-/// ceiling — which is what makes this port canonical at every legal depth.
-/// CORELIB_PLAN §6 ("How deep the hold-back reaches") lets only a heap-free
-/// profile bound the run and frame eagerly past the bound; this crate has a
-/// heap, so it must not.
+/// **Fixed-size state, sized at construction** (CORELIB_PLAN §6.6.2). §6.0.1
+/// makes both halves normative at once — "the pending run is fixed-size state:
+/// at most `MAX_DEPTH` ids, sized at construction. An implementation **MUST**
+/// hold back to the full `MAX_DEPTH` and is thereby canonical at every depth" —
+/// and the only shape that satisfies both is a `MAX_DEPTH`-wide array. The
+/// alternative §6.0.1 offers (bound the run shorter and frame eagerly past it,
+/// emitting the empty frame §2 would have omitted) is reserved to a constrained
+/// profile; this crate is the speed build and takes the canonical branch.
 ///
-/// The spill is grown on demand: an encoder that never opens a sequence, or
-/// never nests deeper than [`INLINE_PENDING`], allocates nothing at all. That
-/// matters because a fresh `OStream` is normally built per message, so an
-/// unconditional allocation would be one malloc/free per message: setting
-/// [`INLINE_PENDING`] to 0, which sends every id to the heap, measures 381
-/// Ir/op on the `encode: typical message` Callgrind workload against this
-/// crate's 242 — **+139**. The width of the inline array is worth far less than
-/// its existence: at `INLINE_PENDING = 1` the same workload measures 237, i.e.
-/// the eight slots cost ~5 Ir over one. See the README's Sequences section for
-/// what the hold-back costs against pre-feature eager framing.
+/// The elements are [`MaybeUninit`] so that constructing an `OStream` costs
+/// nothing at all: a `[Id; MAX_DEPTH]` would zero a kilobyte per stream, and a
+/// stream is normally built per message. Only slots below `n` have ever been
+/// written, and only those are read.
 ///
-/// (The absolute figures moved when the encoder's varint and capacity handling
-/// were reworked; the ratio they were chosen on did not.)
+/// [`OStream::write_sequence_begin_lazy`] refuses a `MAX_DEPTH + 1`th open
+/// sequence, so the array cannot overflow.
 ///
-/// Storage layout: ids `0..n` sit in `inline`, the rest follow in `spill`, in
-/// wire order (outermost first). `spill` may be non-empty while `n` is below
-/// [`INLINE_PENDING`] — after a partial commit — so `push` must consult `spill`
-/// first to keep the order.
-#[derive(Default)]
+/// Storage layout: ids `0..n`, in wire order (outermost first).
 struct PendingRun {
-    inline: [Id; INLINE_PENDING],
+    ids: [MaybeUninit<Id>; MAX_DEPTH as usize],
     n: usize,
-    spill: Vec<Id>,
+}
+
+impl Default for PendingRun {
+    #[inline]
+    fn default() -> Self {
+        PendingRun {
+            // No initialization: an array of `MaybeUninit` is uninitialized by
+            // definition, so this compiles to nothing.
+            ids: [MaybeUninit::uninit(); MAX_DEPTH as usize],
+            n: 0,
+        }
+    }
 }
 
 impl PendingRun {
     /// Number of held-back headers.
     #[inline]
     fn len(&self) -> usize {
-        self.n + self.spill.len()
+        self.n
     }
 
     /// Whether any header is held back. On the hot path: every field write tests
     /// it once.
     #[inline]
     fn is_empty(&self) -> bool {
-        self.n == 0 && self.spill.is_empty()
+        self.n == 0
     }
 
     /// Append an id (the innermost open sequence).
     #[inline]
     fn push(&mut self, id: Id) {
-        if self.n < INLINE_PENDING && self.spill.is_empty() {
-            self.inline[self.n] = id;
-            self.n += 1;
-        } else {
-            self.spill.push(id);
-        }
+        self.ids[self.n].write(id);
+        self.n += 1;
     }
 
     /// Remove the innermost held-back id, if the innermost open sequence is one.
     #[inline]
     fn pop(&mut self) -> Option<Id> {
-        if let Some(id) = self.spill.pop() {
-            return Some(id);
-        }
         self.n = self.n.checked_sub(1)?;
-        Some(self.inline[self.n])
+        // SAFETY: every slot below the old `n` was written by `push`.
+        Some(unsafe { self.ids[self.n].assume_init() })
     }
 
     /// The `i`th held-back id, outermost first.
     #[inline]
     fn get(&self, i: usize) -> Id {
-        if i < self.n {
-            self.inline[i]
-        } else {
-            self.spill[i - self.n]
-        }
+        debug_assert!(i < self.n);
+        // SAFETY: callers index within `0..n`, all written by `push`.
+        unsafe { self.ids[i].assume_init() }
     }
 
     /// Drop the outermost `k` ids — the prefix that has reached the wire. The
@@ -245,21 +235,15 @@ impl PendingRun {
         // general path below shifts a run-length range, which lowers to a
         // `memmove` call — a real one, even when the range is empty, because the
         // length is not a compile-time constant.
-        if k == self.len() {
+        if k == self.n {
             self.n = 0;
-            self.spill.clear();
             return;
         }
         if k == 0 {
             return;
         }
-        if k <= self.n {
-            self.inline.copy_within(k..self.n, 0);
-            self.n -= k;
-        } else {
-            self.spill.drain(..k - self.n);
-            self.n = 0;
-        }
+        self.ids.copy_within(k..self.n, 0);
+        self.n -= k;
     }
 }
 
@@ -296,7 +280,7 @@ impl<'a> OStream<'a, NoFlush> {
             end,
             offset: 0,
             depth: 0,
-            pending: PendingRun::default(), // heap-free until nesting spills
+            pending: PendingRun::default(), // fixed MAX_DEPTH ids, never grows
             flush: None,
             dead: false,
         }
@@ -332,7 +316,7 @@ impl<'a> OStream<'a, NoFlush> {
             end,
             offset,
             depth: 0,
-            pending: PendingRun::default(), // heap-free until nesting spills
+            pending: PendingRun::default(), // fixed MAX_DEPTH ids, never grows
             flush: None,
             dead: false,
         })
@@ -380,7 +364,7 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
             end,
             offset,
             depth: 0,
-            pending: PendingRun::default(), // heap-free until nesting spills
+            pending: PendingRun::default(), // fixed MAX_DEPTH ids, never grows
             flush: Some(sink),
             dead: false,
         })
@@ -1083,13 +1067,12 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// contentless one survives: [`OStream::write_sequence_end`] drops it,
     /// [`OStream::write_sequence_end_keep`] forces the frame out.
     ///
-    /// There is **no depth window**: the run of held-back headers grows on
-    /// demand to the format's [`MAX_DEPTH`] ceiling, so the omission is
-    /// canonical at every legal nesting level (CORELIB_PLAN §6, "How deep the
-    /// hold-back reaches" — only a heap-free profile may bound the run and frame
-    /// eagerly past the bound). The run is the encoder's only heap use, and even
-    /// that is deferred: it stays inline until nesting passes
-    /// `INLINE_PENDING` (8) levels.
+    /// There is **no depth window**: the run of held-back headers is sized at
+    /// construction to the format's [`MAX_DEPTH`] ceiling, so the omission is
+    /// canonical at every legal nesting level (CORELIB_PLAN §6.0.1, "How deep the
+    /// hold-back reaches" — only a constrained profile may bound the run shorter
+    /// and frame eagerly past the bound). Nothing is allocated for it, at any
+    /// depth: see [`PendingRun`].
     ///
     /// ```
     /// use sofab::OStream;

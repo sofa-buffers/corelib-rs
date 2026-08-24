@@ -758,12 +758,11 @@ fn recovery_after_a_cut_is_exact_only_on_a_header_boundary() {
     }
 }
 
-/// The same recovery, but with the run split across the encoder's inline slots
-/// and its heap spill (12 levels > the 8 that stay inline), and with a *further*
-/// sequence opened while the run is half-committed. The ids must still reach the
-/// wire outermost-first, in one order, however the storage is split.
+/// The same recovery, but with a run long enough to be committed in pieces and
+/// with a *further* sequence opened while the run is half-committed. The ids must
+/// still reach the wire outermost-first, in one order.
 #[test]
-fn a_cut_short_commit_keeps_its_order_across_the_spill_boundary() {
+fn a_cut_short_commit_keeps_its_order_when_a_sequence_opens_mid_run() {
     const DEPTH: u32 = 12;
     const EXTRA: u32 = 13;
 
@@ -783,8 +782,8 @@ fn a_cut_short_commit_keeps_its_order_across_the_spill_boundary() {
     };
     let one_shot = big[..one_shot].to_vec();
 
-    // Three bytes of room: the commit stops after three headers, leaving five
-    // inline and four spilled — then id 13 is opened on top of that remainder.
+    // Three bytes of room: the commit stops after three headers, leaving nine
+    // held back — then id 13 is opened on top of that remainder.
     let mut small = [0u8; 3];
     let mut rest = [0u8; 128];
     let (first, second) = {
@@ -810,24 +809,19 @@ fn a_cut_short_commit_keeps_its_order_across_the_spill_boundary() {
     assert_eq!(streamed, one_shot);
 }
 
-/// "Is anything held back?" must consult **both** halves of the run's storage,
-/// and the cut point that proves it is the inline/spill split itself.
+/// "Is anything held back?" must survive a commit that stopped part-way, at
+/// **every** cut point.
 ///
-/// The test above cuts the commit at three bytes, which leaves five ids inline
-/// and four spilled — `n != 0`, so answering from `n` alone still happens to be
-/// right and the bug hides. Cut instead at exactly `INLINE_PENDING` (8) of the 12
-/// headers and the surviving remainder is *entirely* in the heap spill: `n` is
-/// back to zero while `spill` still holds four ids. An encoder that reads
-/// emptiness off `n` then concludes the run is finished, so those four sequence
-/// headers never reach the wire — and later four of the `end` markers pair with
-/// them and vanish too, shortening the message from 26 bytes to 18 and changing
-/// the nesting structure a decoder sees.
+/// An encoder that mis-tracked the surviving remainder would conclude the run is
+/// finished, so the un-emitted sequence headers never reach the wire — and later
+/// the matching `end` markers pair with nothing and vanish too, shortening the
+/// message from 26 bytes to 18 and changing the nesting structure a decoder sees.
 ///
-/// Swept over every cut point rather than pinned to 8, so the split cannot drift
-/// out from under the test if `INLINE_PENDING` changes.
+/// Swept over every cut point rather than pinned to one, so no particular
+/// bookkeeping boundary can drift out from under the test.
 #[test]
 fn a_cut_short_commit_knows_it_is_pending_at_every_cut_point() {
-    const DEPTH: u32 = 12; // 8 inline + 4 spilled
+    const DEPTH: u32 = 12;
 
     // Reference: the same script with room to spare.
     let mut big = [0u8; 128];
@@ -865,7 +859,7 @@ fn a_cut_short_commit_knows_it_is_pending_at_every_cut_point() {
             assert_eq!(first, cut, "cut {cut}: expected {cut} headers to fit");
 
             // Recover into a fresh buffer and re-issue the failed write. Whatever
-            // is left of the run — inline, spilled, or purely spilled — must lead.
+            // is left of the run must lead.
             os.buffer_set(&mut rest, 0).unwrap();
             os.write_unsigned(0, 42).unwrap();
             for _ in 0..DEPTH {
@@ -1096,21 +1090,23 @@ fn every_sequence_end_marker_is_the_bare_canonical_byte() {
 fn a_sequence_end_marker_that_does_not_fit_is_buffer_full() {
     // Three bytes hold exactly the committed header, the field and its value.
     let mut buf = [0u8; 3];
-    let mut os = OStream::new(&mut buf);
-    os.write_sequence_begin_lazy(1).unwrap();
-    os.write_unsigned(0, 42).unwrap();
-    assert_eq!(os.write_sequence_end(), Err(Error::BufferFull));
-    assert_eq!(os.bytes_used(), 3);
-    drop(os);
+    {
+        let mut os = OStream::new(&mut buf);
+        os.write_sequence_begin_lazy(1).unwrap();
+        os.write_unsigned(0, 42).unwrap();
+        assert_eq!(os.write_sequence_end(), Err(Error::BufferFull));
+        assert_eq!(os.bytes_used(), 3);
+    }
     assert_eq!(buf, [0x0E, 0x00, 0x2A]);
 
     // One byte holds the header `end_keep` commits, and nothing more.
     let mut buf = [0u8; 1];
-    let mut os = OStream::new(&mut buf);
-    os.write_sequence_begin_lazy(1).unwrap();
-    assert_eq!(os.write_sequence_end_keep(), Err(Error::BufferFull));
-    assert_eq!(os.bytes_used(), 1);
-    drop(os);
+    {
+        let mut os = OStream::new(&mut buf);
+        os.write_sequence_begin_lazy(1).unwrap();
+        assert_eq!(os.write_sequence_end_keep(), Err(Error::BufferFull));
+        assert_eq!(os.bytes_used(), 1);
+    }
     assert_eq!(buf, [0x0E]);
 }
 
