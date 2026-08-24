@@ -150,23 +150,32 @@ fn each_nan_payload_survives_the_scalar_round_trip() {
     }
 }
 
-/// The hazard itself, as an executable statement of what the test is guarding
-/// against: the same payload through an `f64` comes back quiet.
+/// The hazard itself, as an executable statement of what the tests above guard
+/// against: a payload that passes through an `f64` may come back **quiet**, and
+/// "no later code can recover it" (§6.5).
 ///
-/// If this ever stops failing to preserve the payload, the platform changed, not
-/// the port — and the tests above would be asserting nothing.
+/// What a widening does to a signaling NaN is the *platform's* choice, not the
+/// port's, and the family's two CI hosts disagree: on x86-64 the IEEE widening
+/// sets the quiet bit, exactly as §6.5's diagram shows; on s390x (the
+/// `test-big-endian` job) the payload survives the round trip. So the assertion
+/// is the one statement true on both — the result is still a NaN, and if it moved
+/// at all it moved **only** by the quiet bit being set. Either way it is a reason
+/// never to route an `fp32` through a double, which this port does not: the two
+/// tests above assert the port's own path keeps the four wire bytes at both
+/// positions and on both decode surfaces, which is why this one is an observation
+/// rather than a requirement.
 #[test]
-fn widening_through_a_double_is_what_destroys_the_payload() {
+fn widening_through_a_double_can_quiet_the_payload() {
     let sig = f32::from_bits(0x7F80_0001);
-    let widened = sig as f64 as f32;
-    assert_ne!(
-        widened.to_bits(),
-        sig.to_bits(),
-        "the widening hazard §6.5 describes is not reproducible here"
+    let widened = (sig as f64 as f32).to_bits();
+
+    assert!(
+        f32::from_bits(widened).is_nan(),
+        "a NaN stopped being a NaN"
     );
-    assert_eq!(
-        widened.to_bits() & 0x0040_0000,
-        0x0040_0000,
-        "quiet bit set"
+    assert!(
+        widened == sig.to_bits() || widened == sig.to_bits() | 0x0040_0000,
+        "widening changed more than the quiet bit: {:#010X} -> {widened:#010X}",
+        sig.to_bits()
     );
 }
