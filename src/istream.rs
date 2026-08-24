@@ -409,11 +409,13 @@ impl IStream {
             return Ok(Some(&chunk[consumed - held..]));
         }
 
-        // Still short of a complete item. `parse` consumes nothing until the
-        // item it is carrying completes, so the chunk went in whole.
-        if consumed > 0 {
-            self.carry.copy_within(consumed..stitched, 0);
-        }
+        // Still short of a complete item. `parse` consumes nothing until the item
+        // it is carrying completes — the carry holds exactly one field prefix —
+        // so `consumed` is zero here and the chunk went in whole. The shift is
+        // written unconditionally rather than behind a `consumed > 0` test: it is
+        // a no-op memmove on a cold path, and a branch that can never be taken is
+        // a branch no test can cover.
+        self.carry.copy_within(consumed..stitched, 0);
         self.carry_len = stitched - consumed;
         debug_assert!(
             take == chunk.len(),
