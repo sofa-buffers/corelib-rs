@@ -230,12 +230,33 @@ enum Resume {
     },
 }
 
+/// Capacity of the carry buffer: the widest prefix of a single wire item that
+/// can outlive a chunk boundary, derived from this format's own constants
+/// (CORELIB_PLAN §6.6, "bounded working state … MUST be sized at construction").
+///
+/// `parse` backs the cursor up to the start of the *field* whenever a small item
+/// runs out of bytes, so what is carried is a whole field prefix, not a lone
+/// varint. The widest such prefix is `ARRAY_FIXLEN`'s: a field header, the
+/// element count, and a `fixlen_word` cut before its terminator — three varints,
+/// hence `3 × MAX_VARINT_LEN`. (A truncated varint is at most
+/// `MAX_VARINT_LEN - 1` bytes — with ten readable the value is decided, valid or
+/// not — so the real worst case is 29 and this leaves a byte of slack.)
+///
+/// Nothing else reaches the carry: string/blob payloads and array elements
+/// suspend through [`Resume`] and are handed over in pieces, never buffered.
+pub(crate) const CARRY_CAP: usize = 3 * MAX_VARINT_LEN;
+
 /// Streaming Sofab decoder. Reusable across messages via [`IStream::reset`].
 pub struct IStream {
     /// Bytes of an item that straddled a chunk boundary, carried to the next
-    /// `feed`. Only ever holds a partial small item (header / varint / float),
-    /// so it stays tiny; large payloads are streamed, not buffered.
-    carry: Vec<u8>,
+    /// `feed`. A fixed inline array sized at construction — the decoder
+    /// allocates nothing, on any path, and the caller's chunking cannot choose
+    /// how much memory it holds (CORELIB_PLAN §6.6). Only ever holds a partial
+    /// small item (field header / length or count word / partial fixed-width
+    /// scalar); large payloads are streamed, not buffered.
+    carry: [u8; CARRY_CAP],
+    /// How many bytes of `carry` are live.
+    carry_len: usize,
     resume: Resume,
     /// Nested sequence depth, for balanced start/end validation.
     depth: u32,
@@ -256,20 +277,20 @@ impl IStream {
     /// Create a fresh decoder ready to accept a new message.
     pub const fn new() -> Self {
         IStream {
-            carry: Vec::new(),
+            carry: [0u8; CARRY_CAP],
+            carry_len: 0,
             resume: Resume::None,
             depth: 0,
             invalid: false,
         }
     }
 
-    /// Reset to the initial state so the decoder can be reused for a new message
-    /// without reallocating its carry buffer.
+    /// Reset to the initial state so the decoder can be reused for a new message.
     ///
     /// This is also the only way out of a latched `INVALID` verdict: a decoder
     /// that has rejected its input stays rejecting until it is reset (§5.2).
     pub fn reset(&mut self) {
-        self.carry.clear();
+        self.carry_len = 0;
         self.resume = Resume::None;
         self.depth = 0;
         self.invalid = false;
@@ -305,45 +326,127 @@ impl IStream {
         if self.invalid {
             return Err(Error::InvalidMsg);
         }
-        if self.carry.is_empty() {
-            // Fast path: parse straight from the caller's slice, no copy.
-            //
-            // A chunk that continues a long string/blob payload — every chunk of
-            // a streamed payload but the first — is handed over **here** rather
-            // than by the field parser: delivering one is a dozen instructions,
-            // and routing it through `parse` spends that parser's whole call
-            // frame on a chunk that holds no field at all. Only if the payload
-            // ends inside the chunk does the parser see the remainder.
-            //
-            // (`carry` and `resume` are never both set: an item suspends only by
-            // running out of bytes, which means it consumed the chunk whole.
-            // `parse` resumes a payload for itself all the same, so nothing
-            // rests on that.)
-            let consumed = if matches!(self.resume, Resume::Payload { .. }) {
-                let pos = self.deliver_payload(chunk, 0, visitor);
-                if matches!(self.resume, Resume::None) {
-                    pos + self
-                        .parse(&chunk[pos..], visitor)
-                        .map_err(|e| self.latch(e))?
-                } else {
-                    pos // the whole chunk went into the payload
-                }
+        // A small item straddled the previous boundary: complete it out of the
+        // carry, then parse whatever is left of the chunk in place. Only the few
+        // bytes the pending item still needs are ever copied — the caller's
+        // chunk size never decides how much memory this decoder touches.
+        let rest = if self.carry_len == 0 {
+            chunk
+        } else {
+            match self.resume_carried(chunk, visitor)? {
+                Some(rest) => rest,
+                // The whole chunk went into the carry: nothing left to parse.
+                None => return self.verdict(),
+            }
+        };
+
+        // Fast path: parse straight from the caller's slice, no copy.
+        //
+        // A chunk that continues a long string/blob payload — every chunk of
+        // a streamed payload but the first — is handed over **here** rather
+        // than by the field parser: delivering one is a dozen instructions,
+        // and routing it through `parse` spends that parser's whole call
+        // frame on a chunk that holds no field at all. Only if the payload
+        // ends inside the chunk does the parser see the remainder.
+        //
+        // (`carry` and `resume` are never both set: an item suspends only by
+        // running out of bytes, which means it consumed the chunk whole.
+        // `parse` resumes a payload for itself all the same, so nothing
+        // rests on that.)
+        let consumed = if matches!(self.resume, Resume::Payload { .. }) {
+            let pos = self.deliver_payload(rest, 0, visitor);
+            if matches!(self.resume, Resume::None) {
+                pos + self
+                    .parse(&rest[pos..], visitor)
+                    .map_err(|e| self.latch(e))?
             } else {
-                self.parse(chunk, visitor).map_err(|e| self.latch(e))?
-            };
-            if consumed < chunk.len() {
-                self.carry.extend_from_slice(&chunk[consumed..]);
+                pos // the whole chunk went into the payload
             }
         } else {
-            // A small item straddled the previous boundary: stitch it together.
-            let mut buf = core::mem::take(&mut self.carry);
-            buf.extend_from_slice(chunk);
-            // On the error path the carry stays taken: the verdict is terminal,
-            // so there is nothing left to stitch the next chunk onto.
-            let consumed = self.parse(&buf, visitor).map_err(|e| self.latch(e))?;
-            buf.drain(..consumed);
-            self.carry = buf;
+            self.parse(rest, visitor).map_err(|e| self.latch(e))?
+        };
+        if consumed < rest.len() {
+            self.stash(&rest[consumed..])?;
         }
+        self.verdict()
+    }
+
+    /// Complete the item held in `carry` using the head of `chunk`, and report
+    /// what is left of `chunk` for the in-place fast path — or `None` when the
+    /// chunk was absorbed whole and the item is still short.
+    ///
+    /// At most [`CARRY_CAP`] bytes are copied, whatever the chunk's size: the
+    /// carry is topped up to its fixed capacity and parsed out of a stack copy,
+    /// so the remainder of the chunk is still parsed in place.
+    ///
+    /// Cold: it runs only for a chunk boundary that fell inside a field header
+    /// or a length word, never for a whole-message `feed`.
+    #[cold]
+    #[inline(never)]
+    fn resume_carried<'c, V: Visitor>(
+        &mut self,
+        chunk: &'c [u8],
+        visitor: &mut V,
+    ) -> Result<Option<&'c [u8]>> {
+        let held = self.carry_len;
+        let take = (CARRY_CAP - held).min(chunk.len());
+        self.carry[held..held + take].copy_from_slice(&chunk[..take]);
+        let stitched = held + take;
+
+        // A `[u8; CARRY_CAP]` is `Copy`, so the stitched bytes can be parsed out
+        // of a local without holding a borrow of `self` across the call.
+        let buf = self.carry;
+        // On the error path the carry stays as it is: the verdict is terminal,
+        // so there is nothing left to stitch the next chunk onto.
+        let consumed = self
+            .parse(&buf[..stitched], visitor)
+            .map_err(|e| self.latch(e))?;
+
+        if consumed >= held {
+            // The carried prefix reached the wire in full; `consumed - held`
+            // bytes of the caller's chunk went with it.
+            self.carry_len = 0;
+            return Ok(Some(&chunk[consumed - held..]));
+        }
+
+        // Still short of a complete item. `parse` consumes nothing until the
+        // item it is carrying completes, so the chunk went in whole.
+        if consumed > 0 {
+            self.carry.copy_within(consumed..stitched, 0);
+        }
+        self.carry_len = stitched - consumed;
+        debug_assert!(
+            take == chunk.len(),
+            "CARRY_CAP is wider than any carryable item, so a full carry always \
+             completes or rejects"
+        );
+        if take < chunk.len() {
+            // Unreachable, and deliberately not silent: a carry that filled to
+            // CARRY_CAP without the item completing would mean an item wider
+            // than this format admits, which is malformed either way.
+            return Err(self.latch(Error::InvalidMsg));
+        }
+        Ok(None)
+    }
+
+    /// Hold `tail` — the prefix of an item the chunk ran out inside — until the
+    /// next `feed`.
+    #[inline]
+    fn stash(&mut self, tail: &[u8]) -> Result<()> {
+        if tail.len() > CARRY_CAP {
+            // Unreachable: `parse` returns short only at an incomplete small
+            // item, whose widest prefix is what CARRY_CAP is derived from.
+            debug_assert!(false, "carried item wider than CARRY_CAP");
+            return Err(self.latch(Error::InvalidMsg));
+        }
+        self.carry[..tail.len()].copy_from_slice(tail);
+        self.carry_len = tail.len();
+        Ok(())
+    }
+
+    /// The three-valued outcome for the bytes consumed so far.
+    #[inline]
+    fn verdict(&self) -> Result<()> {
         if self.at_boundary() {
             Ok(())
         } else {
@@ -378,7 +481,7 @@ impl IStream {
     /// bytes, feed an empty chunk — `feed(&[], v)` returns `Ok(())` iff the
     /// stream ended at a clean boundary, `Err(Incomplete)` otherwise.
     fn at_boundary(&self) -> bool {
-        self.carry.is_empty() && matches!(self.resume, Resume::None) && self.depth == 0
+        self.carry_len == 0 && matches!(self.resume, Resume::None) && self.depth == 0
     }
 
     /// Parse as many complete fields as possible from `buf`, returning the number
@@ -915,6 +1018,89 @@ mod ceiling_tests {
                 Err(Error::Incomplete),
                 "fixlen subtype {subtype} at FIXLEN_MAX must stay decodable"
             );
+        }
+    }
+
+    /// `CARRY_CAP` is the *derived* bound of §6.6, so it is asserted against the
+    /// widest prefix the parser can actually hand back, not against a literal.
+    ///
+    /// The widest is `ARRAY_FIXLEN`'s: `parse` backs up to `field_start` over the
+    /// header **and** the element count **and** the `fixlen_word`
+    /// (`istream.rs`'s `T_FIXLENARRAY` arm), so three varints have to be
+    /// carryable — a shape §5.1.4's two-varint reservation does not describe.
+    #[test]
+    fn the_carry_holds_the_widest_prefix_the_parser_backs_up_over() {
+        // The widest *reachable* prefix: a 5-byte header (id `ID_MAX`, the
+        // largest a valid header can carry), a 5-byte count (`ARRAY_MAX`, the
+        // largest a valid count can carry), and a `fixlen_word` cut one byte
+        // before its terminator (9 bytes — with ten readable the value is
+        // decided, valid or not).
+        let mut bytes = Vec::new();
+        push_varint(
+            &mut bytes,
+            ((ID_MAX as Unsigned) << 3) | T_FIXLENARRAY as Unsigned,
+        );
+        push_varint(&mut bytes, ARRAY_MAX);
+        bytes.extend_from_slice(&[0x80; MAX_VARINT_LEN - 1]);
+
+        let mut is = IStream::new();
+        assert_eq!(is.feed(&bytes, &mut Sink), Err(Error::Incomplete));
+        assert_eq!(
+            is.carry_len,
+            bytes.len(),
+            "the whole field prefix must be carried"
+        );
+        assert!(
+            bytes.len() <= CARRY_CAP,
+            "CARRY_CAP ({CARRY_CAP}) is below the widest carryable prefix ({})",
+            bytes.len()
+        );
+    }
+
+    /// The same bound as a property: over a corpus covering every wire type,
+    /// fed at every split point, the carry never exceeds its fixed capacity —
+    /// and the byte-at-a-time verdict matches the one-shot one.
+    #[test]
+    fn no_split_of_any_message_overruns_the_carry() {
+        let mut messages: Vec<Vec<u8>> = Vec::new();
+        for wire in [
+            T_VARINT_UNSIGNED,
+            T_VARINT_SIGNED,
+            T_FIXLEN,
+            T_VARINTARRAY_UNSIGNED,
+            T_VARINTARRAY_SIGNED,
+            T_FIXLENARRAY,
+            T_SEQUENCE_START,
+            T_SEQUENCE_END,
+        ] {
+            for id in [0u64, 1, 300, 70_000, ID_MAX as Unsigned] {
+                for word in [0u64, 1, 4, 8, 300, 70_000, 1 << 40] {
+                    let mut m = Vec::new();
+                    push_varint(&mut m, (id << 3) | wire as Unsigned);
+                    push_varint(&mut m, word);
+                    m.extend_from_slice(&[0x5A; 16]);
+                    messages.push(m);
+                }
+            }
+        }
+
+        for m in &messages {
+            let one_shot = IStream::new().feed(m, &mut Sink);
+            let mut is = IStream::new();
+            let mut last = Ok(());
+            for i in 0..m.len() {
+                last = is.feed(&m[i..i + 1], &mut Sink);
+                assert!(
+                    is.carry_len <= CARRY_CAP,
+                    "carry grew to {} at byte {i}",
+                    is.carry_len
+                );
+            }
+            // INCOMPLETE is the one verdict that legitimately differs: fed whole,
+            // a message whose trailing bytes are garbage may reject earlier.
+            if one_shot != Err(Error::Incomplete) || last != Err(Error::Incomplete) {
+                assert_eq!(last, one_shot, "chunked verdict differs for {m:02X?}");
+            }
         }
     }
 
