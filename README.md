@@ -53,7 +53,34 @@ use sofab::{OStream, decode};
 
 ### Feature flags
 
-**None — always the full format.**
+**None — always the full format.** Every wire type is compiled in and the scalar
+value type is always 64-bit; there is no footprint profile and no build option
+that narrows either.
+
+One option from the specification is **pinned**: `SOFAB_STRICT_UTF8`
+(CORELIB_PLAN §6.4) is a no-op here, fixed **ON**, and no `utf8_valid` primitive
+is exposed — only byte-container targets need one, and Rust's `str`/`String` is a
+Unicode string type.
+
+- **Encode.** The typed writers `write_str`, `write_blob`, `write_fp32` and
+  `write_fp64` are correct by construction. The byte-level
+  `OStream::write_fixlen` takes arbitrary bytes and validates them against the
+  **subtype** it is given, not just against the length ceiling: `Str` requires
+  valid UTF-8, `Fp32`/`Fp64` exactly 4 / 8 payload bytes. Anything else is
+  `Error::Argument` with nothing written. Put arbitrary bytes in a `blob`
+  (`write_blob`, or `write_fixlen` with `FixlenType::Blob`), which is
+  unconstrained.
+- **Decode.** The corelib hands a `string` field's **raw bytes** to
+  `Visitor::string` and never builds a `String`; generated code materializes it
+  with `core::str::from_utf8`, turning invalid bytes into `Error::InvalidMsg` (the
+  `INVALID` decode outcome). Invalid UTF-8 is **rejected, never replaced** with
+  `U+FFFD` or truncated. Embedded `U+0000` is valid UTF-8 and round-trips
+  byte-exact.
+
+Both halves of the shared `invalid_utf8` negative vectors in
+`assets/test_vectors.json` are exercised by `tests/utf8_tests.rs`:
+`decode_outcome: invalid` on the decode side and
+`encode_outcome: invalid_argument` on the encode side.
 
 ## Why this design
 
@@ -61,38 +88,11 @@ use sofab::{OStream, decode};
 |------|-----|
 | Streaming **out** | `OStream` writes into a caller buffer and hands it to a sink when it fills, so a message can exceed the buffer — down to a `MIN_OUTPUT_BUFFER` of **1 byte**. A `Flush` sink copies the bytes out; a `FlushTake` sink may instead *take* the buffer and return the replacement to write into next. |
 | Streaming **in** | `IStream::feed` takes arbitrarily small chunks and suspends/resumes at any byte boundary; string/blob payloads are delivered incrementally. |
-| Zero unnecessary copies | `decode` parses straight from the input buffer, handing string/blob fields back as borrowed slices; `feed` copies only bytes that straddle a chunk boundary. |
-| Low allocation | Per-field encode/decode allocates nothing; the decoder dispatches into a monomorphized `Visitor` (no `dyn`, no boxing). The encoder's only heap use is the run of held-back sequence headers (see [Sequences](#sequences)), and even that stays inline until you nest more than 8 deep. |
+| Zero unnecessary copies | `decode` parses straight from the input buffer and passes each `string`/`blob` payload through the callback as a piece of that buffer, valid until the callback returns; `feed` copies only the field-header bytes that straddle a chunk boundary. |
+| No allocation | The codec allocates **nothing** after construction — no wire number sizes anything it holds, on either side, on any path. Both codecs size their fixed state when they are built: a 30-byte carry in `IStream`, a 255-id run of held-back sequence headers in `OStream` (see [Sequences](#sequences)). The decoder dispatches into a monomorphized `Visitor` (no `dyn`, no boxing). Pinned by `tests/allocation_tests.rs`. |
 | Raw speed | `unsafe` pointer-advancing varint decode, bulk `copy_from_slice`, native little-endian loads, `#[inline]`/`#[cold]` hot/error split, `opt-level = 3` + fat-LTO. No array falls back to the scalar path element by element: an integer array is written in runs of whole varints under one capacity check, and an `fp32`/`fp64` array — whose payload on a little-endian host *is* the slice's own memory — as a single bulk run. |
 | Type safety | Wire types and value widths live in the type system; array element widths are generic, so an invalid element size is unrepresentable. |
 | Cross-language compatibility | The shared `assets/test_vectors.json` is replayed — the same bytes every other port produces. |
-
-### String validity (strict UTF-8)
-
-A `string` field is UTF-8. Rust's `str`/`String` is a **Unicode string type**,
-so this port is **always strict** — the `SOFAB_STRICT_UTF8` option
-(CORELIB_PLAN §6.4) is a **no-op here, pinned ON**, and there is no primitive to
-expose (only byte-container targets need one):
-
-- **Encode.** The typed writers `write_str`, `write_blob`, `write_fp32` and
-  `write_fp64` are correct by construction. The byte-level
-  `OStream::write_fixlen` takes arbitrary bytes and validates them against the
-  **subtype** it is given, not just against the length ceiling: `Str` requires
-  valid UTF-8, `Fp32`/`Fp64` exactly 4 / 8 payload bytes (§4.6). Anything else is
-  `Error::Argument` (§6.3's `InvalidArgument`) with nothing written. Put
-  arbitrary bytes in a `blob` (`write_blob`, or `write_fixlen` with
-  `FixlenType::Blob`), which is unconstrained.
-- **Decode strictness lives in generated code.** The corelib hands a `string`
-  field's **raw bytes** to `Visitor::string` and never builds a `String`;
-  generated code materializes it with `core::str::from_utf8`, turning invalid
-  bytes into `Error::InvalidMsg` (the `INVALID` decode outcome). Invalid UTF-8 is
-  **rejected, never replaced** with `U+FFFD` or truncated. Embedded `U+0000` is
-  valid UTF-8 and round-trips byte-exact.
-
-Both halves of the shared `invalid_utf8` negative vectors in
-`assets/test_vectors.json` are exercised by `tests/utf8_tests.rs`:
-`decode_outcome: invalid` on the decode side and
-`encode_outcome: invalid_argument` on the encode side.
 
 ## Usage
 
@@ -205,14 +205,14 @@ assert_eq!(&buf[..used], &[0x16, 0x00, 0x2A, 0x07]);
 
 Held-back ids are encoder state, not buffer content, so the bytes never depend on
 the output-buffer size: a pending run survives a flush — including an explicit
-`flush()` between two writes — unchanged. The run is **unbounded** up to
-`MAX_DEPTH` (255), so an all-default sequence is omitted at *every* legal nesting
-depth.
+`flush()` between two writes — unchanged. The run holds `MAX_DEPTH` (255) ids, a
+fixed array sized when the `OStream` is built, so an all-default sequence is
+omitted at *every* legal nesting depth and no depth allocates.
 
-**What it costs.** The hold-back carries a `PendingRun` in a per-message encoder
-and tests it on every field write: **+142 Ir/op (+43%)** against eager framing on
-the `encode: typical message` workload, and 242 Ir/op as shipped against 381 with
-every id sent to the heap.
+**What it costs.** The hold-back carries that run in a per-message encoder and
+tests it on every field write: **204 Ir/op** on the `encode: typical message`
+workload against **131** for eager framing — **+73 Ir/op (+56%)**, measured with
+Callgrind (`benches/run_callgrind.sh`).
 
 ### Deserialize
 
@@ -364,36 +364,42 @@ impl Visitor for Point {
 }
 
 #[derive(Default)]
-struct PointDecoder { m: Point, is: IStream }
+struct PointDecoder { value: Point, is: IStream }   // `value` is assembled incrementally
 
 impl PointDecoder {
-    fn feed(&mut self, chunk: &[u8]) -> Result<(), Error> { self.is.feed(chunk, &mut self.m) }
-    fn finish(mut self) -> Result<Point, Error> { self.feed(&[])?; Ok(self.m) }  // rejects a truncated tail
+    fn feed(&mut self, chunk: &[u8]) -> Result<(), Error> { self.is.feed(chunk, &mut self.value) }
 }
 
 let wire = Point { x: 3, y: 4 }.encode();
 let got = Point::try_decode(&wire).unwrap();   // got.x == 3, got.y == 4
 
 let mut dec = Point::decoder();                // the same object, never fully buffered
+let mut st = Ok(());                           // the outcome so far — there is no finalize step
 for chunk in wire.chunks(1) {                  // any chunk size, down to one byte
-    match dec.feed(chunk) {
+    st = dec.feed(chunk);
+    match st {
         Ok(()) | Err(Error::Incomplete) => {}  // mid-field is not a failure: feed more
         Err(e) => panic!("malformed: {e}"),
     }
 }
-let streamed = dec.finish().unwrap();          // streamed.x == 3, streamed.y == 4
+st.unwrap();                                   // `Ok` at end-of-input == a complete message
+let streamed = dec.value;                      // streamed.x == 3, streamed.y == 4
 ```
 
 Streaming out a generated object through a small buffer is the same
 `serialize()` over an `OStream::with_flush` sink (see
 [Serialize stream](#serialize-stream)); streaming *in* is `decoder()` above,
-which wraps `IStream::feed` — your framing decides when the message is over and
-`finish()` gives the verdict for it.
+which wraps `IStream::feed`. Your framing decides when the message is over, and
+`feed`'s own status is the verdict for the bytes given so far: `Ok` at a clean
+boundary, `Err(Incomplete)` inside a field, `Err(InvalidMsg)` for malformed
+bytes. To probe end-of-input without more bytes, feed an empty chunk.
 
 ## Memory handling
 
-The hot path is allocation-free and **never owns your payload memory** — you own
-the buffers on both sides.
+The codec allocates nothing after construction and **never owns your payload
+memory** — you own the buffers on both sides. **No wire value decides an
+allocation in the codec**: not a length, not a count, not a payload — on the
+one-shot path exactly as on the streaming one.
 
 - **Encode (`OStream`):** you own the `&mut [u8]`; the library never allocates or
   grows an output buffer — not even for the one-shot path, where the caller (or
@@ -409,8 +415,9 @@ the buffers on both sides.
   refused before anything is drained, leaving the stream as it was. To collect
   into a `Vec`, drive a small scratch buffer with an appending flush closure —
   *you* own the `Vec`. The encoder's own memory is the run of held-back sequence
-  ids ([Sequences](#sequences)): eight of them inline, spilling to the heap only
-  if you nest deeper than that.
+  ids ([Sequences](#sequences)): a fixed inline array of `MAX_DEPTH` (255) ids,
+  sized when the `OStream` is built and never grown, so nesting to any legal
+  depth allocates nothing.
 - **`MIN_OUTPUT_BUFFER` = 1.** The smallest output buffer this port accepts **for
   streaming**. It binds every buffer installed *together with a sink* —
   `with_flush`, `buffer_set` on a stream that has one, and a replacement a sink
@@ -438,24 +445,37 @@ the buffers on both sides.
   `blob` payload is copied through it rather than passed to the sink directly. Your
   sink never receives memory it did not get from you.
 - **Decode (`decode` / `IStream` + `Visitor`):** you own the input buffer and it
-  must outlive the call. On the zero-copy `decode` fast path (and self-contained
-  `feed` chunks) string/blob `&[u8]` chunks **borrow** directly from it, valid
-  only during the callback — copy them out (`String::push_str`,
-  `Vec::extend_from_slice`) to keep them. Scalars/floats arrive by value. A
-  payload the transport split across chunks is put back together by
-  `PayloadAcc`, which buffers only while a field is genuinely split and hands a
+  must outlive the call. Values reach you **through the callback**: scalars and
+  floats by value, a `string`/`blob` payload as `(id, total, offset, chunk)` where
+  `chunk` is a piece of the bytes *you* fed. **Whatever the callback receives is
+  valid only until it returns** — on the one-shot `decode` path exactly as on the
+  streaming one — so a caller that keeps a payload copies it out first
+  (`String::push_str`, `Vec::extend_from_slice`). Nothing the decoder produces can
+  be read after the call that delivered it: there is no payload position, no
+  "valid until the next feed", and no build option that reinstates one.
+- **The decoder owns no accumulator.** There is **no library-owned buffer for a
+  chunk-straddling field**: a payload split across `feed` calls is handed over
+  piece by piece, and the storage each piece lands in is yours. `IStream`'s own
+  state is a fixed inline carry of 30 bytes, sized when the decoder is built —
+  enough for the widest field *header* the parser backs up over — and no chunk you
+  feed, however large, is ever copied into it beyond that.
+- **`PayloadAcc` is the static helper layer, not the codec.** It is the
+  reassembly buffer the generated layer uses to rebuild a split payload before
+  validating it (a `String` needs its whole field to be UTF-8-checked), and it
+  allocates on the generated layer's behalf — the caller drives it, the codec
+  never touches it. It buffers only while a field is genuinely split and hands a
   whole-payload chunk straight through, unbuffered and uncopied.
 
 | Buffer | Owner / lifetime |
 |--------|------------------|
 | **Output buffer** | Caller-owned `&mut [u8]`; library never allocates or grows it. With a sink: capacity ≥ `MIN_OUTPUT_BUFFER` (1). |
-| **Input buffer** | Caller-owned; must outlive the call; string/blob slices borrow from it during the callback. |
+| **Input buffer** | Caller-owned; must outlive the call; a `string`/`blob` chunk handed to the callback is a piece of it, valid only until the callback returns. |
 
-This is a **push / visitor** model: values are handed to your `Visitor` as they are
-parsed, so there is no address-stability requirement. The only memory the decoder
-owns is `IStream`'s internal carry `Vec` — the few bytes of an item that straddled
-a chunk boundary; on the encode side it is `OStream`'s run of held-back sequence
-ids, inline up to eight levels and spilling to a `Vec` beyond.
+This is a **push / visitor** model: values are handed to your `Visitor` as they
+are parsed, so there is no address-stability requirement. Both codecs size their
+own state once, when they are built — the decoder's 30-byte carry, the encoder's
+255-id run of held-back sequence headers — and neither allocates again, on any
+path, for any message.
 
 ## Build & test
 
@@ -551,9 +571,9 @@ opposite of how they look:
 SofaBuffers ships **two** Rust corelibs with the same API and the same wire
 format, each built for its target:
 
-- **`corelib-rs` (this crate)** — `std`, heap-using, `opt-level = 3` + fat LTO.
-  For desktop and server workloads where throughput is the goal. Golden reference
-  for the benchmark tools; roughly **1.4× prost throughput** in the arena.
+- **`corelib-rs` (this crate)** — `std`, `opt-level = 3` + fat LTO. For desktop
+  and server workloads where throughput is the goal. Golden reference for the
+  benchmark tools; roughly **1.4× prost throughput** in the arena.
 - **[`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std)** —
   `#![no_std]`, no allocator, `opt-level = "z"` + LTO, size-tuned for bare-metal
   firmware. About **1.4× micropb throughput** at a Cortex-M flash footprint of
@@ -562,7 +582,7 @@ format, each built for its target:
 | | `corelib-rs` (this crate) | `corelib-rs-no-std` |
 |---|---|---|
 | Target | desktop / server | microcontroller / firmware |
-| `std` / allocator | requires `std`, uses the heap | `#![no_std]`, no allocation |
+| `std` / allocator | requires `std`; the codec allocates nothing, the `PayloadAcc` helper does | `#![no_std]`, no allocation anywhere |
 | Release profile | `opt-level = 3`, fat LTO | `opt-level = "z"`, LTO |
 | Optimized for | raw throughput | small `.text` footprint |
 | Configurable format | no — always full | Cargo features trim wire types / value width |

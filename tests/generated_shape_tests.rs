@@ -14,7 +14,7 @@
 //! `generators/rust/backend.go` (`serialize`, both `encode()` shapes §5.1
 //! names: bounded schema → one exactly-sized buffer with no sink; unbounded
 //! schema → a scratch buffer with a flush sink appending into a growing `Vec`;
-//! and the streaming-in half, `decoder()` → `<Name>Decoder` with `feed`/`finish`).
+//! and the streaming-in half, `decoder()` → `<Name>Decoder` with `feed`).
 //! It is a *compile* test first and an assertion test second: if this file stops
 //! building, every crate `sofabgen` emits has stopped building too.
 //!
@@ -115,8 +115,17 @@ impl Visitor for V<'_> {
 
 /// `<Name>Decoder`: the generated reader `decoder()` hands back. `feed` reports
 /// the verdict for the bytes handed in — `Err(Incomplete)` means they ended
-/// mid-field and is not a failure — and `finish` gives the verdict for the
-/// message once the caller's own framing says the input is over.
+/// mid-field and is not a failure — and that status **is** the verdict: §6.0
+/// admits "**No** `finish`/`finalize` step", and §6.1's own worked example spells
+/// the assembled message `dec.value`.
+///
+/// **This deviates from `sofabgen`'s Rust backend as it stands today**, which
+/// emits a `finish(self) -> Result<Name, Error>` here. `finish` is a name outside
+/// §6.1.1's closed set and a finalize step §6.0 forbids, so the pin is written to
+/// the specification rather than to the current emitted text; the generator owes
+/// the same change (`A2-0104`). What it did *not* do is reclassify: the emitted
+/// `finish` fed an empty chunk and passed `Err(Incomplete)` through, so §5.2.4's
+/// specific prohibition was never breached — only the name and the step.
 struct Decoder {
     m: Bounded,
     is: IStream,
@@ -156,15 +165,16 @@ impl Decoder {
         fed
     }
 
-    pub fn finish(mut self) -> Result<Bounded, Error> {
-        if self.inv {
-            return Err(Error::InvalidMsg);
-        }
-        // An empty chunk probes end-of-input without supplying any: Ok only when
-        // nothing is half-read, which is what makes a truncated stream an error
-        // here rather than a silently partial value.
-        self.feed(&[])?;
-        Ok(self.m)
+    /// The message assembled so far (§6.1: "`person = dec.value` — assembled
+    /// incrementally"). There is no verdict here and none is needed: the caller
+    /// already has one from the last `feed`, and asking for the value is not what
+    /// decides whether the bytes were complete (§5.2.4, §6.0).
+    ///
+    /// To probe end-of-input without supplying any bytes, `feed(&[])`: `Ok` only
+    /// when nothing is half-read, which is what makes a truncated stream visible
+    /// rather than a silently partial value.
+    pub fn value(self) -> Bounded {
+        self.m
     }
 }
 
@@ -294,24 +304,34 @@ fn the_generated_decoder_assembles_the_message_from_one_byte_chunks() {
     let wire = m.encode();
 
     let mut dec = Bounded::decoder();
+    let mut st = Ok(());
     for chunk in wire.chunks(1) {
-        match dec.feed(chunk) {
+        st = dec.feed(chunk);
+        match st {
             // Mid-field is not a failure: feed more.
             Ok(()) | Err(Error::Incomplete) => {}
             Err(e) => panic!("malformed: {e}"),
         }
     }
-    let got = dec.finish().unwrap();
+    // `st` is the outcome so far, and at end-of-input that is the verdict —
+    // there is no finalize step to ask (§5.2.4, §6.0).
+    assert_eq!(st, Ok(()));
+    let got = dec.value();
 
     assert_eq!(got.x, m.x);
     assert_eq!(got.tag, m.tag);
 }
 
-/// The caller owns end-of-input, so a tail that stops mid-field is truncation,
-/// and `finish` — not `feed` — is where that becomes an error rather than a
-/// half-filled value.
+/// The caller owns end-of-input, so a tail that stops mid-field is truncation —
+/// and `feed`'s own status is where that shows, not a finalize step (§5.2.4:
+/// "no `finish` step promotes it to an error"; §6.0: "**No** `finish`/`finalize`
+/// step").
+///
+/// The last `feed` already says `Incomplete`; an empty chunk asks the same
+/// question again without supplying any bytes, for a caller whose framing ended
+/// between two `feed` calls.
 #[test]
-fn the_generated_decoder_rejects_a_truncated_message_at_finish() {
+fn the_generated_decoder_reports_a_truncated_message_from_feed() {
     let wire = Bounded {
         x: 1,
         tag: "truncated".into(),
@@ -319,8 +339,17 @@ fn the_generated_decoder_rejects_a_truncated_message_at_finish() {
     .encode();
 
     let mut dec = Bounded::decoder();
-    let _ = dec.feed(&wire[..wire.len() - 1]);
-    assert!(matches!(dec.finish(), Err(Error::Incomplete)));
+    assert!(matches!(
+        dec.feed(&wire[..wire.len() - 1]),
+        Err(Error::Incomplete)
+    ));
+    // The end-of-input probe: still incomplete, and still not INVALID.
+    assert!(matches!(dec.feed(&[]), Err(Error::Incomplete)));
+
+    // The missing byte completes it — a truncated stream was never rejected,
+    // only unfinished.
+    assert_eq!(dec.feed(&wire[wire.len() - 1..]), Ok(()));
+    assert_eq!(dec.value().tag, "truncated");
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +365,8 @@ const README: &str = include_str!("../README.md");
 /// family, and a README that teaches an extra one defeats that as surely as
 /// emitting it would — with the added cost that the reader's code will not
 /// compile against what `sofabgen` actually emits.
+/// Spellings §6.1.1 excludes from the generated-object surface: "the set is
+/// closed. Adapt only casing/idiom, never the words."
 const FORBIDDEN: [&str; 7] = [
     "marshal",
     "unmarshal",
@@ -345,6 +376,14 @@ const FORBIDDEN: [&str; 7] = [
     "decode_from",
     "decode_into",
 ];
+
+/// The step §6.0 rules out by name, on top of §6.1.1's closed set:
+/// "`feed(bytes)` … **No** `finish`/`finalize` step."
+///
+/// Checked as a *call or definition* rather than as a bare word, because saying
+/// there is **no** finalize step is exactly what §9.6 and §5.2.4 ask the README
+/// to say — the prohibition is on teaching the operation, not on naming it.
+const FORBIDDEN_STEPS: [&str; 2] = ["finish", "finalize"];
 
 /// Does `hay` contain `needle` as a whole identifier (so `into_bytes` does not
 /// count as `to_bytes`)?
@@ -388,6 +427,25 @@ fn the_readme_never_teaches_a_name_outside_the_closed_set() {
              surface; the canonical spellings are encode/decode/try_decode/serialize/\
              deserialize/decoder"
         );
+    }
+}
+
+/// §6.0's flat "**No** `finish`/`finalize` step" — the rule `A2-0104` found the
+/// README teaching, and the one the list above did not cover.
+#[test]
+fn the_readme_never_teaches_a_finalize_step() {
+    for name in FORBIDDEN_STEPS {
+        for spelling in [
+            format!("fn {name}("),
+            format!(".{name}("),
+            format!("::{name}("),
+        ] {
+            assert!(
+                !README.contains(&spelling),
+                "README teaches `{spelling}`; §6.0 admits no finish/finalize step — \
+                 `feed`'s own status is the verdict for the bytes so far (§5.2.4)"
+            );
+        }
     }
 }
 
