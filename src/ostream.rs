@@ -1072,7 +1072,7 @@ impl<'a, F: FlushTake<'a>> OStream<'a, F> {
     /// canonical at every legal nesting level (CORELIB_PLAN §6.0.1, "How deep the
     /// hold-back reaches" — only a constrained profile may bound the run shorter
     /// and frame eagerly past the bound). Nothing is allocated for it, at any
-    /// depth: see [`PendingRun`].
+    /// depth: see `PendingRun`.
     ///
     /// ```
     /// use sofab::OStream;
