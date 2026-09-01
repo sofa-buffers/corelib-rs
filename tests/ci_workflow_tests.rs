@@ -67,6 +67,29 @@ fn run_steps(yml: &str) -> Vec<String> {
     out
 }
 
+/// The lines of a top-level block (`key:` at column 0), the key line excluded.
+///
+/// Stops at the next column-0 line, comment or key alike — enough to read
+/// `on:`, which is all this file needs and which no comment interrupts.
+fn top_level_block<'a>(yml: &'a str, key: &str) -> Vec<&'a str> {
+    let header = format!("{key}:");
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in yml.lines() {
+        if indent(line) == 0 && !line.trim().is_empty() {
+            if inside {
+                break;
+            }
+            inside = line.trim_end() == header;
+            continue;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    out
+}
+
 /// Every `cargo …` command line in the workflow, as argument token lists
 /// (the `cargo` token itself dropped).
 fn cargo_invocations(yml: &str) -> Vec<Vec<String>> {
@@ -171,6 +194,76 @@ fn the_optimized_test_leg_runs_the_whole_suite() {
             );
         }
     }
+}
+
+/// The shared-vector suite has to say what it ran (corelib-rs#98): `cargo test`
+/// captures stdout for passing tests, so a run without `--nocapture` states no
+/// vector or check count anywhere in the CI log — a half-copied asset, or a
+/// scenario silently gated out, would then look exactly like a full run.
+#[test]
+fn ci_reports_the_shared_vector_counts() {
+    let reports = cargo_invocations(CI_YML).into_iter().any(|args| {
+        is_test_run(&args)
+            && args.iter().any(|a| a == "--nocapture")
+            && args
+                .windows(2)
+                .any(|w| w[0] == "--test" && w[1] == "vectors_tests")
+    });
+
+    assert!(
+        reports,
+        "no CI job runs the shared vectors with `--nocapture`; the run states \
+         neither how many vectors nor how many checks executed (CORELIB_PLAN \
+         §7.1, §7.2 item 7)"
+    );
+}
+
+/// CORELIB_PLAN §13 asks for CI "on push and PR", and corelib-rs#98 restates it
+/// for the vector suite. Both triggers have to be declared: `pull_request` is
+/// what gates a change before it lands, the push leg is what proves main itself
+/// is green after the merge. *Which* branches the push leg watches is a cost
+/// decision (main only, so an open PR's commits are not built twice) — dropping
+/// either trigger is not, and that is what this pins.
+#[test]
+fn ci_triggers_on_both_push_and_pull_request() {
+    let block = top_level_block(CI_YML, "on");
+    assert!(!block.is_empty(), "the workflow declares no `on:` triggers");
+    let declares = |trigger: &str| {
+        block
+            .iter()
+            .any(|line| line.trim().trim_end_matches(':') == trigger)
+    };
+
+    assert!(
+        declares("pull_request"),
+        "CI does not run on `pull_request`; a change would land unverified \
+         (CORELIB_PLAN §13, corelib-rs#98)"
+    );
+    assert!(
+        declares("push"),
+        "CI does not run on `push`; nothing re-checks main after a merge \
+         (CORELIB_PLAN §13, corelib-rs#98)"
+    );
+}
+
+/// A broken intra-doc link was caught only by `docs.yml`, which runs on push to
+/// main — that is, after the merge that introduced it, with main already red
+/// (`write_sequence_begin_lazy` linking the private `PendingRun` shipped that
+/// way). The same check belongs in the PR gate.
+#[test]
+fn ci_builds_the_docs_with_warnings_denied() {
+    assert!(
+        cargo_invocations(CI_YML)
+            .iter()
+            .any(|args| args.starts_with_tokens(&["doc"])),
+        "no CI job builds rustdoc; a broken intra-doc link surfaces only in the \
+         Pages workflow, after the merge"
+    );
+    assert!(
+        CI_YML.contains("RUSTDOCFLAGS: -D warnings"),
+        "the rustdoc step does not deny warnings, so a broken intra-doc link \
+         stays a warning and the Pages build fails later instead"
+    );
 }
 
 /// Sanity check on the parser itself: the workflow it reads is the real one,
