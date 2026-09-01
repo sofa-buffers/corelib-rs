@@ -173,6 +173,28 @@ fn the_optimized_test_leg_runs_the_whole_suite() {
     }
 }
 
+/// The shared-vector suite has to say what it ran (corelib-rs#98): `cargo test`
+/// captures stdout for passing tests, so a run without `--nocapture` states no
+/// vector or check count anywhere in the CI log — a half-copied asset, or a
+/// scenario silently gated out, would then look exactly like a full run.
+#[test]
+fn ci_reports_the_shared_vector_counts() {
+    let reports = cargo_invocations(CI_YML).into_iter().any(|args| {
+        is_test_run(&args)
+            && args.iter().any(|a| a == "--nocapture")
+            && args
+                .windows(2)
+                .any(|w| w[0] == "--test" && w[1] == "vectors_tests")
+    });
+
+    assert!(
+        reports,
+        "no CI job runs the shared vectors with `--nocapture`; the run states \
+         neither how many vectors nor how many checks executed (CORELIB_PLAN \
+         §7.1, §7.2 item 7)"
+    );
+}
+
 /// Sanity check on the parser itself: the workflow it reads is the real one,
 /// and the extraction finds the steps that are known to be there.
 #[test]

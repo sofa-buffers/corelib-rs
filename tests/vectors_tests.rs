@@ -14,20 +14,51 @@
 //! 4. **chunked-decode** — feed the same bytes one byte at a time, assert identical.
 //! 5. **skip** — for vectors carrying `skip_ids`, a receiver that ignores those
 //!    ids (skipping a `sequence_begin` skips its whole sub-tree) must still
-//!    recover every other field, whole and chunked.
+//!    recover every other field, whole and chunked, and end on a clean message
+//!    boundary.
 //!
 //! Roundtrip (encode → decode) falls out of running (1) and (3) on every vector.
 //!
 //! This build has every wire type and the 64-bit value width compiled in, so all
 //! shared vectors are representable and run (a vector's `requires` tags are kept
 //! only as a sanity check that the file carries them).
+//!
+//! # The skip matrix
+//!
+//! The shared file carries a skip matrix (group `skip/matrix`) plus the axes
+//! beside it (group `skip`): every vector there is a chain of
+//! `[read P] [skipped S] [read unsigned anchor]` rows covering all 100 ordered
+//! pairs of the ten skippable constructs, and the anchor is the detector — a
+//! walk that consumes one byte too few or too many resumes inside the next
+//! field and its value comparison fails. Scenario 5 runs for **every** vector
+//! carrying `skip_ids`, whole and one byte at a time; the chunked variant is
+//! where a resync bug that a single-buffer feed papers over shows up.
+//!
+//! Nothing here is bounded by a fixed size: `skip_ids`, field ids, element
+//! counts and payload lengths are all read straight out of the file into `Vec`s,
+//! and every encode buffer is sized from the vector's own ground truth. The C
+//! harness's fixed `MAXSKIP` silently *truncated* an over-long `skip_ids` list —
+//! the surplus ids were read instead of skipped and the vector still passed,
+//! testing less than it claimed. [`the_loader_carries_the_large_cases_whole`]
+//! pins the sizes the matrix needs so that failure mode cannot come back
+//! quietly.
+//!
+//! Both loops print what they ran — vectors, `requires`-gated vectors, and
+//! individual checks. `cargo test` captures stdout for passing tests, so CI runs
+//! this target once more with `--nocapture` to put those counts in the log.
+//!
+//! # Not covered here
+//!
+//! The file's `sequence_growth` block (CORELIB_PLAN §7.2 item 8) is read by
+//! nothing in this repo yet; the loader ignores unknown top-level blocks, so it
+//! costs nothing to carry. `invalid_utf8` is consumed by `tests/utf8_tests.rs`.
 
 mod common;
 
 use common::{Event, Recorder};
 use serde_json::Value;
 use sofab::ArrayKind;
-use sofab::{Error, FlushTake, IStream, Id, OStream, Signed, Unsigned, Visitor};
+use sofab::{Error, FlushTake, IStream, Id, OStream, Signed, Unsigned, Visitor, ID_MAX};
 
 /// The shared vectors, embedded from the verbatim asset copy.
 ///
@@ -199,10 +230,18 @@ fn i_vec<T: TryFrom<i64>>(vals: &[Value]) -> Vec<T> {
         .collect()
 }
 
-/// Encode `fields[]` into a single buffer, returning the message bytes (without
-/// the reserved framing `offset`).
-fn encode_fields(fields: &[Value], offset: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; 4096];
+/// Encode `fields[]` into a single buffer of exactly `capacity` bytes,
+/// returning the message bytes (without the reserved framing `offset`).
+///
+/// Callers pass the vector's own `serialized.length` rather than a fixed
+/// scratch size: no vector is capped by a constant that a longer one would
+/// silently outgrow (the 130-byte payloads and 130-element arrays of the skip
+/// axes are the current maximum, and the file is free to grow past it), and an
+/// exactly-sized buffer additionally asserts that the encoder reserves no
+/// headroom — its unchecked fast paths must fall back to the byte-at-a-time
+/// ones near the end of the buffer rather than report `BufferFull`.
+fn encode_fields(fields: &[Value], offset: usize, capacity: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; capacity];
     let used = {
         let mut os = OStream::with_offset(&mut buf, offset).unwrap();
         write_fields(&mut os, fields);
@@ -463,6 +502,10 @@ fn decode_with_skip(bytes: &[u8], skip: &[Id]) -> Vec<Event> {
     let mut rec = SkipRecorder::new(skip);
     let mut is = IStream::new();
     is.feed(bytes, &mut rec).expect("skip decode");
+    // "the message is fully consumed": an empty feed is the end-of-message
+    // probe, and errors if the walk left the decoder inside a field.
+    is.feed(&[], &mut rec)
+        .expect("skip decode ended mid-message");
     rec.events
 }
 
@@ -523,7 +566,7 @@ fn trailing_default_array_elements_stay_on_the_wire() {
     );
 
     // Encode: all four elements, count M = 4.
-    let bytes = encode_fields(fields, 0);
+    let bytes = encode_fields(fields, 0, expected_hex.len() / 2);
     assert_eq!(bytes_to_hex(&bytes), expected_hex);
 
     // Decode: the array reports length 4 and yields both trailing zeros.
@@ -556,9 +599,12 @@ fn all_shared_vectors_conform() {
     let vectors = doc["vectors"].as_array().unwrap();
 
     let mut ran = 0;
+    let mut gated = 0;
+    let mut checks = 0;
     for vec in vectors {
         if !vector_supported(&parse_requires(vec)) {
-            continue; // capability disabled in this build — skip per `requires`
+            gated += 1; // capability disabled in this build — skip per `requires`
+            continue;
         }
         ran += 1;
 
@@ -569,7 +615,8 @@ fn all_shared_vectors_conform() {
         let expected_bytes = hex_to_bytes(expected_hex);
 
         // 1. Vector encode: replay fields, bytes must match the ground truth.
-        let encoded = encode_fields(fields, offset);
+        let encoded = encode_fields(fields, offset, offset + expected_bytes.len());
+        checks += 1;
         assert_eq!(
             encoded,
             expected_bytes,
@@ -579,6 +626,7 @@ fn all_shared_vectors_conform() {
 
         // 2. Chunked encode: stream out through tiny flush buffers.
         for &bs in &[1usize, 3, 7] {
+            checks += 1;
             assert_eq!(
                 chunked_encode(fields, bs),
                 expected_bytes,
@@ -588,9 +636,11 @@ fn all_shared_vectors_conform() {
 
         // 3. Vector decode: feed the official bytes, recovered fields must match.
         let want = expected_events(fields);
+        checks += 1;
         assert_eq!(decode(&expected_bytes), want, "[{name}] decode mismatch");
 
         // 4. Chunked decode: one byte at a time yields identical events.
+        checks += 1;
         assert_eq!(
             decode_one_byte_at_a_time(&expected_bytes),
             want,
@@ -598,6 +648,10 @@ fn all_shared_vectors_conform() {
         );
     }
 
+    println!(
+        "shared vectors: {ran} of {} vectors ran ({gated} gated out by `requires`), {checks} checks",
+        vectors.len(),
+    );
     assert!(ran > 0, "no vectors ran");
 }
 
@@ -607,36 +661,61 @@ fn skip_ids_vectors_conform() {
     // skipped `sequence_begin` skips the whole sub-tree) must still recover every
     // other field, in order, without losing decoder sync — including over chunk
     // boundaries.
+    //
+    // It runs for **every** vector carrying `skip_ids`: the 36 `skip/matrix`
+    // vectors (all 100 ordered pairs of skipped-after-read wire types), the 16
+    // `skip` axis vectors (empty and two-varint-byte lengths, fp64 element
+    // width, a three-byte id, the message edges, the last field inside a
+    // sequence), and the older `sequence` / `composite` ones.
     let doc: Value = serde_json::from_str(VECTORS_JSON).unwrap();
     let vectors = doc["vectors"].as_array().unwrap();
 
-    let mut seen = 0;
+    let mut carrying = 0;
+    let mut ran = 0;
+    let mut gated = 0;
+    let mut checks = 0;
+    // How many vectors of each group ran, so the log names the matrix itself
+    // rather than one lump total.
+    let mut by_group: Vec<(&str, usize)> = Vec::new();
     for vec in vectors {
         let skip_ids: Vec<Id> = match vec.get("skip_ids").and_then(Value::as_array) {
-            Some(a) => a.iter().map(|x| x.as_u64().unwrap() as Id).collect(),
-            None => continue,
+            Some(a) => a
+                .iter()
+                .map(|x| Id::try_from(x.as_u64().expect("skip id")).expect("skip id fits `Id`"))
+                .collect(),
+            None => continue, // fields are only ever skipped when `skip_ids` is present
         };
+        carrying += 1;
         if !vector_supported(&parse_requires(vec)) {
+            gated += 1;
             continue;
         }
-        seen += 1;
+        ran += 1;
 
         let name = vec["name"].as_str().unwrap();
+        let group = vec["group"].as_str().unwrap_or("");
+        match by_group.iter_mut().find(|(g, _)| *g == group) {
+            Some((_, n)) => *n += 1,
+            None => by_group.push((group, 1)),
+        }
         let fields = vec["fields"].as_array().unwrap();
         let bytes = hex_to_bytes(vec["serialized"]["hex"].as_str().unwrap());
 
         let want = expected_events_with_skip(fields, &skip_ids);
         // Sanity: the skip set must actually drop something.
+        checks += 1;
         assert!(
             want.len() < expected_events(fields).len(),
             "[{name}] skip_ids dropped nothing",
         );
 
+        checks += 1;
         assert_eq!(
             decode_with_skip(&bytes, &skip_ids),
             want,
             "[{name}] skip decode mismatch",
         );
+        checks += 1;
         assert_eq!(
             decode_with_skip_chunked(&bytes, &skip_ids),
             want,
@@ -644,6 +723,150 @@ fn skip_ids_vectors_conform() {
         );
     }
 
-    // Every shared skip vector is supported in this build.
-    assert!(seen >= 8, "expected the shared skip vectors (saw {seen})");
+    by_group.sort_unstable();
+    let groups: Vec<String> = by_group.iter().map(|(g, n)| format!("{g} {n}")).collect();
+    println!(
+        "skip scenario: {ran} of {carrying} vectors carrying `skip_ids` ran \
+         ({gated} gated out by `requires`), {checks} checks — {}",
+        groups.join(", "),
+    );
+
+    // Every vector carrying `skip_ids` is accounted for: run, or gated out by
+    // `requires` — never dropped on the floor.
+    assert_eq!(ran + gated, carrying, "skip vectors went missing");
+    // This build compiles in every wire type and the 64-bit value width, so
+    // nothing is gated: the whole matrix runs here.
+    assert_eq!(
+        gated, 0,
+        "no vector should be `requires`-gated in this build"
+    );
+
+    // Floors from corelib-c-cpp#160 / corelib-rs#98: the regenerated file has 58
+    // vectors carrying `skip_ids`, 36 of them the matrix and 16 the axes beside
+    // it. A hand-edited or half-copied asset shows up here rather than as a
+    // suite that quietly checks less.
+    let count = |g: &str| {
+        by_group
+            .iter()
+            .find(|(n, _)| *n == g)
+            .map_or(0, |(_, n)| *n)
+    };
+    assert!(
+        count("skip/matrix") >= 36,
+        "expected the full 36-vector skip matrix (saw {})",
+        count("skip/matrix"),
+    );
+    assert!(
+        count("skip") >= 16,
+        "expected the 16 `skip` axis vectors (saw {})",
+        count("skip"),
+    );
+    assert!(
+        carrying >= 58,
+        "expected 58 vectors carrying `skip_ids` (saw {carrying})",
+    );
+}
+
+#[test]
+fn the_loader_carries_the_large_cases_whole() {
+    // Upstream's C harness had a fixed `MAXSKIP` that *truncated* an over-long
+    // `skip_ids` list: the surplus ids were read instead of skipped, so the
+    // vector still passed while testing less than it claimed (fixed in
+    // corelib-c-cpp#160, which now refuses instead). Nothing on this side is
+    // bounded by a constant — `skip_ids`, ids, element counts and payloads are
+    // read into `Vec`s and `u64`s, and the encode buffer is sized from each
+    // vector's own `serialized` length — so the guard this port needs is the
+    // other one: assert the sizes the skip matrix actually depends on are
+    // present *and* carried whole, so a cap introduced later fails loudly here.
+    let doc: Value = serde_json::from_str(VECTORS_JSON).unwrap();
+
+    let mut max_skip_ids = 0;
+    let mut max_id = 0u64;
+    let mut max_elements = 0;
+    let mut max_payload = 0;
+    let mut fp64_arrays = 0;
+    for vec in doc["vectors"].as_array().unwrap() {
+        // Only the skip scenario is at issue here: an id that is skipped, a
+        // payload that is walked past, a count that is stepped over.
+        let Some(skip_ids) = vec.get("skip_ids").and_then(Value::as_array) else {
+            continue;
+        };
+        max_skip_ids = max_skip_ids.max(skip_ids.len());
+        for f in vec["fields"].as_array().unwrap() {
+            max_id = max_id.max(f.get("id").and_then(Value::as_u64).unwrap_or(0));
+            match f["op"].as_str().unwrap() {
+                "array" => {
+                    let values = f["values"].as_array().unwrap();
+                    max_elements = max_elements.max(values.len());
+                    if f["element_type"] == "fp64" {
+                        fp64_arrays += 1;
+                    }
+                }
+                "string" => max_payload = max_payload.max(f["value"].as_str().unwrap().len()),
+                "blob" => {
+                    max_payload = max_payload.max(f["value_hex"].as_str().unwrap().len() / 2);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        max_skip_ids >= 9,
+        "`skip_ids` lists reach 9 entries; the loader saw at most {max_skip_ids} \
+         — a cap is truncating them",
+    );
+    assert!(
+        max_id >= 100_001,
+        "the skip matrix needs three-byte header varints (id 100001); the \
+         loader saw at most {max_id}",
+    );
+    assert!(
+        max_id <= u64::from(ID_MAX),
+        "a vector id exceeds ID_MAX ({ID_MAX}), which `Id` cannot represent",
+    );
+    assert!(
+        max_elements >= 130,
+        "arrays of 130 elements need a two-byte count varint; the loader saw at \
+         most {max_elements}",
+    );
+    assert!(
+        max_payload >= 130,
+        "130-byte payloads need a two-byte `fixlen_word`; the loader saw at most \
+         {max_payload} bytes",
+    );
+    assert!(
+        fp64_arrays > 0,
+        "no fp64 array among the skip vectors — the 8-byte element width is \
+         then unpinned on the skip path",
+    );
+}
+
+#[test]
+fn unknown_top_level_blocks_are_tolerated() {
+    // The asset is copied verbatim from corelib-c-cpp (CORELIB_PLAN §7.1/§8), so
+    // it carries blocks this file does not drive scenarios from. The loader must
+    // ignore them rather than fail or warn: adopting a regenerated file must
+    // never mean editing it down to what is understood here.
+    let doc: Value = serde_json::from_str(VECTORS_JSON).expect("parse test_vectors.json");
+    assert!(
+        doc["vectors"].as_array().is_some_and(|v| !v.is_empty()),
+        "the unread top-level blocks must not affect `vectors`",
+    );
+
+    // Ignoring them is a decision, though, not an oversight — so each one is
+    // named, and a block the shared file grows later fails here until this port
+    // decides whether to run it:
+    //   * `invalid_utf8`    — run, by `tests/utf8_tests.rs`.
+    //   * `sequence_growth` — CORELIB_PLAN §7.2 item 8, not exercised by this
+    //     port yet; corelib-rs#98 leaves it as follow-up work.
+    let driven_here = ["format", "version", "description", "notes", "vectors"];
+    let decided_elsewhere = ["invalid_utf8", "sequence_growth"];
+    for key in doc.as_object().expect("top-level object").keys() {
+        assert!(
+            driven_here.contains(&key.as_str()) || decided_elsewhere.contains(&key.as_str()),
+            "the shared file grew top-level block `{key}`; the loader ignores it, \
+             but decide whether this port should run it (CORELIB_PLAN §7.2)",
+        );
+    }
 }

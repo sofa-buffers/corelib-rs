@@ -54,6 +54,15 @@ jobs:
       - run: cargo build --release --verbose
       - run: cargo test --verbose
 
+      # State what the shared-vector suite ran. `cargo test` captures stdout for
+      # passing tests, so the vector target is replayed with `--nocapture` to put
+      # the vector and check counts — including the 58 vectors carrying
+      # `skip_ids` and the 36-vector skip matrix (CORELIB_PLAN §7.1, §7.2 item 7)
+      # — into the CI log. The step re-runs the binary the line above already
+      # built; it compiles nothing.
+      - name: Shared test vectors (vector and check counts)
+        run: cargo test --test vectors_tests -- --nocapture
+
   # The same suite against the build users actually link against. `cargo test`
   # on its own only ever asserts on the unoptimized artifact, and this port's
   # correctness arguments are optimizer-visible: the varint reader's unchecked
