@@ -1,10 +1,19 @@
 //! Error and result types.
 //!
 //! Mirrors the C `sofab_ret_t` status codes (minus `OK`, which Rust models as
-//! `Ok(())`) and the no_std port's [`Error`], so code moves between the two Rust
-//! crates unchanged. Unlike the no_std crate, this one is `std`, so [`Error`]
-//! also implements [`std::error::Error`] and [`core::fmt::Display`] for use with
-//! `?` in `fn() -> Result<_, Box<dyn Error>>` and friends.
+//! the `Ok` arm) and the no_std port's [`Error`], so code moves between the two
+//! Rust crates unchanged.
+//!
+//! **`INCOMPLETE` is not here, by design.** CORELIB_PLAN §5.2.1 calls it a
+//! first-class decode *outcome* and not an error, and §6.3 keeps the per-`feed`
+//! result ("the three-valued outcome … *not* a code from this table") apart from
+//! this table. It is therefore carried in the success arm, as
+//! [`crate::Status::Incomplete`]; what remains here is what genuinely failed, so
+//! `?` propagates real errors instead of the commonest normal case.
+//!
+//! Unlike the no_std crate, this one is `std`, so [`Error`] also implements
+//! [`std::error::Error`] and [`core::fmt::Display`] for use with `?` in
+//! `fn() -> Result<_, Box<dyn Error>>` and friends.
 
 /// Errors returned by the encoder and decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,18 +34,10 @@ pub enum Error {
     /// invalid UTF-8, …).
     /// Corresponds to `SOFAB_RET_E_INVALID_MSG`.
     ///
-    /// This is distinct from [`Error::Incomplete`]: a truncated message is *not*
-    /// malformed, it is merely unfinished. See MESSAGE_SPEC §7.
+    /// This is distinct from [`crate::Status::Incomplete`]: a truncated message
+    /// is *not* malformed, it is merely unfinished — and it is not an error at
+    /// all, so it never reaches this enum. See MESSAGE_SPEC §7.
     InvalidMsg,
-
-    /// The consumed bytes end **inside** a field — a partial varint (continuation
-    /// bit set with no terminating byte), a fixlen/array payload shorter than
-    /// declared, or an open (unclosed) sequence. This is the third decode outcome
-    /// (MESSAGE_SPEC §7): not an error in the sense of malformed input — the
-    /// caller owns end-of-input and may feed more bytes to complete the message.
-    /// A streaming [`crate::IStream::feed`] returns this whenever a chunk ends
-    /// mid-field; the one-shot [`crate::decode`] returns it for truncated input.
-    Incomplete,
 
     /// A receiver-configured decode limit was exceeded — a dynamic (unbounded)
     /// field carried more than the maximum element count or byte length the
@@ -64,7 +65,6 @@ impl core::fmt::Display for Error {
             Error::Argument => "invalid argument",
             Error::BufferFull => "output buffer full and no flush sink set",
             Error::InvalidMsg => "malformed SofaBuffers message",
-            Error::Incomplete => "incomplete SofaBuffers message (ends mid-field)",
             Error::LimitExceeded => "receiver-configured decode limit exceeded",
         };
         f.write_str(msg)

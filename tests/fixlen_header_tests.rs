@@ -21,7 +21,7 @@
 //! whole-buffer `feed` — so a whole message and the same bytes fed a byte at a
 //! time run the exact same code; this suite exercises both.
 
-use sofab::{Error, FixlenType, IStream, Id, Visitor};
+use sofab::{Error, FixlenType, IStream, Id, Status, Visitor};
 
 /// One header/payload event, recorded in order. A dedicated visitor keeps this
 /// suite's assertions about *ordering* — header before the first payload byte —
@@ -61,7 +61,7 @@ impl Visitor for Rec {
 }
 
 /// Feed `bytes` in one shot; return the three-valued outcome (§7) and every event.
-fn feed(bytes: &[u8]) -> (Result<(), Error>, Vec<Ev>) {
+fn feed(bytes: &[u8]) -> (Result<Status, Error>, Vec<Ev>) {
     let mut rec = Rec::default();
     let mut is = IStream::new();
     let outcome = is.feed(bytes, &mut rec);
@@ -104,7 +104,7 @@ fn header_fires_at_the_length_word_before_any_payload_byte() {
     // though the corelib's own outcome for these bytes is INCOMPLETE.
     let bytes = vec![0x1a, 0x52]; // (10 << 3) | 2 == 0x52
     let (outcome, events) = feed(&bytes);
-    assert_eq!(outcome, Err(Error::Incomplete));
+    assert_eq!(outcome, Ok(Status::Incomplete));
     assert_eq!(events, [Ev::FixlenBegin(3, FixlenType::Str, 10)]);
 }
 
@@ -162,11 +162,11 @@ fn in_bound_string_truncated_at_its_word_still_announces_then_completes() {
     // scalar fixlen field the same way. Truncated at the word, this is
     // INCOMPLETE (payload owed); whole, it decodes with the same single header.
     let (outcome, events) = feed(&[0x1a, 0x52]); // total 10, header only
-    assert_eq!(outcome, Err(Error::Incomplete));
+    assert_eq!(outcome, Ok(Status::Incomplete));
     assert_eq!(events, [Ev::FixlenBegin(3, FixlenType::Str, 10)]);
 
     let (outcome, events) = feed(&string_field(10));
-    assert_eq!(outcome, Ok(()));
+    assert_eq!(outcome, Ok(Status::Complete));
     assert_eq!(
         events,
         [
@@ -183,7 +183,7 @@ fn empty_string_announces_the_header_before_its_zero_length_chunk() {
     // `1a 02`: an empty string. `total == 0` still fires the header — once —
     // ahead of the single empty payload chunk the callback contract promises.
     let (outcome, events) = feed(&[0x1a, 0x02]);
-    assert_eq!(outcome, Ok(()));
+    assert_eq!(outcome, Ok(Status::Complete));
     assert_eq!(
         events,
         [Ev::FixlenBegin(3, FixlenType::Str, 0), Ev::Str(3, 0, 0, 0)]
@@ -194,7 +194,7 @@ fn empty_string_announces_the_header_before_its_zero_length_chunk() {
 fn empty_blob_announces_the_header_with_its_subtype() {
     // `1a 03`: an empty blob. Same shape, subtype `Blob`.
     let (outcome, events) = feed(&[0x1a, 0x03]);
-    assert_eq!(outcome, Ok(()));
+    assert_eq!(outcome, Ok(Status::Complete));
     assert_eq!(
         events,
         [
@@ -213,7 +213,7 @@ fn blob_field_announces_the_blob_subtype() {
     let mut bytes = vec![0x1a, 0x53];
     bytes.resize(2 + 10, 0x00);
     let (outcome, events) = feed(&bytes);
-    assert_eq!(outcome, Ok(()));
+    assert_eq!(outcome, Ok(Status::Complete));
     assert_eq!(
         events,
         [
@@ -233,7 +233,7 @@ fn scalar_fp32_announces_its_header_at_the_length_word() {
     let mut bytes = vec![0x1a, 0x20];
     bytes.resize(2 + 4, 0x00);
     let (outcome, events) = feed(&bytes);
-    assert_eq!(outcome, Ok(()));
+    assert_eq!(outcome, Ok(Status::Complete));
     assert_eq!(
         events,
         [Ev::FixlenBegin(3, FixlenType::Fp32, 4), Ev::Fp32(3)]
@@ -245,7 +245,7 @@ fn scalar_fp32_truncated_at_its_word_is_announced_then_incomplete() {
     // The word arrived and is a legal fp32, so the field is decidable now even
     // though its 4 payload bytes are still owed.
     let (outcome, events) = feed(&[0x1a, 0x20]);
-    assert_eq!(outcome, Err(Error::Incomplete));
+    assert_eq!(outcome, Ok(Status::Incomplete));
     assert_eq!(events, [Ev::FixlenBegin(3, FixlenType::Fp32, 4)]);
 }
 
@@ -279,7 +279,7 @@ fn scalar_fp64_announces_its_header_at_the_length_word() {
     let mut bytes = vec![0x1a, 0x41];
     bytes.resize(2 + 8, 0x00);
     let (outcome, events) = feed(&bytes);
-    assert_eq!(outcome, Ok(()));
+    assert_eq!(outcome, Ok(Status::Complete));
     assert_eq!(
         events,
         [Ev::FixlenBegin(3, FixlenType::Fp64, 8), Ev::Fp64(3)]
@@ -295,7 +295,7 @@ fn fixlen_array_elements_do_not_fire_the_scalar_header() {
     let mut bytes = vec![0x05, 0x02, 0x20];
     bytes.resize(3 + 8, 0x00);
     let (outcome, events) = feed(&bytes);
-    assert_eq!(outcome, Ok(()));
+    assert_eq!(outcome, Ok(Status::Complete));
     assert!(
         !events.iter().any(|e| matches!(e, Ev::FixlenBegin(..))),
         "array elements must not fire the scalar fixlen header: {events:?}",

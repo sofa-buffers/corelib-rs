@@ -14,8 +14,11 @@
 //!   per-byte bounds check and no per-byte overflow check: only the tenth byte
 //!   can overflow a `u64`, so that is the only one tested.
 //! * **Fewer than ten bytes** — [`read_varint_tail`], a checked byte loop that
-//!   can stop and report [`Error::Incomplete`] so the streaming decoder can
-//!   carry the partial bytes into the next chunk.
+//!   can stop and report "ran out of bytes" (`Ok(None)`) so the streaming decoder
+//!   can carry the partial bytes into the next chunk. Running out is not an
+//!   error — it is the truncation outcome (CORELIB_PLAN §5.2.1) — so it travels
+//!   in the success arm here too, the same split the public
+//!   [`crate::Status`]/[`Error`] pair makes.
 //!
 //! The encode side mirrors it: [`write_varint_unchecked`] fills a caller-checked
 //! run of at least [`MAX_VARINT_LEN`] bytes with no per-byte bookkeeping.
@@ -63,16 +66,16 @@ const KEEP7: [u64; 9] = {
 
 /// Read one base-128 varint from `buf` starting at `*pos`.
 ///
-/// * `Ok(v)` — a full varint was decoded; `*pos` advanced past it.
-/// * `Err(Incomplete)` — `buf` ends mid-varint; `*pos` is left unchanged so the
-///   caller can carry the partial bytes to the next chunk. This is the
-///   truncation outcome, not a rejection (MESSAGE_SPEC §7).
+/// * `Ok(Some(v))` — a full varint was decoded; `*pos` advanced past it.
+/// * `Ok(None)` — `buf` ends mid-varint; `*pos` is left unchanged so the caller
+///   can carry the partial bytes to the next chunk. This is the truncation
+///   outcome, not a rejection (MESSAGE_SPEC §7), so it is *not* an error.
 /// * `Err(InvalidMsg)` — the varint is longer than [`Unsigned`] allows.
 #[inline(always)]
-pub(crate) fn read_varint(buf: &[u8], pos: &mut usize) -> Result<Unsigned> {
+pub(crate) fn read_varint(buf: &[u8], pos: &mut usize) -> Result<Option<Unsigned>> {
     let start = *pos;
     if start >= buf.len() {
-        return Err(Error::Incomplete);
+        return Ok(None);
     }
     // SAFETY: `start < buf.len()`, checked above.
     let b0 = unsafe { *buf.get_unchecked(start) };
@@ -80,19 +83,23 @@ pub(crate) fn read_varint(buf: &[u8], pos: &mut usize) -> Result<Unsigned> {
         // Single-byte varint: every field id below 16, every value below 128,
         // every element count below 128, every sequence marker.
         *pos = start + 1;
-        return Ok(b0 as Unsigned);
+        return Ok(Some(b0 as Unsigned));
     }
     if buf.len() - start >= MAX_VARINT_LEN {
         // SAFETY: at least `MAX_VARINT_LEN` bytes are readable from `start`.
-        unsafe { read_varint_wide(buf.as_ptr().add(start), start, pos) }
+        unsafe { read_varint_wide(buf.as_ptr().add(start), start, pos).map(Some) }
     } else {
         // The tail returns its length rather than writing the cursor back: it is
         // the one varint path the optimizer may leave outlined, and handing it a
         // `&mut` to the caller's cursor would pin that cursor to the stack for
         // every varint in the message.
-        let (value, len) = read_varint_tail(buf, start)?;
-        *pos = start + len;
-        Ok(value)
+        match read_varint_tail(buf, start)? {
+            Some((value, len)) => {
+                *pos = start + len;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -180,10 +187,11 @@ unsafe fn read_varint_wide(p: *const u8, start: usize, pos: &mut usize) -> Resul
 /// [`read_varint_wide`]'s job, and that is where — and only where — the 64-bit
 /// bound is enforced. At most nine bytes are readable here, so `shift` tops out
 /// at 56 and no byte this loop reads can overflow the value; a run of
-/// continuations that reaches the end of the buffer is [`Error::Incomplete`],
-/// because the byte that terminates it may still arrive in the next chunk.
+/// continuations that reaches the end of the buffer is `Ok(None)` — truncation,
+/// not an error — because the byte that terminates it may still arrive in the
+/// next chunk.
 #[inline]
-fn read_varint_tail(buf: &[u8], start: usize) -> Result<(Unsigned, usize)> {
+fn read_varint_tail(buf: &[u8], start: usize) -> Result<Option<(Unsigned, usize)>> {
     debug_assert!(
         buf.len() - start < MAX_VARINT_LEN,
         "a full-width varint run belongs to read_varint_wide"
@@ -196,11 +204,11 @@ fn read_varint_tail(buf: &[u8], start: usize) -> Result<(Unsigned, usize)> {
         i += 1;
         value |= ((byte & 0x7F) as Unsigned) << shift;
         if byte & 0x80 == 0 {
-            return Ok((value, i - start));
+            return Ok(Some((value, i - start)));
         }
         shift += 7;
     }
-    Err(Error::Incomplete)
+    Ok(None)
 }
 
 /// Spread the low 56 bits of `x` into eight 7-bit groups, one per byte — the
@@ -324,16 +332,17 @@ mod tests {
 
     /// `read_varint` takes the tail path only when fewer than `MAX_VARINT_LEN`
     /// bytes are readable, so hand it a buffer that is exactly the varint.
-    fn decode_via_tail(bytes: &[u8]) -> Result<(Unsigned, usize)> {
+    fn decode_via_tail(bytes: &[u8]) -> Result<Option<(Unsigned, usize)>> {
         assert!(
             bytes.len() < MAX_VARINT_LEN,
             "that buffer takes the wide path"
         );
         let mut pos = 0;
         let value = read_varint(bytes, &mut pos)?;
+        let reached = value.map(|v| (v, pos));
         let direct = read_varint_tail(bytes, 0);
-        assert_eq!(direct, Ok((value, pos)), "tail and read_varint disagree");
-        Ok((value, pos))
+        assert_eq!(direct, Ok(reached), "tail and read_varint disagree");
+        Ok(reached)
     }
 
     /// Every length the tail can be handed — 1..=`MAX_VARINT_LEN` − 1 — decodes.
@@ -345,14 +354,15 @@ mod tests {
             let value = widest_in(len);
             let bytes = encode(value);
             assert_eq!(bytes.len(), len as usize);
-            assert_eq!(decode_via_tail(&bytes), Ok((value, len as usize)));
+            assert_eq!(decode_via_tail(&bytes), Ok(Some((value, len as usize))));
         }
         // The widest nine-byte varint carries 63 payload bits.
         assert_eq!(widest_in(9), (1 << 63) - 1);
     }
 
-    /// A varint cut short is `Incomplete` — the truncation outcome — and the
-    /// cursor stays put so the streaming decoder can carry the bytes forward.
+    /// A varint cut short reports truncation — `Ok(None)`, not an error — and
+    /// the cursor stays put so the streaming decoder can carry the bytes
+    /// forward.
     #[test]
     fn tail_reports_incomplete_for_every_truncation() {
         for len in 2..MAX_VARINT_LEN as u32 {
@@ -360,9 +370,9 @@ mod tests {
             for cut in 1..bytes.len() {
                 let head = &bytes[..cut];
                 let mut pos = 0;
-                assert_eq!(read_varint(head, &mut pos), Err(Error::Incomplete));
+                assert_eq!(read_varint(head, &mut pos), Ok(None));
                 assert_eq!(pos, 0);
-                assert_eq!(read_varint_tail(head, 0), Err(Error::Incomplete));
+                assert_eq!(read_varint_tail(head, 0), Ok(None));
             }
         }
     }
@@ -373,9 +383,9 @@ mod tests {
     #[test]
     fn tail_defers_a_run_of_continuations() {
         let all_continue = [0x80u8; MAX_VARINT_LEN - 1];
-        assert_eq!(read_varint_tail(&all_continue, 0), Err(Error::Incomplete));
+        assert_eq!(read_varint_tail(&all_continue, 0), Ok(None));
         let mut pos = 0;
-        assert_eq!(read_varint(&all_continue, &mut pos), Err(Error::Incomplete));
+        assert_eq!(read_varint(&all_continue, &mut pos), Ok(None));
     }
 
     /// The 64-bit bound is enforced in exactly one place — the wide path — and
@@ -386,7 +396,7 @@ mod tests {
         assert_eq!(ten.len(), MAX_VARINT_LEN);
         assert_eq!(ten[MAX_VARINT_LEN - 1], 0x01);
         let mut pos = 0;
-        assert_eq!(read_varint(&ten, &mut pos), Ok(Unsigned::MAX));
+        assert_eq!(read_varint(&ten, &mut pos), Ok(Some(Unsigned::MAX)));
         assert_eq!(pos, MAX_VARINT_LEN);
 
         for tenth in [0x02u8, 0x7F, 0x80, 0xFF] {

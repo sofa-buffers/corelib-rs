@@ -4,7 +4,7 @@
 mod common;
 
 use common::{Event, Recorder};
-use sofab::{ArrayKind, IStream, OStream};
+use sofab::{ArrayKind, IStream, OStream, Status};
 
 fn roundtrip<F: FnOnce(&mut OStream)>(f: F) -> Vec<Event> {
     let mut buf = [0u8; 256];
@@ -15,7 +15,11 @@ fn roundtrip<F: FnOnce(&mut OStream)>(f: F) -> Vec<Event> {
     };
     let mut rec = Recorder::new();
     let mut is = IStream::new();
-    is.feed(&buf[..used], &mut rec).expect("decode failed");
+    assert_eq!(
+        is.feed(&buf[..used], &mut rec),
+        Ok(Status::Complete),
+        "decode failed"
+    );
     rec.events
 }
 

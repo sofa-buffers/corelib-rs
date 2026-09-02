@@ -14,7 +14,7 @@
 #![allow(clippy::identity_op)]
 
 use sofab::{
-    decode, ArrayKind, Error, FixlenType, IStream, Id, OStream, Signed, Unsigned, Visitor,
+    decode, ArrayKind, Error, FixlenType, IStream, Id, OStream, Signed, Status, Unsigned, Visitor,
 };
 
 #[derive(Debug, PartialEq, Clone)]
@@ -66,22 +66,30 @@ impl Visitor for Rec {
 /// a tolerance.
 fn events(bytes: &[u8]) -> Vec<Event> {
     let mut one_shot = Rec::default();
-    decode(bytes, &mut one_shot).expect("well-formed input must decode");
+    assert_eq!(
+        decode(bytes, &mut one_shot),
+        Ok(Status::Complete),
+        "well-formed input must decode"
+    );
 
     let mut chunked = Rec::default();
     let mut is = IStream::new();
-    let mut last = Ok(());
+    let mut last = Ok(Status::Complete);
     for b in bytes {
         // Every byte but the final one leaves the decoder mid-message, which is
         // `Incomplete` — an outcome, not an error (§5.2). Only the last one has
         // to complete.
         last = is.feed(&[*b], &mut chunked);
         assert!(
-            matches!(last, Ok(()) | Err(Error::Incomplete)),
+            matches!(last, Ok(Status::Complete) | Ok(Status::Incomplete)),
             "byte-at-a-time feed reported {last:?}"
         );
     }
-    assert_eq!(last, Ok(()), "the last byte must complete the message");
+    assert_eq!(
+        last,
+        Ok(Status::Complete),
+        "the last byte must complete the message"
+    );
     assert_eq!(one_shot.ev, chunked.ev, "the two decode paths disagreed");
     one_shot.ev
 }

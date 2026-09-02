@@ -18,7 +18,7 @@
 mod common;
 
 use common::{Event, Recorder};
-use sofab::{decode, Error, FixlenType, Id, OStream, Result, ID_MAX};
+use sofab::{decode, Error, FixlenType, Id, OStream, Result, Status, ID_MAX};
 
 /// One public writer, applied to a caller-chosen id.
 type Writer = fn(&mut OStream, Id) -> Result<()>;
@@ -174,7 +174,11 @@ fn every_writer_accepts_id_max_itself() {
         assert!(used >= 5, "{name}: unexpected encoding");
 
         let mut rec = Recorder::new();
-        decode(&buf[..used], &mut rec).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
+        assert_eq!(
+            decode(&buf[..used], &mut rec),
+            Ok(Status::Complete),
+            "{name}: decode failed"
+        );
         assert_eq!(rec.events.first(), Some(&want), "{name}");
     }
 }

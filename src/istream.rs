@@ -39,6 +39,64 @@ const FX_FP64: u8 = FixlenType::Fp64 as u8;
 const FX_STR: u8 = FixlenType::Str as u8;
 const FX_BLOB: u8 = FixlenType::Blob as u8;
 
+/// The decode outcome of one [`IStream::feed`] / [`decode`] call: where the
+/// decoder stands after the bytes it has consumed so far.
+///
+/// CORELIB_PLAN §5.2.1 names three outcomes — `COMPLETE`, `INCOMPLETE`,
+/// `INVALID` — and §5.2.4 makes the returned status *the* answer: there is no
+/// `finish`/`finalize` step and no second accessor to ask again, so the two
+/// cannot drift apart. This port splits the three across `Result`'s two arms:
+///
+/// | outcome | how it arrives |
+/// |---|---|
+/// | `COMPLETE` | `Ok(Status::Complete)` |
+/// | `INCOMPLETE` | `Ok(Status::Incomplete)` |
+/// | `INVALID` | `Err(`[`Error::InvalidMsg`]`)` |
+///
+/// `INCOMPLETE` is **not** an error (§5.2.1) and so lives in the success arm
+/// with `COMPLETE`; `INVALID` is malformed input and rides the error channel
+/// with the `InvalidMessage` code §6.3 pairs it with — as does the terminal
+/// [`Error::LimitExceeded`], for which §6.3 explicitly admits the error channel
+/// as an alternative to a fourth outcome. `?` therefore propagates exactly the
+/// terminal verdicts and leaves the ordinary streaming case — every chunk but
+/// the last — to be matched:
+///
+/// ```
+/// use sofab::{IStream, Status, Visitor};
+/// struct Sink;
+/// impl Visitor for Sink {}
+///
+/// # fn run() -> sofab::Result<()> {
+/// let mut is = IStream::new();
+/// for chunk in [&[0x08u8][..], &[42u8][..]] {
+///     match is.feed(chunk, &mut Sink)? {
+///         Status::Complete => {}   // a valid message may end here
+///         Status::Incomplete => {} // mid-field: feed the next chunk
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// # run().unwrap();
+/// ```
+///
+/// It is `#[must_use]` on purpose: a caller that drops the value has thrown the
+/// verdict away, and there is no second place to get it back from.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Status {
+    /// The consumed bytes end **exactly** at a field boundary with no sequence
+    /// left open: a valid message *may* end here (more valid fields could still
+    /// extend it).
+    Complete,
+
+    /// The consumed bytes end **inside** a field — a partial varint, a
+    /// fixlen/array payload shorter than declared, or an open sequence. Not a
+    /// rejection: the decoder keeps the partial tail, and the caller feeds the
+    /// next chunk to continue. Whether that is acceptable is the caller's call,
+    /// because only the caller knows its framing (§5.2.4).
+    Incomplete,
+}
+
 /// Receives decoded fields from [`IStream`] / [`decode`].
 ///
 /// Every method has a default empty implementation, so an implementor overrides
@@ -316,19 +374,21 @@ impl IStream {
     /// Feed a chunk of encoded bytes, pushing decoded fields to `visitor`.
     ///
     /// Surfaces the three decode outcomes of MESSAGE_SPEC §7 for the bytes
-    /// consumed so far — **there is no separate finalize step**:
+    /// consumed so far — **there is no separate finalize step, and no second
+    /// accessor**: this return value is the whole answer (CORELIB_PLAN §5.2.4).
     ///
-    /// * `Ok(())` — **complete**: the consumed bytes end exactly at a field
-    ///   boundary (a whole, valid message so far).
-    /// * [`Err(Error::Incomplete)`](Error::Incomplete) — the bytes end **inside**
-    ///   a field: a partial varint, a payload shorter than declared, or an open
-    ///   sequence. This is *not* a rejection; the decoder keeps all state
-    ///   internally, so the caller simply feeds the next chunk to continue.
+    /// * `Ok(`[`Status::Complete`]`)` — the consumed bytes end exactly at a
+    ///   field boundary (a whole, valid message so far).
+    /// * `Ok(`[`Status::Incomplete`]`)` — the bytes end **inside** a field: a
+    ///   partial varint, a payload shorter than declared, or an open sequence.
+    ///   This is *not* a rejection and *not* an error (§5.2.1); the decoder
+    ///   keeps all state internally, so the caller simply feeds the next chunk
+    ///   to continue.
     /// * [`Err(Error::InvalidMsg)`](Error::InvalidMsg) — the bytes are malformed
     ///   regardless of what follows and decoding cannot continue.
     ///
-    /// The distinction matters: a truncated tail returns `Incomplete`, never
-    /// `InvalidMsg`. The caller — not the decoder — owns end-of-input.
+    /// The distinction matters: a truncated tail returns `Status::Incomplete`,
+    /// never `InvalidMsg`. The caller — not the decoder — owns end-of-input.
     ///
     /// `InvalidMsg` is **terminal for this decoder** (§5.2, "can more bytes
     /// change it? — no"). Once a `feed` has reported it, every further `feed`
@@ -339,7 +399,7 @@ impl IStream {
     /// bytes must decode to the same outcome fed whole or one byte at a time.
     /// [`reset`](Self::reset) clears the latch and readies the decoder for a new
     /// message.
-    pub fn feed<V: Visitor>(&mut self, chunk: &[u8], visitor: &mut V) -> Result<()> {
+    pub fn feed<V: Visitor>(&mut self, chunk: &[u8], visitor: &mut V) -> Result<Status> {
         if self.invalid {
             return Err(Error::InvalidMsg);
         }
@@ -353,7 +413,7 @@ impl IStream {
             match self.resume_carried(chunk, visitor)? {
                 Some(rest) => rest,
                 // The whole chunk went into the carry: nothing left to parse.
-                None => return self.verdict(),
+                None => return Ok(self.verdict()),
             }
         };
 
@@ -385,7 +445,7 @@ impl IStream {
         if consumed < rest.len() {
             self.stash(&rest[consumed..])?;
         }
-        self.verdict()
+        Ok(self.verdict())
     }
 
     /// Complete the item held in `carry` using the head of `chunk`, and report
@@ -463,25 +523,27 @@ impl IStream {
         Ok(())
     }
 
-    /// The three-valued outcome for the bytes consumed so far.
+    /// The non-terminal half of the three-valued outcome for the bytes consumed
+    /// so far. Only reached once parsing returned without rejecting, so `INVALID`
+    /// is already out of the picture and what is left is where the cursor sits.
     #[inline]
-    fn verdict(&self) -> Result<()> {
+    fn verdict(&self) -> Status {
         if self.at_boundary() {
-            Ok(())
+            Status::Complete
         } else {
             // Ended mid-field / mid-payload / inside an open sequence: distinct
-            // from both COMPLETE (Ok) and INVALID (InvalidMsg). Not a rejection.
-            Err(Error::Incomplete)
+            // from both COMPLETE and INVALID (InvalidMsg). Not a rejection.
+            Status::Incomplete
         }
     }
 
     /// Record a terminal verdict and hand the error straight back.
     ///
     /// Only `InvalidMsg` latches: it is the one outcome §5.2 calls terminal.
-    /// `Incomplete` is not an error on this path (it is derived from
-    /// `at_boundary` after a successful parse), and a receiver-side
-    /// `LimitExceeded` is policy rather than malformation, so neither may
-    /// poison a decoder here.
+    /// `Status::Incomplete` never reaches here at all — it is not an error, and
+    /// is derived from `at_boundary` after a successful parse — and a
+    /// receiver-side `LimitExceeded` is policy rather than malformation, so
+    /// neither may poison a decoder here.
     #[cold]
     fn latch(&mut self, e: Error) -> Error {
         if e == Error::InvalidMsg {
@@ -493,12 +555,14 @@ impl IStream {
     /// True when the decoder sits at a clean message boundary: no half-read
     /// field carried over, no in-progress payload/array, no open sequence.
     ///
-    /// There is deliberately **no** public `finish`/`finalize`: the three-valued
-    /// verdict is obtained solely from [`feed`](Self::feed)'s return value at
-    /// every byte boundary, keeping the decode surface identical across every
-    /// `corelib-*` port (MESSAGE_SPEC §7). To probe end-of-input without more
-    /// bytes, feed an empty chunk — `feed(&[], v)` returns `Ok(())` iff the
-    /// stream ended at a clean boundary, `Err(Incomplete)` otherwise.
+    /// There is deliberately **no** public `finish`/`finalize` and no public
+    /// status accessor: the three-valued verdict is obtained solely from
+    /// [`feed`](Self::feed)'s return value at every byte boundary, so there is
+    /// only one place the answer can come from and nothing to drift out of step
+    /// with it (CORELIB_PLAN §5.2.4, §5.3.1). To probe end-of-input without more
+    /// bytes, feed an empty chunk — `feed(&[], v)` returns
+    /// `Ok(Status::Complete)` iff the stream ended at a clean boundary,
+    /// `Ok(Status::Incomplete)` otherwise.
     fn at_boundary(&self) -> bool {
         self.carry_len == 0 && matches!(self.resume, Resume::None) && self.depth == 0
     }
@@ -529,10 +593,9 @@ impl IStream {
                 return Ok(pos);
             }
             let field_start = pos;
-            let header = match read_varint(buf, &mut pos) {
-                Ok(h) => h,
-                Err(Error::Incomplete) => return Ok(field_start),
-                Err(e) => return Err(e),
+            let header = match read_varint(buf, &mut pos)? {
+                Some(h) => h,
+                None => return Ok(field_start),
             };
             let wire = (header & 0x07) as u8;
             let id_raw = header >> 3;
@@ -542,22 +605,19 @@ impl IStream {
             let id = id_raw as Id;
 
             match wire {
-                T_VARINT_UNSIGNED => match read_varint(buf, &mut pos) {
-                    Ok(val) => v.unsigned(id, val),
-                    Err(Error::Incomplete) => return Ok(field_start),
-                    Err(e) => return Err(e),
+                T_VARINT_UNSIGNED => match read_varint(buf, &mut pos)? {
+                    Some(val) => v.unsigned(id, val),
+                    None => return Ok(field_start),
                 },
-                T_VARINT_SIGNED => match read_varint(buf, &mut pos) {
-                    Ok(zz) => v.signed(id, zigzag_decode(zz)),
-                    Err(Error::Incomplete) => return Ok(field_start),
-                    Err(e) => return Err(e),
+                T_VARINT_SIGNED => match read_varint(buf, &mut pos)? {
+                    Some(zz) => v.signed(id, zigzag_decode(zz)),
+                    None => return Ok(field_start),
                 },
 
                 T_FIXLEN => {
-                    let word = match read_varint(buf, &mut pos) {
-                        Ok(w) => w,
-                        Err(Error::Incomplete) => return Ok(field_start),
-                        Err(e) => return Err(e),
+                    let word = match read_varint(buf, &mut pos)? {
+                        Some(w) => w,
+                        None => return Ok(field_start),
                     };
                     // A scalar fixlen field's declared length is bounded by
                     // `FIXLEN_MAX` (§4.6, §6.2) — the fixlen ceiling, not the
@@ -646,10 +706,9 @@ impl IStream {
                 }
 
                 T_VARINTARRAY_UNSIGNED => {
-                    let count = match read_varint(buf, &mut pos) {
-                        Ok(c) => c,
-                        Err(Error::Incomplete) => return Ok(field_start),
-                        Err(e) => return Err(e),
+                    let count = match read_varint(buf, &mut pos)? {
+                        Some(c) => c,
+                        None => return Ok(field_start),
                     };
                     if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
@@ -661,10 +720,9 @@ impl IStream {
                     }
                 }
                 T_VARINTARRAY_SIGNED => {
-                    let count = match read_varint(buf, &mut pos) {
-                        Ok(c) => c,
-                        Err(Error::Incomplete) => return Ok(field_start),
-                        Err(e) => return Err(e),
+                    let count = match read_varint(buf, &mut pos)? {
+                        Some(c) => c,
+                        None => return Ok(field_start),
                     };
                     if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
@@ -676,10 +734,9 @@ impl IStream {
                     }
                 }
                 T_FIXLENARRAY => {
-                    let count = match read_varint(buf, &mut pos) {
-                        Ok(c) => c,
-                        Err(Error::Incomplete) => return Ok(field_start),
-                        Err(e) => return Err(e),
+                    let count = match read_varint(buf, &mut pos)? {
+                        Some(c) => c,
+                        None => return Ok(field_start),
                     };
                     if count > ARRAY_MAX {
                         return Err(Error::InvalidMsg);
@@ -688,10 +745,9 @@ impl IStream {
                     // when empty (count == 0) — this is what distinguishes an
                     // empty fp32 array from an empty fp64 array on the wire
                     // (§4.8).
-                    let word = match read_varint(buf, &mut pos) {
-                        Ok(w) => w,
-                        Err(Error::Incomplete) => return Ok(field_start),
-                        Err(e) => return Err(e),
+                    let word = match read_varint(buf, &mut pos)? {
+                        Some(w) => w,
+                        None => return Ok(field_start),
                     };
                     // Only fixed-width float subtypes are valid in a fixlen
                     // array; string/blob must use a sequence instead. Subtype
@@ -823,8 +879,8 @@ impl IStream {
         // Tail — inside the last few bytes an element may straddle the chunk.
         while rem > 0 {
             let elem_start = p;
-            match read_varint(buf, &mut p) {
-                Ok(val) => {
+            match read_varint(buf, &mut p)? {
+                Some(val) => {
                     if SIGNED {
                         v.signed(id, zigzag_decode(val));
                     } else {
@@ -832,7 +888,7 @@ impl IStream {
                     }
                     rem -= 1;
                 }
-                Err(Error::Incomplete) => {
+                None => {
                     self.resume = Resume::ArrayInt {
                         id,
                         signed: SIGNED,
@@ -840,7 +896,6 @@ impl IStream {
                     };
                     return Ok(elem_start);
                 }
-                Err(e) => return Err(e),
             }
         }
         Ok(p)
@@ -949,10 +1004,13 @@ unsafe fn emit_fixlen_value<const FP64: bool, V: Visitor>(
 /// no copy. Surfaces the three outcomes of MESSAGE_SPEC §7 — there is no separate
 /// finalize step:
 ///
-/// * `Ok(())` — the buffer is a complete message ending at a field boundary.
-/// * [`Err(Error::Incomplete)`](Error::Incomplete) — the buffer ends inside a
-///   field or with an open sequence (truncated). Not malformed; more bytes would
-///   complete it.
+/// * `Ok(`[`Status::Complete`]`)` — the buffer is a complete message ending at a
+///   field boundary.
+/// * `Ok(`[`Status::Incomplete`]`)` — the buffer ends inside a field or with an
+///   open sequence (truncated). Not malformed and not an error; more bytes would
+///   complete it. A caller that requires a whole message accepts only
+///   `Status::Complete` — that judgement is the caller's, not the decoder's
+///   (§5.2.4).
 /// * [`Err(Error::InvalidMsg)`](Error::InvalidMsg) — the bytes are malformed.
 ///
 /// ```
@@ -964,10 +1022,10 @@ unsafe fn emit_fixlen_value<const FP64: bool, V: Visitor>(
 /// struct Sink(Unsigned);
 /// impl Visitor for Sink { fn unsigned(&mut self, _id: Id, v: Unsigned) { self.0 = v; } }
 /// let mut sink = Sink::default();
-/// decode(&buf[..n], &mut sink).unwrap();
+/// assert_eq!(decode(&buf[..n], &mut sink), Ok(sofab::Status::Complete));
 /// assert_eq!(sink.0, 42);
 /// ```
-pub fn decode<V: Visitor>(buf: &[u8], visitor: &mut V) -> Result<()> {
+pub fn decode<V: Visitor>(buf: &[u8], visitor: &mut V) -> Result<Status> {
     // `feed` itself surfaces all three outcomes for the bytes consumed, so a
     // single feed of the whole buffer is the complete verdict — no separate
     // finish step (which would only re-report the same state).
@@ -1034,7 +1092,7 @@ mod ceiling_tests {
             bytes.extend_from_slice(b"hi");
             assert_eq!(
                 IStream::new().feed(&bytes, &mut Sink),
-                Err(Error::Incomplete),
+                Ok(Status::Incomplete),
                 "fixlen subtype {subtype} at FIXLEN_MAX must stay decodable"
             );
         }
@@ -1063,7 +1121,7 @@ mod ceiling_tests {
         bytes.extend_from_slice(&[0x80; MAX_VARINT_LEN - 1]);
 
         let mut is = IStream::new();
-        assert_eq!(is.feed(&bytes, &mut Sink), Err(Error::Incomplete));
+        assert_eq!(is.feed(&bytes, &mut Sink), Ok(Status::Incomplete));
         assert_eq!(
             is.carry_len,
             bytes.len(),
@@ -1106,7 +1164,7 @@ mod ceiling_tests {
         for m in &messages {
             let one_shot = IStream::new().feed(m, &mut Sink);
             let mut is = IStream::new();
-            let mut last = Ok(());
+            let mut last = Ok(Status::Complete);
             for i in 0..m.len() {
                 last = is.feed(&m[i..i + 1], &mut Sink);
                 assert!(
@@ -1117,7 +1175,7 @@ mod ceiling_tests {
             }
             // INCOMPLETE is the one verdict that legitimately differs: fed whole,
             // a message whose trailing bytes are garbage may reject earlier.
-            if one_shot != Err(Error::Incomplete) || last != Err(Error::Incomplete) {
+            if one_shot != Ok(Status::Incomplete) || last != Ok(Status::Incomplete) {
                 assert_eq!(last, one_shot, "chunked verdict differs for {m:02X?}");
             }
         }

@@ -8,7 +8,7 @@
 //! test suite would notice: every other chunked test hands `feed` memory that
 //! happens to stay alive.
 
-use sofab::{decode, ArrayKind, Error, IStream, Id, OStream, Signed, Unsigned, Visitor};
+use sofab::{decode, ArrayKind, IStream, Id, OStream, Signed, Status, Unsigned, Visitor};
 
 const SCRUB: u8 = 0xA5;
 
@@ -88,12 +88,12 @@ fn wire() -> Vec<u8> {
 fn decode_scrubbing(wire: &[u8], size: usize) -> Message {
     let mut sink = Message::default();
     let mut is = IStream::new();
-    let mut last = Ok(());
+    let mut last = Ok(Status::Complete);
     for piece in wire.chunks(size) {
         let mut owned = piece.to_vec();
         last = is.feed(&owned, &mut sink);
         assert!(
-            matches!(last, Ok(()) | Err(Error::Incomplete)),
+            matches!(last, Ok(Status::Complete) | Ok(Status::Incomplete)),
             "feed reported {last:?}"
         );
         // The chunk's memory is the caller's again the moment `feed` returned.
@@ -103,7 +103,11 @@ fn decode_scrubbing(wire: &[u8], size: usize) -> Message {
         // reliable way to fail than hoping the allocator reuses the page.
         drop(owned);
     }
-    assert_eq!(last, Ok(()), "the final chunk must complete the message");
+    assert_eq!(
+        last,
+        Ok(Status::Complete),
+        "the final chunk must complete the message"
+    );
     sink
 }
 
@@ -112,7 +116,10 @@ fn scrubbing_every_chunk_after_feed_leaves_the_message_unchanged() {
     let wire = wire();
 
     let mut reference = Message::default();
-    IStream::new().feed(&wire, &mut reference).unwrap();
+    assert_eq!(
+        IStream::new().feed(&wire, &mut reference),
+        Ok(Status::Complete)
+    );
 
     // Sanity: the reference actually carries the payloads we are protecting.
     assert_eq!(reference.strings.len(), 2);
@@ -147,7 +154,7 @@ fn a_payload_whole_inside_one_chunk_is_still_copied_out() {
     {
         let mut owned = buf.clone();
         let mut is = IStream::new();
-        is.feed(&owned, &mut sink).unwrap();
+        assert_eq!(is.feed(&owned, &mut sink), Ok(Status::Complete));
         owned.fill(SCRUB);
     }
 
@@ -168,14 +175,17 @@ fn a_payload_whole_inside_one_chunk_is_still_copied_out() {
 fn scrubbing_the_one_shot_buffer_leaves_the_message_unchanged() {
     let reference_wire = wire();
     let mut reference = Message::default();
-    decode(&reference_wire, &mut reference).unwrap();
+    assert_eq!(
+        decode(&reference_wire, &mut reference),
+        Ok(Status::Complete)
+    );
     assert_eq!(reference.strings.len(), 2);
     assert_eq!(reference.blobs.len(), 1);
 
     // A buffer of its own, so the scrub cannot be confused with the reference's.
     let mut owned = wire();
     let mut sink = Message::default();
-    decode(&owned, &mut sink).unwrap();
+    assert_eq!(decode(&owned, &mut sink), Ok(Status::Complete));
     owned.fill(SCRUB);
 
     assert_eq!(

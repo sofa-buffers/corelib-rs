@@ -11,7 +11,7 @@ mod common;
 
 use common::Recorder;
 use serde_json::Value;
-use sofab::{decode, Error, IStream, Id, Visitor};
+use sofab::{decode, Error, IStream, Id, Status, Visitor};
 
 const VECTORS_JSON: &str = include_str!("../assets/test_vectors.json");
 
@@ -57,10 +57,17 @@ fn fast_path_matches_streaming_on_all_vectors() {
         let bytes = hex_to_bytes(vec["serialized"]["hex"].as_str().unwrap());
 
         let mut fast = Recorder::new();
-        decode(&bytes, &mut fast).unwrap_or_else(|e| panic!("[{name}] decode failed: {e}"));
+        assert_eq!(
+            decode(&bytes, &mut fast),
+            Ok(Status::Complete),
+            "[{name}] decode failed"
+        );
 
         let mut streamed = Recorder::new();
-        IStream::new().feed(&bytes, &mut streamed).unwrap();
+        assert_eq!(
+            IStream::new().feed(&bytes, &mut streamed),
+            Ok(Status::Complete)
+        );
 
         assert_eq!(fast.events, streamed.events, "[{name}] fast vs streaming");
     }
@@ -87,7 +94,7 @@ fn strings_delivered_zero_copy_single_call() {
         0x02, 0x62, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x43, 0x6F, 0x75, 0x63, 0x68, 0x21,
     ];
     let mut v = Once::default();
-    decode(&bytes, &mut v).unwrap();
+    assert_eq!(decode(&bytes, &mut v), Ok(Status::Complete));
     assert_eq!(v.calls, 1, "string delivered in exactly one call");
     assert!(v.ok, "whole string delivered at offset 0");
 }
@@ -98,36 +105,39 @@ fn strings_delivered_zero_copy_single_call() {
 /// (the caller simply feeds more).
 #[test]
 fn truncated_input_is_incomplete_not_invalid() {
-    fn dec(bytes: &[u8]) -> Result<(), Error> {
+    fn dec(bytes: &[u8]) -> Result<Status, Error> {
         decode(bytes, &mut Recorder::new())
     }
     // header (id0, unsigned) present, value varint missing.
-    assert_eq!(dec(&[0x00]), Err(Error::Incomplete));
+    assert_eq!(dec(&[0x00]), Ok(Status::Incomplete));
     // string header says 5 bytes, only 2 follow.
-    assert_eq!(dec(&[0x02, 0x2A, 0x41, 0x42]), Err(Error::Incomplete));
+    assert_eq!(dec(&[0x02, 0x2A, 0x41, 0x42]), Ok(Status::Incomplete));
     // sequence opened, never closed.
-    assert_eq!(dec(&[0x0E, 0x00, 0x2A]), Err(Error::Incomplete));
+    assert_eq!(dec(&[0x0E, 0x00, 0x2A]), Ok(Status::Incomplete));
 
     // The streaming decoder reports the same outcome on the bare prefix — it is
     // not accepted (Ok) and not rejected (InvalidMsg): it waits for more.
     let mut sink = Recorder::new();
     assert_eq!(
         IStream::new().feed(&[0x00], &mut sink),
-        Err(Error::Incomplete)
+        Ok(Status::Incomplete)
     );
 }
 
 /// The three decode outcomes (MESSAGE_SPEC §7) are distinct: a lone dangling
-/// continuation byte is Incomplete, an over-long (>64-bit) varint is InvalidMsg,
-/// and a whole message is Complete (`Ok`).
+/// continuation byte is `Status::Incomplete`, an over-long (>64-bit) varint is
+/// `Err(InvalidMsg)`, and a whole message is `Status::Complete`. The first and
+/// the last are both `Ok` — `INCOMPLETE` is not an error (CORELIB_PLAN §5.2.1) —
+/// and it is the returned `Status`, not a second accessor, that tells them
+/// apart.
 #[test]
 fn three_outcomes_are_distinct() {
-    fn dec(bytes: &[u8]) -> Result<(), Error> {
+    fn dec(bytes: &[u8]) -> Result<Status, Error> {
         decode(bytes, &mut Recorder::new())
     }
     // A lone 0x80: a varint header with the continuation bit set and no
     // terminating byte — ends mid-field → INCOMPLETE.
-    assert_eq!(dec(&[0x80]), Err(Error::Incomplete));
+    assert_eq!(dec(&[0x80]), Ok(Status::Incomplete));
 
     // 0x00 header (id0, unsigned) then 11 continuation bytes: the value varint
     // exceeds 64 bits → malformed regardless of what follows → INVALID.
@@ -137,7 +147,7 @@ fn three_outcomes_are_distinct() {
     );
 
     // id0 unsigned = 42, ending exactly at a field boundary → COMPLETE.
-    assert_eq!(dec(&[0x00, 0x2A]), Ok(()));
+    assert_eq!(dec(&[0x00, 0x2A]), Ok(Status::Complete));
 }
 
 /// A receiver-configured decode-limit violation (`LimitExceeded`) is policy, not
@@ -152,15 +162,24 @@ fn limit_exceeded_is_distinct_from_invalid_msg() {
     // fuzzer must never conflate the two.
     assert_ne!(Error::LimitExceeded, Error::InvalidMsg);
 
-    // And distinct from every other decode outcome, too.
-    for other in [
-        Error::Argument,
-        Error::BufferFull,
-        Error::InvalidMsg,
-        Error::Incomplete,
-    ] {
+    // And distinct from every other error code, too.
+    for other in [Error::Argument, Error::BufferFull, Error::InvalidMsg] {
         assert_ne!(Error::LimitExceeded, other);
     }
+
+    // `INCOMPLETE` is no longer in that list because it is not an error code at
+    // all (§5.2.1, §6.3): it arrives on the success arm as `Status::Incomplete`,
+    // so a policy rejection cannot be confused with a merely truncated stream —
+    // the two are not even the same arm of the `Result`.
+    let mut sink = Recorder::new();
+    assert_eq!(
+        IStream::new().feed(&[0x00], &mut sink),
+        Ok(Status::Incomplete)
+    );
+    assert_ne!(
+        Ok(Status::Incomplete),
+        Err::<Status, Error>(Error::LimitExceeded)
+    );
 
     // Its Display text is its own, so logs/telemetry can tell a policy rejection
     // apart from a malformed message.
@@ -178,7 +197,6 @@ fn error_display_and_std_error() {
         Error::Argument,
         Error::BufferFull,
         Error::InvalidMsg,
-        Error::Incomplete,
         Error::LimitExceeded,
     ] {
         let s = format!("{e}");
@@ -193,13 +211,13 @@ fn error_display_and_std_error() {
 fn istream_reset_reuses_decoder() {
     let mut is = IStream::new();
     let mut a = Recorder::new();
-    is.feed(&[0x00, 0x2A], &mut a).unwrap(); // id0 unsigned 42
-    is.feed(&[], &mut a).unwrap(); // clean boundary => Ok
+    assert_eq!(is.feed(&[0x00, 0x2A], &mut a), Ok(Status::Complete)); // id0 unsigned 42
+    assert_eq!(is.feed(&[], &mut a), Ok(Status::Complete)); // clean boundary => Ok
 
     is.reset();
     let mut b = Recorder::new();
-    is.feed(&[0x08, 0x07], &mut b).unwrap(); // id1 unsigned 7
-    is.feed(&[], &mut b).unwrap(); // clean boundary => Ok
+    assert_eq!(is.feed(&[0x08, 0x07], &mut b), Ok(Status::Complete)); // id1 unsigned 7
+    assert_eq!(is.feed(&[], &mut b), Ok(Status::Complete)); // clean boundary => Ok
 
     assert_eq!(a.events.len(), 1);
     assert_eq!(b.events.len(), 1);
@@ -238,7 +256,7 @@ fn large_blob_single_call() {
         }
     }
     let mut v = Cap::default();
-    decode(&bytes, &mut v).unwrap();
+    assert_eq!(decode(&bytes, &mut v), Ok(Status::Complete));
     assert_eq!(v.calls, 1);
     assert_eq!(v.got, data);
 }
@@ -298,9 +316,9 @@ fn an_omitted_sequence_fires_no_callbacks_and_absence_must_be_prepared_for() {
     for path in ["decode", "feed"] {
         let mut rec = common::Recorder::new();
         if path == "decode" {
-            decode(&b, &mut rec).unwrap();
+            assert_eq!(decode(&b, &mut rec), Ok(Status::Complete));
         } else {
-            IStream::new().feed(&b, &mut rec).unwrap();
+            assert_eq!(IStream::new().feed(&b, &mut rec), Ok(Status::Complete));
         }
         assert!(
             rec.events.is_empty(),
@@ -310,7 +328,7 @@ fn an_omitted_sequence_fires_no_callbacks_and_absence_must_be_prepared_for() {
 
     // A, by contrast, delivers the wrapper and both element frames.
     let mut rec = common::Recorder::new();
-    decode(&a, &mut rec).unwrap();
+    assert_eq!(decode(&a, &mut rec), Ok(Status::Complete));
     assert_eq!(
         rec.events,
         [
@@ -344,9 +362,9 @@ fn an_omitted_sequence_fires_no_callbacks_and_absence_must_be_prepared_for() {
     }
 
     let mut reused = Dest::default();
-    decode(&a, &mut reused).unwrap();
+    assert_eq!(decode(&a, &mut reused), Ok(Status::Complete));
     assert_eq!(reused.elems, [10, 11]);
-    decode(&b, &mut reused).unwrap();
+    assert_eq!(decode(&b, &mut reused), Ok(Status::Complete));
     assert_eq!(
         reused.elems,
         [10, 11],
@@ -355,7 +373,7 @@ fn an_omitted_sequence_fires_no_callbacks_and_absence_must_be_prepared_for() {
 
     // §5.1 done right: initialise the destination before applying the message.
     let mut fresh = Dest::default();
-    decode(&b, &mut fresh).unwrap();
+    assert_eq!(decode(&b, &mut fresh), Ok(Status::Complete));
     assert!(
         fresh.elems.is_empty(),
         "absent must reconstruct to the default"

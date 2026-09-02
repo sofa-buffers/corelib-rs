@@ -27,7 +27,7 @@
 mod common;
 
 use common::push_varint;
-use sofab::{decode, Error, IStream, Id, Visitor};
+use sofab::{decode, Error, IStream, Id, Status, Visitor};
 
 /// Wire type `FIXLEN`, and the `Str` / `Blob` subtypes of its length word.
 const T_FIXLEN: u64 = 0x2;
@@ -154,12 +154,12 @@ impl Visitor for PayloadTrace {
 
 /// Feed `msg` in `size`-byte chunks, returning the trace and the final verdict
 /// of the end-of-input probe.
-fn feed_in_chunks(msg: &[u8], size: usize) -> (PayloadTrace, Result<(), Error>) {
+fn feed_in_chunks(msg: &[u8], size: usize) -> (PayloadTrace, Result<Status, Error>) {
     let mut trace = PayloadTrace::default();
     let mut is = IStream::new();
     for chunk in msg.chunks(size) {
         match is.feed(chunk, &mut trace) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("chunk size {size}: corelib rejected a structurally valid frame: {e}"),
         }
     }
@@ -188,7 +188,7 @@ fn an_invalid_sequence_past_the_first_chunk_is_rejected_at_every_chunking() {
         let (trace, verdict) = feed_in_chunks(&msg, size);
         assert_eq!(
             verdict,
-            Ok(()),
+            Ok(Status::Complete),
             "chunk size {size}: message ends at a boundary"
         );
         assert_eq!(trace.id, Some(7), "chunk size {size}");
@@ -234,7 +234,7 @@ fn an_invalid_sequence_past_the_first_chunk_is_rejected_at_every_chunking() {
     let good_msg = fixlen_field(7, FX_STR, &good);
     for size in chunk_sizes(good_msg.len()) {
         let (trace, verdict) = feed_in_chunks(&good_msg, size);
-        assert_eq!(verdict, Ok(()), "chunk size {size}");
+        assert_eq!(verdict, Ok(Status::Complete), "chunk size {size}");
         assert_eq!(trace.bytes, good, "chunk size {size}");
         assert!(
             trace.materialize().is_ok(),
@@ -259,7 +259,7 @@ fn a_validator_that_only_saw_the_first_chunk_would_accept_the_message() {
     let first_cut = header_len + 100; // 100 = 20 × "sofä", a char boundary
     assert_eq!(
         is.feed(&msg[..first_cut], &mut trace),
-        Err(Error::Incomplete)
+        Ok(Status::Incomplete)
     );
 
     assert_eq!(trace.calls, vec![(0, 100)], "one call, at offset 0");
@@ -268,7 +268,7 @@ fn a_validator_that_only_saw_the_first_chunk_would_accept_the_message() {
         "the first chunk is valid UTF-8 on its own — this is why the gap hides"
     );
 
-    assert_eq!(is.feed(&msg[first_cut..], &mut trace), Ok(()));
+    assert_eq!(is.feed(&msg[first_cut..], &mut trace), Ok(Status::Complete));
     let carrier = trace.calls[1..]
         .iter()
         .find(|&&(off, len)| off <= INVALID_AT && INVALID_AT < off + len)
@@ -293,11 +293,11 @@ fn the_verdict_is_the_same_at_every_two_chunk_split() {
         let mut trace = PayloadTrace::default();
         let mut is = IStream::new();
         match is.feed(&msg[..cut], &mut trace) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("cut {cut}: prefix of a valid frame reported {e}"),
         }
         match is.feed(&msg[cut..], &mut trace) {
-            Ok(()) => {}
+            Ok(Status::Complete) => {}
             other => panic!("cut {cut}: completing the message reported {other:?}"),
         }
         assert_eq!(trace.bytes, payload, "cut {cut}");
@@ -314,7 +314,7 @@ fn the_one_shot_path_delivers_the_payload_in_a_single_call() {
     let msg = fixlen_field(7, FX_STR, &payload);
 
     let mut trace = PayloadTrace::default();
-    assert_eq!(decode(&msg, &mut trace), Ok(()));
+    assert_eq!(decode(&msg, &mut trace), Ok(Status::Complete));
     assert_eq!(trace.calls, vec![(0, payload.len())]);
     assert_eq!(trace.materialize(), Err(Error::InvalidMsg));
 }
@@ -329,7 +329,7 @@ fn the_same_late_bytes_in_a_blob_are_delivered_and_never_a_verdict() {
 
     for size in chunk_sizes(msg.len()) {
         let (trace, verdict) = feed_in_chunks(&msg, size);
-        assert_eq!(verdict, Ok(()), "chunk size {size}");
+        assert_eq!(verdict, Ok(Status::Complete), "chunk size {size}");
         assert_eq!(trace.bytes, payload, "chunk size {size}");
     }
 }

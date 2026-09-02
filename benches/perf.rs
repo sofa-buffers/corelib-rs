@@ -162,7 +162,11 @@ impl Visitor for PerfOut {
 
 fn perf_decode(buf: &[u8], out: &mut PerfOut) {
     let mut is = IStream::new();
-    is.feed(buf, out).unwrap();
+    // The status is the whole verdict, so it is checked rather than dropped: one
+    // integer compare per whole-message decode is below this harness's noise
+    // floor, and a workload that quietly stopped mid-message would otherwise
+    // report a flattering number.
+    assert_eq!(is.feed(buf, out).unwrap(), sofab::Status::Complete);
 }
 
 // ---------------------------------------------------------------------------

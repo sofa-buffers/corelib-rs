@@ -85,7 +85,7 @@
 //! ## Example
 //!
 //! ```
-//! use sofab::{OStream, decode, Visitor, Id, Unsigned, Signed};
+//! use sofab::{OStream, decode, Status, Visitor, Id, Unsigned, Signed};
 //!
 //! // --- encode (into a caller buffer; swap in a flush sink to stream out) ---
 //! let mut buf = [0u8; 32];
@@ -104,7 +104,7 @@
 //!     fn signed(&mut self, id: Id, v: Signed) { if id == 2 { self.b = v; } }
 //! }
 //! let mut sink = Sink::default();
-//! decode(&buf[..used], &mut sink).unwrap();
+//! assert_eq!(decode(&buf[..used], &mut sink), Ok(Status::Complete));
 //! assert_eq!((sink.a, sink.b), (42, -7));
 //! ```
 
@@ -118,7 +118,7 @@ mod types;
 mod varint;
 
 pub use error::{Error, Result};
-pub use istream::{decode, IStream, Visitor};
+pub use istream::{decode, IStream, Status, Visitor};
 pub use ostream::{Flush, FlushTake, NoFlush, OStream, SignedElem, UnsignedElem};
 pub use payload::PayloadAcc;
 pub use types::{

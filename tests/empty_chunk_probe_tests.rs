@@ -5,8 +5,8 @@
 //! "did the stream end on a field boundary?". That makes the empty feed a real
 //! entry point with obligations of its own:
 //!
-//! * it answers `Ok(())` **iff** the decoder sits at a boundary, and
-//!   `Err(Incomplete)` from *every* suspended state — mid header varint, mid
+//! * it answers `Ok(Status::Complete)` **iff** the decoder sits at a boundary,
+//!   and `Ok(Status::Incomplete)` from *every* suspended state — mid header varint, mid
 //!   value varint, mid `fixlen_word`, mid string/blob payload, between and inside
 //!   array elements, and inside an open sequence;
 //! * it must be **inert**: no callback may fire for it (in particular no
@@ -23,7 +23,7 @@
 mod common;
 
 use sofab::{
-    decode, ArrayKind, Error, FixlenType, IStream, Id, OStream, Signed, Unsigned, Visitor,
+    decode, ArrayKind, Error, FixlenType, IStream, Id, OStream, Signed, Status, Unsigned, Visitor,
 };
 
 /// One visitor callback, recorded at **chunk** granularity: a payload chunk is
@@ -173,16 +173,20 @@ fn the_probe_reports_incomplete_from_every_suspended_state() {
         let mut ref_is = IStream::new();
         assert_eq!(
             ref_is.feed(&msg[..cut], &mut reference),
-            Err(Error::Incomplete),
+            Ok(Status::Incomplete),
             "{what}: the prefix itself must be INCOMPLETE"
         );
-        assert_eq!(ref_is.feed(&msg[cut..], &mut reference), Ok(()), "{what}");
+        assert_eq!(
+            ref_is.feed(&msg[cut..], &mut reference),
+            Ok(Status::Complete),
+            "{what}"
+        );
 
         let mut calls = Calls::default();
         let mut is = IStream::new();
         assert_eq!(
             is.feed(&msg[..cut], &mut calls),
-            Err(Error::Incomplete),
+            Ok(Status::Incomplete),
             "{what}: the prefix itself must be INCOMPLETE"
         );
         let after_prefix = calls.log.clone();
@@ -192,7 +196,7 @@ fn the_probe_reports_incomplete_from_every_suspended_state() {
         for round in 0..3 {
             assert_eq!(
                 is.feed(&[], &mut calls),
-                Err(Error::Incomplete),
+                Ok(Status::Incomplete),
                 "{what}: probe {round} must report INCOMPLETE"
             );
             assert_eq!(
@@ -204,7 +208,7 @@ fn the_probe_reports_incomplete_from_every_suspended_state() {
         // And the message still completes, byte-identically to the unprobed run.
         assert_eq!(
             is.feed(&msg[cut..], &mut calls),
-            Ok(()),
+            Ok(Status::Complete),
             "{what}: the remainder must complete the message"
         );
         assert_eq!(
@@ -213,7 +217,7 @@ fn the_probe_reports_incomplete_from_every_suspended_state() {
         );
         assert_eq!(
             is.feed(&[], &mut calls),
-            Ok(()),
+            Ok(Status::Complete),
             "{what}: now at a boundary"
         );
     }
@@ -231,13 +235,21 @@ fn the_probe_reports_ok_at_every_boundary() {
 
     let mut calls = Calls::default();
     let mut is = IStream::new();
-    assert_eq!(is.feed(&[], &mut calls), Ok(()), "a fresh decoder");
+    assert_eq!(
+        is.feed(&[], &mut calls),
+        Ok(Status::Complete),
+        "a fresh decoder"
+    );
     assert!(calls.log.is_empty());
 
-    assert_eq!(is.feed(&msg, &mut calls), Ok(()));
+    assert_eq!(is.feed(&msg, &mut calls), Ok(Status::Complete));
     let after = calls.log.clone();
     for _ in 0..3 {
-        assert_eq!(is.feed(&[], &mut calls), Ok(()), "after a whole message");
+        assert_eq!(
+            is.feed(&[], &mut calls),
+            Ok(Status::Complete),
+            "after a whole message"
+        );
         assert_eq!(calls.log, after, "the probe fired a callback");
     }
 
@@ -249,17 +261,17 @@ fn the_probe_reports_ok_at_every_boundary() {
         let mut is = IStream::new();
         for chunk in msg.chunks(1) {
             match is.feed(chunk, &mut calls) {
-                Ok(()) | Err(Error::Incomplete) => {}
+                Ok(Status::Complete) | Ok(Status::Incomplete) => {}
                 Err(e) => panic!("one-byte feed reported {e}"),
             }
             if probe {
                 match is.feed(&[], &mut calls) {
-                    Ok(()) | Err(Error::Incomplete) => {}
+                    Ok(Status::Complete) | Ok(Status::Incomplete) => {}
                     Err(e) => panic!("probe reported {e}"),
                 }
             }
         }
-        assert_eq!(is.feed(&[], &mut calls), Ok(()));
+        assert_eq!(is.feed(&[], &mut calls), Ok(Status::Complete));
         calls.log
     };
     assert_eq!(
@@ -269,7 +281,11 @@ fn the_probe_reports_ok_at_every_boundary() {
     );
 
     let mut empty = Calls::default();
-    assert_eq!(decode(&[], &mut empty), Ok(()), "an all-default message");
+    assert_eq!(
+        decode(&[], &mut empty),
+        Ok(Status::Complete),
+        "an all-default message"
+    );
     assert!(empty.log.is_empty());
 }
 
@@ -285,7 +301,7 @@ fn the_probe_repeats_a_latched_rejection() {
         assert_eq!(is.feed(&[], &mut calls), Err(Error::InvalidMsg));
     }
     is.reset();
-    assert_eq!(is.feed(&[], &mut calls), Ok(()));
+    assert_eq!(is.feed(&[], &mut calls), Ok(Status::Complete));
     assert!(calls.log.is_empty());
 }
 
@@ -304,7 +320,7 @@ fn a_probe_mid_payload_delivers_no_empty_chunk() {
     let mut is = IStream::new();
     assert_eq!(
         is.feed(&msg[..payload_at + 10], &mut calls),
-        Err(Error::Incomplete)
+        Ok(Status::Incomplete)
     );
     assert_eq!(
         calls.log,
@@ -314,10 +330,13 @@ fn a_probe_mid_payload_delivers_no_empty_chunk() {
         ]
     );
 
-    assert_eq!(is.feed(&[], &mut calls), Err(Error::Incomplete));
+    assert_eq!(is.feed(&[], &mut calls), Ok(Status::Incomplete));
     assert_eq!(calls.log.len(), 2, "the probe delivered an empty chunk");
 
-    assert_eq!(is.feed(&msg[payload_at + 10..], &mut calls), Ok(()));
+    assert_eq!(
+        is.feed(&msg[payload_at + 10..], &mut calls),
+        Ok(Status::Complete)
+    );
     assert_eq!(
         calls.log[2],
         Call::Str(1, 200, 10, text.as_bytes()[10..].to_vec()),
@@ -337,7 +356,7 @@ fn an_empty_string_still_gets_its_one_chunk() {
         os.write_blob(2, &[]).unwrap();
     });
     let mut calls = Calls::default();
-    assert_eq!(decode(&msg, &mut calls), Ok(()));
+    assert_eq!(decode(&msg, &mut calls), Ok(Status::Complete));
     assert_eq!(
         calls.log,
         vec![
@@ -353,18 +372,18 @@ fn an_empty_string_still_gets_its_one_chunk() {
     let mut is = IStream::new();
     for chunk in msg.chunks(1) {
         match is.feed(chunk, &mut chunked) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("one-byte feed reported {e}"),
         }
         // A probe after every single byte: inert, so it neither duplicates the
         // zero-length chunk of the empty payloads nor adds one of its own.
         let before = chunked.log.clone();
         match is.feed(&[], &mut chunked) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("probe reported {e}"),
         }
         assert_eq!(chunked.log, before, "a probe fired a callback");
     }
-    assert_eq!(is.feed(&[], &mut chunked), Ok(()));
+    assert_eq!(is.feed(&[], &mut chunked), Ok(Status::Complete));
     assert_eq!(chunked.log, calls.log);
 }

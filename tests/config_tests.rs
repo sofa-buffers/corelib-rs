@@ -3,7 +3,7 @@
 //! (Originally the per-configuration suite; with the feature flags removed
 //! every wire type is always present, so these just run unconditionally.)
 
-use sofab::{ArrayKind, IStream, OStream, Signed, Unsigned, Visitor};
+use sofab::{ArrayKind, IStream, OStream, Signed, Status, Unsigned, Visitor};
 
 #[test]
 fn scalars_roundtrip() {
@@ -30,7 +30,10 @@ fn scalars_roundtrip() {
         os.bytes_used()
     };
     let mut v = V::default();
-    IStream::new().feed(&buf[..used], &mut v).unwrap();
+    assert_eq!(
+        IStream::new().feed(&buf[..used], &mut v),
+        Ok(Status::Complete)
+    );
     assert_eq!(v.u, [(1, 42), (3, 1)]); // boolean decodes as unsigned 1
     assert_eq!(v.s, [(2, -7)]);
 }
@@ -61,7 +64,10 @@ fn wide_value_roundtrips() {
         os.bytes_used()
     };
     let mut v = V::default();
-    IStream::new().feed(&buf[..used], &mut v).unwrap();
+    assert_eq!(
+        IStream::new().feed(&buf[..used], &mut v),
+        Ok(Status::Complete)
+    );
     assert_eq!(v.u, [big]);
 }
 
@@ -115,7 +121,10 @@ fn fixlen_roundtrip() {
         os.bytes_used()
     };
     let mut v = V::default();
-    IStream::new().feed(&buf[..used], &mut v).unwrap();
+    assert_eq!(
+        IStream::new().feed(&buf[..used], &mut v),
+        Ok(Status::Complete)
+    );
     assert_eq!(v.fp32, [(1, 1.5f32.to_bits())]);
     assert_eq!(v.strs, [(2, b"hi".to_vec())]);
     assert_eq!(v.blobs, [(3, vec![9, 8, 7])]);
@@ -139,7 +148,10 @@ fn fp64_roundtrip() {
         os.bytes_used()
     };
     let mut v = V::default();
-    IStream::new().feed(&buf[..used], &mut v).unwrap();
+    assert_eq!(
+        IStream::new().feed(&buf[..used], &mut v),
+        Ok(Status::Complete)
+    );
     assert_eq!(v.fp64, [(1, 2.5f64.to_bits())]);
 }
 
@@ -170,7 +182,10 @@ fn integer_array_roundtrip() {
         os.bytes_used()
     };
     let mut v = V::default();
-    IStream::new().feed(&buf[..used], &mut v).unwrap();
+    assert_eq!(
+        IStream::new().feed(&buf[..used], &mut v),
+        Ok(Status::Complete)
+    );
     assert_eq!(v.begins, [(1, 3), (2, 2)]);
     assert_eq!(v.u, [10, 20, 30]);
     assert_eq!(v.s, [-1, -2]);
@@ -194,7 +209,10 @@ fn float_array_roundtrip() {
         os.bytes_used()
     };
     let mut v = V::default();
-    IStream::new().feed(&buf[..used], &mut v).unwrap();
+    assert_eq!(
+        IStream::new().feed(&buf[..used], &mut v),
+        Ok(Status::Complete)
+    );
     assert_eq!(v.fp32, [1.0f32.to_bits(), 2.0f32.to_bits()]);
 }
 
@@ -225,7 +243,10 @@ fn sequence_roundtrip() {
         os.bytes_used()
     };
     let mut v = V::default();
-    IStream::new().feed(&buf[..used], &mut v).unwrap();
+    assert_eq!(
+        IStream::new().feed(&buf[..used], &mut v),
+        Ok(Status::Complete)
+    );
     assert_eq!(v.frames, [Some(1), None]);
     assert_eq!(v.u, [(2, 99)]);
 }

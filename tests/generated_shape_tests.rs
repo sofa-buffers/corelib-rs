@@ -23,7 +23,7 @@
 //! helpers **and** the streaming `serialize` / `decoder()` path, and §6.1.1
 //! closes the name set they may be spelled with.
 
-use sofab::{Error, IStream, Id, OStream, Unsigned, Visitor};
+use sofab::{Error, IStream, Id, OStream, Status, Unsigned, Visitor};
 
 /// A message whose schema bounds every field: `MAX_SIZE` is derived, one
 /// exactly-sized buffer always holds it, and no sink is installed
@@ -114,8 +114,8 @@ impl Visitor for V<'_> {
 }
 
 /// `<Name>Decoder`: the generated reader `decoder()` hands back. `feed` reports
-/// the verdict for the bytes handed in — `Err(Incomplete)` means they ended
-/// mid-field and is not a failure — and that status **is** the verdict: §6.0
+/// the verdict for the bytes handed in — `Ok(Status::Incomplete)` means they
+/// ended mid-field and is not a failure — and that status **is** the verdict: §6.0
 /// admits "**No** `finish`/`finalize` step", and §6.1's own worked example spells
 /// the assembled message `dec.value`.
 ///
@@ -124,8 +124,8 @@ impl Visitor for V<'_> {
 /// §6.1.1's closed set and a finalize step §6.0 forbids, so the pin is written to
 /// the specification rather than to the current emitted text; the generator owes
 /// the same change (`A2-0104`). What it did *not* do is reclassify: the emitted
-/// `finish` fed an empty chunk and passed `Err(Incomplete)` through, so §5.2.4's
-/// specific prohibition was never breached — only the name and the step.
+/// `finish` fed an empty chunk and passed the `INCOMPLETE` outcome through, so
+/// §5.2.4's specific prohibition was never breached — only the name and the step.
 struct Decoder {
     m: Bounded,
     is: IStream,
@@ -143,7 +143,7 @@ impl Decoder {
         }
     }
 
-    pub fn feed(&mut self, chunk: &[u8]) -> Result<(), Error> {
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Status, Error> {
         let fed = {
             let mut v = V {
                 m: &mut self.m,
@@ -170,9 +170,9 @@ impl Decoder {
     /// already has one from the last `feed`, and asking for the value is not what
     /// decides whether the bytes were complete (§5.2.4, §6.0).
     ///
-    /// To probe end-of-input without supplying any bytes, `feed(&[])`: `Ok` only
-    /// when nothing is half-read, which is what makes a truncated stream visible
-    /// rather than a silently partial value.
+    /// To probe end-of-input without supplying any bytes, `feed(&[])`:
+    /// `Ok(Status::Complete)` only when nothing is half-read, which is what makes
+    /// a truncated stream visible rather than a silently partial value.
     pub fn value(self) -> Bounded {
         self.m
     }
@@ -304,18 +304,18 @@ fn the_generated_decoder_assembles_the_message_from_one_byte_chunks() {
     let wire = m.encode();
 
     let mut dec = Bounded::decoder();
-    let mut st = Ok(());
+    let mut st = Ok(Status::Complete);
     for chunk in wire.chunks(1) {
         st = dec.feed(chunk);
         match st {
             // Mid-field is not a failure: feed more.
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("malformed: {e}"),
         }
     }
     // `st` is the outcome so far, and at end-of-input that is the verdict —
     // there is no finalize step to ask (§5.2.4, §6.0).
-    assert_eq!(st, Ok(()));
+    assert_eq!(st, Ok(Status::Complete));
     let got = dec.value();
 
     assert_eq!(got.x, m.x);
@@ -341,14 +341,14 @@ fn the_generated_decoder_reports_a_truncated_message_from_feed() {
     let mut dec = Bounded::decoder();
     assert!(matches!(
         dec.feed(&wire[..wire.len() - 1]),
-        Err(Error::Incomplete)
+        Ok(Status::Incomplete)
     ));
     // The end-of-input probe: still incomplete, and still not INVALID.
-    assert!(matches!(dec.feed(&[]), Err(Error::Incomplete)));
+    assert!(matches!(dec.feed(&[]), Ok(Status::Incomplete)));
 
     // The missing byte completes it — a truncated stream was never rejected,
     // only unfinished.
-    assert_eq!(dec.feed(&wire[wire.len() - 1..]), Ok(()));
+    assert_eq!(dec.feed(&wire[wire.len() - 1..]), Ok(Status::Complete));
     assert_eq!(dec.value().tag, "truncated");
 }
 
