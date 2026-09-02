@@ -17,7 +17,7 @@
 mod common;
 
 use common::{Event, Recorder};
-use sofab::{Error, IStream, OStream};
+use sofab::{Error, IStream, OStream, Status};
 
 /// Write one field of every kind — scalars, floats, a string, a blob, all three
 /// array flavours and a nested sequence — so a single pass exercises every
@@ -147,19 +147,22 @@ fn an_array_larger_than_the_buffer_streams_out_whole() {
 // --- decoder: a message split across chunks ----------------------------------
 
 /// Feed `msg` in fixed-size chunks and return the events, asserting that every
-/// intermediate outcome is `Ok` or `Incomplete` — never `InvalidMsg`, since a
+/// intermediate outcome is `Complete` or `Incomplete` — never `InvalidMsg`, since a
 /// cut in the middle of a field is truncation, not malformedness (§5.2).
 fn feed_in_chunks(msg: &[u8], size: usize) -> Vec<Event> {
     let mut rec = Recorder::new();
     let mut is = IStream::new();
     for chunk in msg.chunks(size) {
         match is.feed(chunk, &mut rec) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("feed failed at chunk size {size}: {e}"),
         }
     }
-    is.feed(&[], &mut rec)
-        .expect("stream did not end at a boundary");
+    assert_eq!(
+        is.feed(&[], &mut rec),
+        Ok(Status::Complete),
+        "stream did not end at a boundary"
+    );
     rec.events
 }
 
@@ -168,7 +171,7 @@ fn every_chunk_size_decodes_to_the_one_shot_events() {
     let msg = one_shot();
 
     let mut rec = Recorder::new();
-    IStream::new().feed(&msg, &mut rec).unwrap();
+    assert_eq!(IStream::new().feed(&msg, &mut rec), Ok(Status::Complete));
     let reference = rec.events;
 
     // Chunk size 1 suspends and resumes at literally every byte boundary, so
@@ -192,7 +195,7 @@ fn a_truncated_message_is_incomplete_at_every_cut() {
         // Every prefix of a valid message is either a clean field boundary or
         // an unfinished field — never invalid.
         match is.feed(&msg[..cut], &mut rec) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("prefix of length {cut} reported {e}"),
         }
     }

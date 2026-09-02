@@ -5,7 +5,7 @@
 mod common;
 
 use common::{Event, Recorder};
-use sofab::{Error, IStream, OStream};
+use sofab::{IStream, OStream, Status};
 
 #[test]
 fn with_offset_reserves_header_space() {
@@ -64,12 +64,15 @@ fn large_blob_streams_in_small_chunks() {
     for chunk in buf[..used].chunks(7) {
         // Intermediate chunks end mid-payload (Incomplete); that is expected.
         match is.feed(chunk, &mut rec) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("blob stream feed failed: {e}"),
         }
     }
-    is.feed(&[], &mut rec)
-        .expect("blob stream ended mid-message");
+    assert_eq!(
+        is.feed(&[], &mut rec),
+        Ok(Status::Complete),
+        "blob stream ended mid-message"
+    );
     assert_eq!(rec.events, [Event::Blob(7, data)]);
 }
 
@@ -83,7 +86,7 @@ fn default_constructors_work() {
 
     let mut rec = Recorder::new();
     let mut is = IStream::default();
-    is.feed(&buf[..used], &mut rec).unwrap();
+    assert_eq!(is.feed(&buf[..used], &mut rec), Ok(Status::Complete));
     assert_eq!(rec.events, [Event::Unsigned(1, 0)]);
 }
 

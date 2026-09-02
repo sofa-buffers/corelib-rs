@@ -19,7 +19,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use sofab::{decode, Error, FlushTake, IStream, Id, OStream, Unsigned, Visitor, MAX_DEPTH};
+use sofab::{decode, FlushTake, IStream, Id, OStream, Status, Unsigned, Visitor, MAX_DEPTH};
 
 // ---------------------------------------------------------------------------
 // the counting allocator
@@ -284,7 +284,7 @@ fn a_complete_one_shot_decode_allocates_nothing() {
     let used = write_message(&mut buf);
     let mut fold = Fold::default();
     let (calls, bytes, r) = measure(|| decode(&buf[..used], &mut fold));
-    assert_eq!(r, Ok(()));
+    assert_eq!(r, Ok(Status::Complete));
     assert_eq!((calls, bytes), (0, 0), "one-shot decode allocated");
 }
 
@@ -301,13 +301,17 @@ fn a_decode_fed_one_byte_at_a_time_allocates_nothing() {
     let mut fold = Fold::default();
     let (calls, bytes, last) = measure(|| {
         let mut is = IStream::new();
-        let mut last = Ok(());
+        let mut last = Ok(Status::Complete);
         for i in 0..used {
             last = is.feed(&buf[i..i + 1], &mut fold);
         }
         last
     });
-    assert_eq!(last, Ok(()), "the byte-at-a-time feed did not complete");
+    assert_eq!(
+        last,
+        Ok(Status::Complete),
+        "the byte-at-a-time feed did not complete"
+    );
     assert_eq!((calls, bytes), (0, 0), "chunked decode allocated");
 }
 
@@ -326,10 +330,10 @@ fn a_huge_chunk_after_a_split_header_allocates_nothing() {
     let mut fold = Fold::default();
     let (calls, bytes, r) = measure(|| {
         let mut is = IStream::new();
-        assert_eq!(is.feed(&[0x80], &mut fold), Err(Error::Incomplete));
+        assert_eq!(is.feed(&[0x80], &mut fold), Ok(Status::Incomplete));
         is.feed(&big, &mut fold)
     });
-    assert_eq!(r, Ok(()));
+    assert_eq!(r, Ok(Status::Complete));
     assert_eq!(
         (calls, bytes),
         (0, 0),
@@ -373,7 +377,7 @@ fn nothing_a_sender_writes_changes_what_the_decoder_takes() {
         let mut is = IStream::new();
         is.feed(&hostile, &mut fold)
     });
-    assert_eq!(r, Err(Error::Incomplete));
+    assert_eq!(r, Ok(Status::Incomplete));
     assert_eq!((calls, bytes), (0, 0), "a declared length reserved memory");
 }
 

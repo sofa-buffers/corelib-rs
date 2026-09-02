@@ -61,7 +61,7 @@ mod common;
 use common::{Event, Recorder};
 use serde_json::Value;
 use sofab::ArrayKind;
-use sofab::{Error, FlushTake, IStream, Id, OStream, Signed, Unsigned, Visitor, ID_MAX};
+use sofab::{FlushTake, IStream, Id, OStream, Signed, Status, Unsigned, Visitor, ID_MAX};
 
 /// The shared vectors, embedded from the verbatim asset copy.
 ///
@@ -374,7 +374,7 @@ fn expected_events_with_skip(fields: &[Value], skip: &[Id]) -> Vec<Event> {
 fn decode(bytes: &[u8]) -> Vec<Event> {
     let mut rec = Recorder::new();
     let mut is = IStream::new();
-    is.feed(bytes, &mut rec).expect("decode");
+    assert_eq!(is.feed(bytes, &mut rec), Ok(Status::Complete), "decode");
     rec.events
 }
 
@@ -385,11 +385,15 @@ fn decode_one_byte_at_a_time(bytes: &[u8]) -> Vec<Event> {
         // Intermediate chunks legitimately end mid-field (Incomplete); only a
         // genuinely malformed byte is an error.
         match is.feed(&[b], &mut rec) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("chunked decode failed: {e}"),
         }
     }
-    is.feed(&[], &mut rec).expect("stream ended mid-message"); // clean boundary
+    assert_eq!(
+        is.feed(&[], &mut rec),
+        Ok(Status::Complete),
+        "stream ended mid-message"
+    ); // clean boundary
     rec.events
 }
 
@@ -504,11 +508,18 @@ impl Visitor for SkipRecorder<'_> {
 fn decode_with_skip(bytes: &[u8], skip: &[Id]) -> Vec<Event> {
     let mut rec = SkipRecorder::new(skip);
     let mut is = IStream::new();
-    is.feed(bytes, &mut rec).expect("skip decode");
+    assert_eq!(
+        is.feed(bytes, &mut rec),
+        Ok(Status::Complete),
+        "skip decode"
+    );
     // "the message is fully consumed": an empty feed is the end-of-message
     // probe, and errors if the walk left the decoder inside a field.
-    is.feed(&[], &mut rec)
-        .expect("skip decode ended mid-message");
+    assert_eq!(
+        is.feed(&[], &mut rec),
+        Ok(Status::Complete),
+        "skip decode ended mid-message"
+    );
     rec.events
 }
 
@@ -517,11 +528,15 @@ fn decode_with_skip_chunked(bytes: &[u8], skip: &[Id]) -> Vec<Event> {
     let mut is = IStream::new();
     for &b in bytes {
         match is.feed(&[b], &mut rec) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("skip chunked decode failed: {e}"),
         }
     }
-    is.feed(&[], &mut rec).expect("stream ended mid-message"); // clean boundary
+    assert_eq!(
+        is.feed(&[], &mut rec),
+        Ok(Status::Complete),
+        "stream ended mid-message"
+    ); // clean boundary
     rec.events
 }
 

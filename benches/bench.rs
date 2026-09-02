@@ -208,7 +208,9 @@ pub fn run_encode_typical(out: &mut [u8]) -> usize {
 pub fn run_decode_u64_array(wire: &[u8]) -> u64 {
     let mut sink = Checksum::default();
     let mut is = IStream::new();
-    is.feed(black_box(wire), &mut sink).unwrap();
+    // `unwrap` still rejects malformed input; the COMPLETE half of the verdict
+    // is asserted once, outside the timed code, in `self_check`.
+    let _ = is.feed(black_box(wire), &mut sink).unwrap();
     black_box(sink.acc)
 }
 
@@ -217,7 +219,9 @@ pub fn run_decode_u64_array(wire: &[u8]) -> u64 {
 pub fn run_decode_typical(wire: &[u8]) -> u64 {
     let mut sink = Checksum::default();
     let mut is = IStream::new();
-    is.feed(black_box(wire), &mut sink).unwrap();
+    // `unwrap` still rejects malformed input; the COMPLETE half of the verdict
+    // is asserted once, outside the timed code, in `self_check`.
+    let _ = is.feed(black_box(wire), &mut sink).unwrap();
     black_box(sink.acc)
 }
 
@@ -280,7 +284,9 @@ pub fn run_encode_composite(out: &mut [u8]) -> usize {
 pub fn run_decode_composite(wire: &[u8]) -> u64 {
     let mut sink = Checksum::default();
     let mut is = IStream::new();
-    is.feed(black_box(wire), &mut sink).unwrap();
+    // `unwrap` still rejects malformed input; the COMPLETE half of the verdict
+    // is asserted once, outside the timed code, in `self_check`.
+    let _ = is.feed(black_box(wire), &mut sink).unwrap();
     black_box(sink.acc)
 }
 
@@ -301,7 +307,7 @@ impl Visitor for SkipAll {}
 pub fn run_decode_composite_skip(wire: &[u8]) -> bool {
     let mut sink = SkipAll;
     let mut is = IStream::new();
-    black_box(is.feed(black_box(wire), &mut sink).is_ok())
+    black_box(is.feed(black_box(wire), &mut sink) == Ok(sofab::Status::Complete))
 }
 
 /// Prove each workload does the work its row is named after — before any of
@@ -372,12 +378,13 @@ fn self_check(blob: &[u8], blob_wire: &[u8], comp_wire: &[u8]) {
 
     let mut seen = Seen::default();
     let mut is = IStream::new();
-    let mut last = Err(sofab::Error::Incomplete);
+    let mut last = Ok(sofab::Status::Incomplete);
     for chunk in blob_wire.chunks(BLOB_CHUNK) {
         last = is.feed(chunk, &mut seen);
     }
-    assert!(
-        last.is_ok(),
+    assert_eq!(
+        last,
+        Ok(sofab::Status::Complete),
         "chunked blob decode ended {last:?}, not COMPLETE"
     );
     assert_eq!(
@@ -389,9 +396,11 @@ fn self_check(blob: &[u8], blob_wire: &[u8], comp_wire: &[u8]) {
     // the UTF-8 string, four sequences on the wire (field 4 omitted, not
     // framed), and the scalars from the depth-3 nest and the two-byte header.
     let mut seen = Seen::default();
-    IStream::new()
-        .feed(comp_wire, &mut seen)
-        .expect("composite decodes COMPLETE");
+    assert_eq!(
+        IStream::new().feed(comp_wire, &mut seen),
+        Ok(sofab::Status::Complete),
+        "composite decodes COMPLETE"
+    );
     assert_eq!(seen.strings, 65, "composite: wrapper elements + string");
     assert_eq!(
         seen.sequences, 4,
@@ -572,13 +581,13 @@ fn main() {
     let dec_u64 = measure(ba, || {
         let mut sink = Checksum::default();
         let mut is = IStream::new();
-        is.feed(black_box(&u64_buf), &mut sink).unwrap();
+        let _ = is.feed(black_box(&u64_buf), &mut sink).unwrap();
         black_box(sink.acc);
     });
     let dec_typ = measure(bt, || {
         let mut sink = Checksum::default();
         let mut is = IStream::new();
-        is.feed(black_box(&typ_buf), &mut sink).unwrap();
+        let _ = is.feed(black_box(&typ_buf), &mut sink).unwrap();
         black_box(sink.acc);
     });
 
@@ -619,7 +628,7 @@ fn main() {
     let dec_comp = measure(bc, || {
         let mut sink = Checksum::default();
         let mut is = IStream::new();
-        is.feed(black_box(&comp_buf), &mut sink).unwrap();
+        let _ = is.feed(black_box(&comp_buf), &mut sink).unwrap();
         black_box(sink.acc);
     });
     // Written out rather than calling `run_decode_composite_skip`: that entry
@@ -630,7 +639,7 @@ fn main() {
     let dec_comp_skip = measure(bc, || {
         let mut sink = SkipAll;
         let mut is = IStream::new();
-        is.feed(black_box(&comp_buf), &mut sink).unwrap();
+        let _ = is.feed(black_box(&comp_buf), &mut sink).unwrap();
     });
 
     println!("=== SofaBuffers Rust throughput (CPU time, MB/s) ===");

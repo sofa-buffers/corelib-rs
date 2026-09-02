@@ -21,7 +21,7 @@
 mod common;
 
 use common::{push_varint, Event, Recorder};
-use sofab::{decode, ArrayKind, Error, IStream, Id, OStream, Signed, Unsigned, Visitor};
+use sofab::{decode, ArrayKind, Error, IStream, Id, OStream, Signed, Status, Unsigned, Visitor};
 
 /// The skip path: every callback left at its default no-op.
 #[derive(Default)]
@@ -73,11 +73,11 @@ fn one_shot() -> Vec<u8> {
 
 /// Feed `msg` in `size`-byte chunks with a fresh visitor, returning the verdict
 /// of the end-of-input probe.
-fn chunked_verdict<V: Visitor>(msg: &[u8], size: usize, v: &mut V) -> Result<(), Error> {
+fn chunked_verdict<V: Visitor>(msg: &[u8], size: usize, v: &mut V) -> Result<Status, Error> {
     let mut is = IStream::new();
     for chunk in msg.chunks(size) {
         match is.feed(chunk, v) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             e => return e,
         }
     }
@@ -87,14 +87,14 @@ fn chunked_verdict<V: Visitor>(msg: &[u8], size: usize, v: &mut V) -> Result<(),
 #[test]
 fn a_visitor_that_overrides_nothing_walks_every_wire_type() {
     let msg = one_shot();
-    assert_eq!(decode(&msg, &mut Blind), Ok(()));
+    assert_eq!(decode(&msg, &mut Blind), Ok(Status::Complete));
 
     // Every chunk size, so each construct is skipped from every resume state as
     // well as contiguously.
     for size in 1..=msg.len() {
         assert_eq!(
             chunked_verdict(&msg, size, &mut Blind),
-            Ok(()),
+            Ok(Status::Complete),
             "the skip path lost the boundary at chunk size {size}"
         );
     }
@@ -116,7 +116,7 @@ fn the_skip_path_lands_where_the_recording_path_lands_at_every_prefix() {
             "prefix of length {cut}: skipping and recording disagree"
         );
         assert!(
-            matches!(blind, Ok(()) | Err(Error::Incomplete)),
+            matches!(blind, Ok(Status::Complete) | Ok(Status::Incomplete)),
             "prefix of length {cut}: a prefix of a valid message is never invalid"
         );
     }
@@ -140,12 +140,12 @@ fn a_partially_interested_visitor_still_sees_the_fields_after_the_skipped_ones()
     ];
 
     let mut ints = IntegersOnly::default();
-    decode(&msg, &mut ints).unwrap();
+    assert_eq!(decode(&msg, &mut ints), Ok(Status::Complete));
     assert_eq!(ints.seen, want, "one-shot");
 
     for size in 1..=msg.len() {
         let mut ints = IntegersOnly::default();
-        assert_eq!(chunked_verdict(&msg, size, &mut ints), Ok(()));
+        assert_eq!(chunked_verdict(&msg, size, &mut ints), Ok(Status::Complete));
         assert_eq!(ints.seen, want, "chunk size {size}");
     }
 }
@@ -169,17 +169,17 @@ fn a_skipped_string_is_never_utf8_checked() {
     push_varint(&mut msg, 5 << 3); // id 5, unsigned (wire type 0)
     push_varint(&mut msg, 42);
 
-    assert_eq!(decode(&msg, &mut Blind), Ok(()));
+    assert_eq!(decode(&msg, &mut Blind), Ok(Status::Complete));
 
     let mut ints = IntegersOnly::default();
-    decode(&msg, &mut ints).unwrap();
+    assert_eq!(decode(&msg, &mut ints), Ok(Status::Complete));
     assert_eq!(ints.seen, vec![(5, 42)]);
 
     for size in 1..=msg.len() {
         let mut ints = IntegersOnly::default();
         assert_eq!(
             chunked_verdict(&msg, size, &mut ints),
-            Ok(()),
+            Ok(Status::Complete),
             "size {size}"
         );
         assert_eq!(ints.seen, vec![(5, 42)], "chunk size {size}");
@@ -188,7 +188,7 @@ fn a_skipped_string_is_never_utf8_checked() {
     // A visitor that *does* take the bytes gets them verbatim — the corelib
     // neither replaced nor truncated them, it simply never looked.
     let mut rec = Recorder::new();
-    decode(&msg, &mut rec).unwrap();
+    assert_eq!(decode(&msg, &mut rec), Ok(Status::Complete));
     assert_eq!(
         rec.events,
         vec![Event::Str(4, bad.clone()), Event::Unsigned(5, 42)]
@@ -249,12 +249,15 @@ fn array_headers_are_announced_even_when_the_elements_are_skipped() {
     ];
 
     let mut headers = ArrayHeaders::default();
-    decode(&msg, &mut headers).unwrap();
+    assert_eq!(decode(&msg, &mut headers), Ok(Status::Complete));
     assert_eq!(headers.seen, want, "one-shot");
 
     for size in 1..=msg.len() {
         let mut headers = ArrayHeaders::default();
-        assert_eq!(chunked_verdict(&msg, size, &mut headers), Ok(()));
+        assert_eq!(
+            chunked_verdict(&msg, size, &mut headers),
+            Ok(Status::Complete)
+        );
         assert_eq!(headers.seen, want, "chunk size {size}");
     }
 }
@@ -276,6 +279,6 @@ fn a_signed_only_visitor_skips_the_unsigned_side() {
     let msg = one_shot();
     let want = vec![(2, -12345), (8, -1), (8, i64::MIN), (8, 7)];
     let mut only = SignedOnly::default();
-    decode(&msg, &mut only).unwrap();
+    assert_eq!(decode(&msg, &mut only), Ok(Status::Complete));
     assert_eq!(only.seen, want);
 }

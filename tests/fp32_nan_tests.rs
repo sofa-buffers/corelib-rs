@@ -37,7 +37,7 @@
 //! the four **wire bytes** the encoder writes: any widening anywhere on the path
 //! changes them, on every one of those platforms.
 
-use sofab::{decode, IStream, Id, OStream, Visitor};
+use sofab::{decode, IStream, Id, OStream, Status, Visitor};
 
 /// The three payloads §6.5 names, plus the value the hazard destroys first.
 const NANS: [(&str, u32); 4] = [
@@ -66,7 +66,7 @@ impl Visitor for Floats {
 /// Decode `wire` one whole buffer at a time.
 fn one_shot(wire: &[u8]) -> Vec<u32> {
     let mut sink = Floats::default();
-    decode(wire, &mut sink).unwrap();
+    assert_eq!(decode(wire, &mut sink), Ok(Status::Complete));
     sink.bits
 }
 
@@ -74,11 +74,15 @@ fn one_shot(wire: &[u8]) -> Vec<u32> {
 fn byte_at_a_time(wire: &[u8]) -> Vec<u32> {
     let mut sink = Floats::default();
     let mut is = IStream::new();
-    let mut last = Ok(());
+    let mut last = Ok(Status::Complete);
     for i in 0..wire.len() {
         last = is.feed(&wire[i..i + 1], &mut sink);
     }
-    assert_eq!(last, Ok(()), "the chunked feed did not complete");
+    assert_eq!(
+        last,
+        Ok(Status::Complete),
+        "the chunked feed did not complete"
+    );
     sink.bits
 }
 

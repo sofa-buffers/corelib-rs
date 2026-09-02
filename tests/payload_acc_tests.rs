@@ -18,7 +18,7 @@
 mod common;
 
 use common::push_varint;
-use sofab::{decode, Error, FixlenType, IStream, Id, OStream, PayloadAcc, Visitor};
+use sofab::{decode, Error, FixlenType, IStream, Id, OStream, PayloadAcc, Status, Visitor};
 
 /// Wire type `FIXLEN`, and the `Str` subtype of its length word.
 const T_FIXLEN: u64 = 0x2;
@@ -68,13 +68,19 @@ impl Visitor for Sink {
 
 impl Sink {
     /// The three-valued outcome generated code reports: `INVALID` wins over the
-    /// stream's own status (§5.2).
-    fn finish(self, status: Result<(), Error>) -> Result<(String, String, Vec<u8>), Error> {
+    /// stream's own status (§5.2), and the stream's status is otherwise handed
+    /// straight back — generated code "passes this status through verbatim"
+    /// (MESSAGE_SPEC §7), it does not decide for the caller whether an
+    /// unfinished message is acceptable (CORELIB_PLAN §5.2.4).
+    #[allow(clippy::type_complexity)]
+    fn finish(
+        self,
+        status: Result<Status, Error>,
+    ) -> Result<(Status, String, String, Vec<u8>), Error> {
         if self.inv {
             return Err(Error::InvalidMsg);
         }
-        status?;
-        Ok((self.name, self.note, self.data))
+        Ok((status?, self.name, self.note, self.data))
     }
 }
 
@@ -104,10 +110,11 @@ fn expected() -> (String, String, Vec<u8>) {
 }
 
 /// Decode `wire` by feeding it in fixed-size pieces.
-fn feed_in_chunks(wire: &[u8], step: usize) -> Result<(String, String, Vec<u8>), Error> {
+#[allow(clippy::type_complexity)]
+fn feed_in_chunks(wire: &[u8], step: usize) -> Result<(Status, String, String, Vec<u8>), Error> {
     let mut sink = Sink::default();
     let mut is = IStream::new();
-    let mut status = Ok(());
+    let mut status = Ok(Status::Complete);
     for chunk in wire.chunks(step) {
         status = is.feed(chunk, &mut sink);
         if let Err(Error::InvalidMsg) = status {
@@ -121,11 +128,9 @@ fn feed_in_chunks(wire: &[u8], step: usize) -> Result<(String, String, Vec<u8>),
 fn every_chunk_size_assembles_the_same_message() {
     let wire = message();
     for step in 1..=wire.len() + 1 {
-        assert_eq!(
-            feed_in_chunks(&wire, step).unwrap(),
-            expected(),
-            "fed {step} bytes at a time"
-        );
+        let (status, name, note, data) = feed_in_chunks(&wire, step).unwrap();
+        assert_eq!(status, Status::Complete, "fed {step} bytes at a time");
+        assert_eq!((name, note, data), expected(), "fed {step} bytes at a time");
     }
 }
 
@@ -137,7 +142,9 @@ fn the_contiguous_path_assembles_the_same_message() {
     let wire = message();
     let mut sink = Sink::default();
     let status = decode(&wire, &mut sink);
-    assert_eq!(sink.finish(status).unwrap(), expected());
+    let (status, name, note, data) = sink.finish(status).unwrap();
+    assert_eq!(status, Status::Complete);
+    assert_eq!((name, note, data), expected());
 }
 
 #[test]
@@ -156,11 +163,13 @@ fn one_accumulator_serves_message_after_message() {
     is.reset();
     sink.acc.reset();
 
-    let mut status = Ok(());
+    let mut status = Ok(Status::Complete);
     for chunk in wire.chunks(3) {
         status = is.feed(chunk, &mut sink);
     }
-    assert_eq!(sink.finish(status).unwrap(), expected());
+    let (status, name, note, data) = sink.finish(status).unwrap();
+    assert_eq!(status, Status::Complete);
+    assert_eq!((name, note, data), expected());
 }
 
 /// A `string` field written by hand: `OStream` refuses invalid UTF-8 under the
@@ -211,10 +220,10 @@ fn a_truncated_payload_leaves_the_field_at_its_default() {
         let mut sink = Sink::default();
         let mut is = IStream::new();
         let status = is.feed(&wire[..cut], &mut sink);
-        if status.is_ok() {
+        if status == Ok(Status::Complete) {
             continue; // the cut fell on a field boundary
         }
-        assert_eq!(status, Err(Error::Incomplete), "cut at {cut}");
+        assert_eq!(status, Ok(Status::Incomplete), "cut at {cut}");
         assert!(
             !sink.inv,
             "a truncated payload is unfinished, not malformed (cut at {cut})"
@@ -257,7 +266,7 @@ fn the_accumulator_is_idle_between_payloads() {
 
     let wire = message();
     let mut watch = Watch::default();
-    decode(&wire, &mut watch).unwrap();
+    assert_eq!(decode(&wire, &mut watch), Ok(Status::Complete));
     assert_eq!(
         watch.buffered_after_completion,
         vec![0, 0],

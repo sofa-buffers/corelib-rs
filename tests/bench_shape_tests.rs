@@ -317,15 +317,16 @@ fn the_blob_decode_row_feeds_every_chunk_and_ends_complete() {
     let mut sink = Delivered::default();
     let mut is = IStream::new();
     let mut chunks = 0;
-    let mut last = Err(sofab::Error::Incomplete);
+    let mut last = Ok(sofab::Status::Incomplete);
     for chunk in wire.chunks(BLOB_CHUNK) {
         chunks += 1;
         last = is.feed(chunk, &mut sink);
     }
 
     assert_eq!(chunks, BLOB_SIZE.div_ceil(BLOB_CHUNK));
-    assert!(
-        last.is_ok(),
+    assert_eq!(
+        last,
+        Ok(sofab::Status::Complete),
         "the last chunk of the blob 1MB message left the decode at {last:?} \
          rather than COMPLETE; a row that gives up on chunk 1 still prints a \
          number, and a much better-looking one"
@@ -343,8 +344,11 @@ fn the_composite_dataset_exercises_the_five_paths_it_was_added_for() {
 
     let mut sink = Delivered::default();
     let mut is = IStream::new();
-    is.feed(&wire, &mut sink)
-        .expect("composite decodes COMPLETE");
+    assert_eq!(
+        is.feed(&wire, &mut sink),
+        Ok(sofab::Status::Complete),
+        "composite decodes COMPLETE"
+    );
 
     // Field 1 is a wrapper array of 64 string elements; field 2 is the 65th
     // string.
@@ -397,8 +401,11 @@ fn a_skip_all_decode_still_walks_the_whole_composite_message() {
 
     let wire = encoded(4096, encode_composite);
     let mut is = IStream::new();
-    is.feed(&wire, &mut SkipAll)
-        .expect("skipping every field is still a COMPLETE decode");
+    assert_eq!(
+        is.feed(&wire, &mut SkipAll),
+        Ok(sofab::Status::Complete),
+        "skipping every field is still a COMPLETE decode"
+    );
 }
 
 // ---------------------------------------------------------------------------

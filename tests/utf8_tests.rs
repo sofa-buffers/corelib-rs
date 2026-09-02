@@ -32,7 +32,7 @@ mod common;
 
 use common::{Event, Recorder};
 use serde_json::Value;
-use sofab::{decode, Error, FixlenType, IStream, OStream};
+use sofab::{decode, Error, FixlenType, IStream, OStream, Status};
 
 /// The shared vectors, embedded from the verbatim asset copy.
 const VECTORS_JSON: &str = include_str!("../assets/test_vectors.json");
@@ -61,7 +61,10 @@ fn invalid_utf8_vectors() -> Vec<Value> {
 /// outcome the generated `inv`-flag path reports).
 fn decode_and_materialize(bytes: &[u8]) -> Result<Vec<Event>, Error> {
     let mut rec = Recorder::new();
-    decode(bytes, &mut rec)?; // structural frame validity is the corelib's job
+    // Structural frame validity is the corelib's job. A one-shot consumer
+    // accepts only COMPLETE (§5.2.4) — and `?` now carries only the outcomes
+    // that are genuinely errors.
+    assert_eq!(decode(bytes, &mut rec)?, Status::Complete);
     for e in &rec.events {
         if let Event::Str(_, buf) = e {
             // Generated code: `core::str::from_utf8(buf).map_err(|_| inv)?`.
@@ -79,11 +82,13 @@ fn decode_and_materialize_chunked(bytes: &[u8]) -> Result<Vec<Event>, Error> {
     let mut is = IStream::new();
     for &b in bytes {
         match is.feed(&[b], &mut rec) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => return Err(e),
         }
     }
-    is.feed(&[], &mut rec)?; // clean boundary or Incomplete
+    // The end-of-input probe: the same one-shot judgement as above, reached
+    // through `feed`'s own return value rather than a finalize step (§5.2.4).
+    assert_eq!(is.feed(&[], &mut rec)?, Status::Complete);
     for e in &rec.events {
         if let Event::Str(_, buf) = e {
             core::str::from_utf8(buf).map_err(|_| Error::InvalidMsg)?;
@@ -140,8 +145,9 @@ fn corelib_frame_itself_stays_valid() {
         let name = v["name"].as_str().unwrap();
         let bytes = hex_to_bytes(v["serialized_hex"].as_str().unwrap());
         let mut rec = Recorder::new();
-        assert!(
-            decode(&bytes, &mut rec).is_ok(),
+        assert_eq!(
+            decode(&bytes, &mut rec),
+            Ok(Status::Complete),
             "[{name}] corelib frame should be structurally valid",
         );
         // The raw bytes delivered to the visitor are exactly the invalid form.

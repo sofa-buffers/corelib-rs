@@ -7,13 +7,17 @@
 mod common;
 
 use common::{push_varint, Event, Recorder};
-use sofab::{ArrayKind, Error, IStream};
+use sofab::{ArrayKind, Error, IStream, Status};
 
 /// Decode `bytes` in one shot and return the recorded events.
 fn decode(bytes: &[u8]) -> Vec<Event> {
     let mut rec = Recorder::new();
     let mut is = IStream::new();
-    is.feed(bytes, &mut rec).expect("decode failed");
+    assert_eq!(
+        is.feed(bytes, &mut rec),
+        Ok(Status::Complete),
+        "decode failed"
+    );
     rec.events
 }
 
@@ -170,11 +174,11 @@ fn streaming_chunked_feed_matches_oneshot() {
     let mut is = IStream::new();
     for b in msg {
         match is.feed(&[b], &mut rec) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("feed failed: {e}"),
         }
     }
-    is.feed(&[], &mut rec).unwrap(); // clean boundary => Ok
+    assert_eq!(is.feed(&[], &mut rec), Ok(Status::Complete)); // clean boundary => Ok
     assert_eq!(rec.events, oneshot);
 
     // Feed in awkward 3-byte chunks.
@@ -182,11 +186,11 @@ fn streaming_chunked_feed_matches_oneshot() {
     let mut is2 = IStream::new();
     for chunk in msg.chunks(3) {
         match is2.feed(chunk, &mut rec2) {
-            Ok(()) | Err(Error::Incomplete) => {}
+            Ok(Status::Complete) | Ok(Status::Incomplete) => {}
             Err(e) => panic!("feed failed: {e}"),
         }
     }
-    is2.feed(&[], &mut rec2).unwrap(); // clean boundary => Ok
+    assert_eq!(is2.feed(&[], &mut rec2), Ok(Status::Complete)); // clean boundary => Ok
     assert_eq!(rec2.events, oneshot);
 }
 
@@ -232,7 +236,7 @@ fn nesting_beyond_max_depth_is_invalid() {
     let ok: Vec<u8> = vec![0x06; sofab::MAX_DEPTH as usize];
     let mut rec = Recorder::new();
     let mut is = IStream::new();
-    assert_eq!(is.feed(&ok, &mut rec), Err(Error::Incomplete));
+    assert_eq!(is.feed(&ok, &mut rec), Ok(Status::Incomplete));
 
     let too_deep: Vec<u8> = vec![0x06; sofab::MAX_DEPTH as usize + 1];
     let mut rec2 = Recorder::new();
@@ -392,7 +396,7 @@ fn a_reserved_subtype_in_a_truncated_fixlen_word_is_incomplete_not_invalid() {
         let mut rec = Recorder::new();
         assert_eq!(
             IStream::new().feed(truncated, &mut rec),
-            Err(Error::Incomplete),
+            Ok(Status::Incomplete),
             "[{name}] a settled subtype in an unfinished word must not decide the verdict"
         );
         assert!(rec.events.is_empty(), "[{name}] nothing may be announced");
@@ -400,11 +404,11 @@ fn a_reserved_subtype_in_a_truncated_fixlen_word_is_incomplete_not_invalid() {
         // Byte by byte, which is where an early evaluation is likeliest to show.
         let mut rec = Recorder::new();
         let mut is = IStream::new();
-        let mut last = Ok(());
+        let mut last = Ok(Status::Complete);
         for i in 0..truncated.len() {
             last = is.feed(&truncated[i..i + 1], &mut rec);
         }
-        assert_eq!(last, Err(Error::Incomplete), "[{name}] chunked");
+        assert_eq!(last, Ok(Status::Incomplete), "[{name}] chunked");
 
         // The terminator arrives: now the reserved subtype is a real verdict.
         assert_eq!(
@@ -453,7 +457,7 @@ fn oversized_count_or_length_is_invalid() {
     bytes3.extend_from_slice(b"hi");
     let mut rec3 = Recorder::new();
     let mut is3 = IStream::new();
-    assert_eq!(is3.feed(&bytes3, &mut rec3), Err(Error::Incomplete));
+    assert_eq!(is3.feed(&bytes3, &mut rec3), Ok(Status::Incomplete));
 }
 
 // --- F-0042: the fixlen array's element subtype must reach the visitor -------
@@ -481,9 +485,9 @@ fn oversized_count_or_length_is_invalid() {
 // elem_len 8) — the contradicting subtype.
 
 /// Decode `bytes` in one shot, returning both the verdict and the events
-/// recorded before it. A truncated message returns `Err(Incomplete)` *and* the
+/// recorded before it. A truncated message returns `Ok(Status::Incomplete)` *and* the
 /// events already delivered, which is the whole point for row 5.
-fn decode_partial(bytes: &[u8]) -> (Result<(), Error>, Vec<Event>) {
+fn decode_partial(bytes: &[u8]) -> (Result<Status, Error>, Vec<Event>) {
     let mut rec = Recorder::new();
     let mut is = IStream::new();
     let r = is.feed(bytes, &mut rec);
@@ -516,7 +520,7 @@ fn frame(events: &[Event]) -> Vec<Event> {
 fn fixlen_array_header_reports_fp64_subtype() {
     let bytes = nested_fixlen_array(3, 0x41, 3 * 8);
     let (r, ev) = decode_partial(&bytes);
-    assert_eq!(r, Ok(()));
+    assert_eq!(r, Ok(Status::Complete));
     let mut want = vec![Event::ArrayBegin(0, ArrayKind::Fp64, 3)];
     want.extend((0..3).map(|_| Event::Fp64(0, 0.0f64.to_bits())));
     assert_eq!(ev, frame(&want));
@@ -533,7 +537,7 @@ fn fixlen_array_header_reports_fp64_subtype() {
 fn overcount_with_contradicting_subtype_is_accepted_and_typed() {
     let bytes = nested_fixlen_array(8, 0x41, 8 * 8);
     let (r, ev) = decode_partial(&bytes);
-    assert_eq!(r, Ok(()));
+    assert_eq!(r, Ok(Status::Complete));
     assert_eq!(ev[2], Event::ArrayBegin(0, ArrayKind::Fp64, 8));
     // Exactly one header event, and 8 element events after it.
     assert_eq!(
@@ -557,7 +561,7 @@ fn overcount_with_contradicting_subtype_is_accepted_and_typed() {
 fn overcount_with_matching_subtype_reports_fp32_so_the_bound_still_applies() {
     let bytes = nested_fixlen_array(8, 0x20, 8 * 4);
     let (r, ev) = decode_partial(&bytes);
-    assert_eq!(r, Ok(()));
+    assert_eq!(r, Ok(Status::Complete));
     assert_eq!(ev[2], Event::ArrayBegin(0, ArrayKind::Fp32, 8));
     assert_eq!(
         ev.iter().filter(|e| matches!(e, Event::Fp32(..))).count(),
@@ -573,7 +577,7 @@ fn overcount_with_matching_subtype_reports_fp32_so_the_bound_still_applies() {
 #[test]
 fn truncation_between_count_and_fixlen_word_fires_no_header() {
     let (r, ev) = decode_partial(&[0xA6, 0x06, 0x56, 0x05, 0x08]);
-    assert_eq!(r, Err(Error::Incomplete));
+    assert_eq!(r, Ok(Status::Incomplete));
     assert_eq!(ev, [Event::SequenceBegin(100), Event::SequenceBegin(10)]);
     assert!(!ev.iter().any(|e| matches!(e, Event::ArrayBegin(..))));
 }
@@ -587,7 +591,7 @@ fn truncation_between_count_and_fixlen_word_fires_no_header() {
 #[test]
 fn overcount_matching_subtype_delivers_header_before_the_truncation() {
     let (r, ev) = decode_partial(&[0xA6, 0x06, 0x56, 0x05, 0x08, 0x20]);
-    assert_eq!(r, Err(Error::Incomplete));
+    assert_eq!(r, Ok(Status::Incomplete));
     assert_eq!(
         ev,
         [
@@ -604,7 +608,7 @@ fn overcount_matching_subtype_delivers_header_before_the_truncation() {
 fn valid_in_count_fp32_array_roundtrips() {
     let bytes = nested_fixlen_array(3, 0x20, 3 * 4);
     let (r, ev) = decode_partial(&bytes);
-    assert_eq!(r, Ok(()));
+    assert_eq!(r, Ok(Status::Complete));
     let mut want = vec![Event::ArrayBegin(0, ArrayKind::Fp32, 3)];
     want.extend((0..3).map(|_| Event::Fp32(0, 0.0f32.to_bits())));
     assert_eq!(ev, frame(&want));
@@ -626,12 +630,12 @@ fn valid_in_count_fp32_array_roundtrips() {
 #[test]
 fn zero_count_fixlen_array_still_reports_its_subtype() {
     let (r, ev) = decode_partial(&[0xA6, 0x06, 0x56, 0x05, 0x00, 0x41, 0x07, 0x07]);
-    assert_eq!(r, Ok(()));
+    assert_eq!(r, Ok(Status::Complete));
     assert_eq!(ev, frame(&[Event::ArrayBegin(0, ArrayKind::Fp64, 0)]));
 
     // An empty fp32 array stays distinguishable from an empty fp64 one.
     let (r32, ev32) = decode_partial(&[0xA6, 0x06, 0x56, 0x05, 0x00, 0x20, 0x07, 0x07]);
-    assert_eq!(r32, Ok(()));
+    assert_eq!(r32, Ok(Status::Complete));
     assert_eq!(ev32, frame(&[Event::ArrayBegin(0, ArrayKind::Fp32, 0)]));
     assert_ne!(ev, ev32);
 }
@@ -675,18 +679,18 @@ fn integer_array_header_position_and_kind_are_unchanged() {
     bytes.extend(core::iter::repeat(0x00).take(8));
     bytes.extend_from_slice(&[0x07, 0x07]);
     let (r, ev) = decode_partial(&bytes);
-    assert_eq!(r, Ok(()));
+    assert_eq!(r, Ok(Status::Complete));
     assert_eq!(ev[2], Event::ArrayBegin(0, ArrayKind::Unsigned, 8));
 
     // The hook still fires off the count word alone: truncating right after it
     // has already delivered the header (contrast row 4).
     let (r2, ev2) = decode_partial(&[0xA6, 0x06, 0x56, 0x03, 0x08]);
-    assert_eq!(r2, Err(Error::Incomplete));
+    assert_eq!(r2, Ok(Status::Incomplete));
     assert_eq!(ev2[2], Event::ArrayBegin(0, ArrayKind::Unsigned, 8));
 
     // Signed likewise.
     let (r3, ev3) = decode_partial(&[0xA6, 0x06, 0x56, 0x04, 0x02, 0x00, 0x00, 0x07, 0x07]);
-    assert_eq!(r3, Ok(()));
+    assert_eq!(r3, Ok(Status::Complete));
     assert_eq!(ev3[2], Event::ArrayBegin(0, ArrayKind::Signed, 2));
 }
 
@@ -714,7 +718,7 @@ fn array_max_ceiling_still_fires_on_the_count_word() {
     push_varint(&mut at_max, i32::MAX as u64);
     push_varint(&mut at_max, 0x20);
     let (r3, ev3) = decode_partial(&at_max);
-    assert_eq!(r3, Err(Error::Incomplete));
+    assert_eq!(r3, Ok(Status::Incomplete));
     assert_eq!(
         ev3[2],
         Event::ArrayBegin(0, ArrayKind::Fp32, i32::MAX as usize)
@@ -735,7 +739,7 @@ fn a_mistyped_later_occurrence_is_distinguishable_from_an_earlier_good_one() {
     bytes.extend(core::iter::repeat(0x00).take(16));
     bytes.extend_from_slice(&[0x07, 0x07]);
     let (r, ev) = decode_partial(&bytes);
-    assert_eq!(r, Ok(()));
+    assert_eq!(r, Ok(Status::Complete));
     let begins: Vec<&Event> = ev
         .iter()
         .filter(|e| matches!(e, Event::ArrayBegin(..)))
@@ -759,7 +763,11 @@ fn header_fires_exactly_once_even_when_the_field_straddles_a_chunk() {
         let mut rec = Recorder::new();
         let mut is = IStream::new();
         is.feed(&bytes[..split], &mut rec).ok();
-        is.feed(&bytes[split..], &mut rec).expect("decode failed");
+        assert_eq!(
+            is.feed(&bytes[split..], &mut rec),
+            Ok(Status::Complete),
+            "decode failed"
+        );
         let begins: Vec<&Event> = rec
             .events
             .iter()
@@ -850,7 +858,7 @@ fn invalid_is_terminal_and_only_reset_clears_it() {
         let mut fresh = Recorder::new();
         assert_eq!(
             is.feed(&[0x08, 0x2A], &mut fresh),
-            Ok(()),
+            Ok(Status::Complete),
             "[{name}] reset did not restore the decoder"
         );
         assert_eq!(fresh.events, [Event::Unsigned(1, 42)]);
@@ -866,7 +874,7 @@ fn invalid_survives_a_pending_carry_and_an_open_sequence() {
     // sequence-end that would balance the depth the decoder still holds.
     let mut rec = Recorder::new();
     let mut is = IStream::new();
-    assert_eq!(is.feed(&[0x0E], &mut rec), Err(Error::Incomplete));
+    assert_eq!(is.feed(&[0x0E], &mut rec), Ok(Status::Incomplete));
     assert_eq!(is.feed(&[0x0A, 0x59], &mut rec), Err(Error::InvalidMsg));
     assert_eq!(is.feed(&[0x07], &mut rec), Err(Error::InvalidMsg));
 
@@ -874,7 +882,7 @@ fn invalid_survives_a_pending_carry_and_an_open_sequence() {
     // field malformed, then a whole valid field.
     let mut rec = Recorder::new();
     let mut is = IStream::new();
-    assert_eq!(is.feed(&[0x02], &mut rec), Err(Error::Incomplete));
+    assert_eq!(is.feed(&[0x02], &mut rec), Ok(Status::Incomplete));
     assert_eq!(
         is.feed(&[(4 << 3) | 0x04], &mut rec),
         Err(Error::InvalidMsg)
@@ -888,10 +896,10 @@ fn invalid_survives_a_pending_carry_and_an_open_sequence() {
 /// rejection sticks.
 #[test]
 fn the_chunked_verdict_matches_the_one_shot_verdict_at_every_chunk_size() {
-    fn final_status(msg: &[u8], size: usize) -> Result<(), Error> {
+    fn final_status(msg: &[u8], size: usize) -> Result<Status, Error> {
         let mut rec = Recorder::new();
         let mut is = IStream::new();
-        let mut last = Ok(());
+        let mut last = Ok(Status::Complete);
         for chunk in msg.chunks(size) {
             last = is.feed(chunk, &mut rec);
         }
