@@ -78,6 +78,13 @@ jobs:
       - name: Shared test vectors (vector and check counts)
         run: cargo test --test vectors_tests -- --nocapture
 
+      # The same argument for the shared file's `header_limits` block: it runs
+      # under a `requires` gate, and a case silently skipped there would look
+      # exactly like one that passed. The run prints how many of the block's
+      # cases ran and how many were gated out.
+      - name: Shared header-ceiling cases (case and check counts)
+        run: cargo test --test header_limits_tests -- --nocapture
+
   # The same suite against the build users actually link against. `cargo test`
   # on its own only ever asserts on the unoptimized artifact, and this port's
   # correctness arguments are optimizer-visible: the varint reader's unchecked
