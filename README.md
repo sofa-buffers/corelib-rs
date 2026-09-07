@@ -82,6 +82,18 @@ Both halves of the shared `invalid_utf8` negative vectors in
 `decode_outcome: invalid` on the decode side and
 `encode_outcome: invalid_argument` on the encode side.
 
+### Ceilings answer at the length word
+
+The same file's `header_limits` cases cover bytes that *declare* a length or a
+count and then end, with no payload behind them. The corelib enforces no
+receiver limit of its own (`Error::LimitExceeded` is configured in generated
+code), but it announces the bound-bearing word — `Visitor::fixlen_begin` for a
+scalar `string`/`blob`, `Visitor::array_begin` for an array — after the word is
+read and validated and **before any payload byte**, so the receiver above it can
+judge the declared size there and reject terminally instead of asking for more
+bytes that cannot change the answer. `tests/header_limits_tests.rs` runs the
+block with a minimal receiver standing in for generated code.
+
 ## Why this design
 
 | Goal | How |

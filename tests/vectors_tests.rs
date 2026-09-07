@@ -54,7 +54,9 @@
 //!
 //! The file's `sequence_growth` block (CORELIB_PLAN §7.2 item 8) is read by
 //! nothing in this repo yet; the loader ignores unknown top-level blocks, so it
-//! costs nothing to carry. `invalid_utf8` is consumed by `tests/utf8_tests.rs`.
+//! costs nothing to carry. `invalid_utf8` is consumed by `tests/utf8_tests.rs`,
+//! and `header_limits` — where a ceiling answers at the length or count word
+//! (CORELIB_PLAN §6.2.1, §6.3) — by `tests/header_limits_tests.rs`.
 
 mod common;
 
@@ -1012,10 +1014,11 @@ fn unknown_top_level_blocks_are_tolerated() {
     // named, and a block the shared file grows later fails here until this port
     // decides whether to run it:
     //   * `invalid_utf8`    — run, by `tests/utf8_tests.rs`.
+    //   * `header_limits`   — run, by `tests/header_limits_tests.rs`.
     //   * `sequence_growth` — CORELIB_PLAN §7.2 item 8, not exercised by this
     //     port yet; corelib-rs#98 leaves it as follow-up work.
     let driven_here = ["format", "version", "description", "notes", "vectors"];
-    let decided_elsewhere = ["invalid_utf8", "sequence_growth"];
+    let decided_elsewhere = ["invalid_utf8", "sequence_growth", "header_limits"];
     for key in doc.as_object().expect("top-level object").keys() {
         assert!(
             driven_here.contains(&key.as_str()) || decided_elsewhere.contains(&key.as_str()),
