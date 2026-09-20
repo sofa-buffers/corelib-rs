@@ -52,11 +52,10 @@
 //!
 //! # Not covered here
 //!
-//! The file's `sequence_growth` block (CORELIB_PLAN §7.2 item 8) is read by
-//! nothing in this repo yet; the loader ignores unknown top-level blocks, so it
-//! costs nothing to carry. `invalid_utf8` is consumed by `tests/utf8_tests.rs`,
-//! and `header_limits` — where a ceiling answers at the length or count word
-//! (CORELIB_PLAN §6.2.1, §6.3) — by `tests/header_limits_tests.rs`.
+//! `invalid_utf8` is consumed by `tests/utf8_tests.rs`; `header_limits` — where a
+//! ceiling answers at the length or count word (CORELIB_PLAN §6.2.1, §6.3) — by
+//! `tests/header_limits_tests.rs`; and `sequence_growth` (CORELIB_PLAN §7.2 item
+//! 8) by `tests/sequence_growth_tests.rs`.
 
 mod common;
 
@@ -1015,8 +1014,7 @@ fn unknown_top_level_blocks_are_tolerated() {
     // decides whether to run it:
     //   * `invalid_utf8`    — run, by `tests/utf8_tests.rs`.
     //   * `header_limits`   — run, by `tests/header_limits_tests.rs`.
-    //   * `sequence_growth` — CORELIB_PLAN §7.2 item 8, not exercised by this
-    //     port yet; corelib-rs#98 leaves it as follow-up work.
+    //   * `sequence_growth` — run, by `tests/sequence_growth_tests.rs`.
     //   * `boolean_tolerant` — CORELIB_PLAN §4.4, not exercised yet; #104. It
     //     needs only the plain decode API, so it is the cheaper of the two.
     //   * `header_limits_nested` — the ceiling one frame deeper, not exercised
