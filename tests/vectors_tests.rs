@@ -1017,8 +1017,18 @@ fn unknown_top_level_blocks_are_tolerated() {
     //   * `header_limits`   — run, by `tests/header_limits_tests.rs`.
     //   * `sequence_growth` — CORELIB_PLAN §7.2 item 8, not exercised by this
     //     port yet; corelib-rs#98 leaves it as follow-up work.
+    //   * `boolean_tolerant` — CORELIB_PLAN §4.4, not exercised yet; #104. It
+    //     needs only the plain decode API, so it is the cheaper of the two.
+    //   * `header_limits_nested` — the ceiling one frame deeper, not exercised
+    //     yet; #105. Needs receiver caps, which `header_limits` above already has.
     let driven_here = ["format", "version", "description", "notes", "vectors"];
-    let decided_elsewhere = ["invalid_utf8", "sequence_growth", "header_limits"];
+    let decided_elsewhere = [
+        "invalid_utf8",
+        "sequence_growth",
+        "header_limits",
+        "boolean_tolerant",
+        "header_limits_nested",
+    ];
     for key in doc.as_object().expect("top-level object").keys() {
         assert!(
             driven_here.contains(&key.as_str()) || decided_elsewhere.contains(&key.as_str()),
