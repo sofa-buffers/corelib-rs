@@ -85,6 +85,14 @@ jobs:
       - name: Shared header-ceiling cases (case and check counts)
         run: cargo test --test header_limits_tests -- --nocapture
 
+      # And the same for `sequence_growth`, for the same reason and one more:
+      # its `dynamic_arrays` tag gates on how the port allocates, so a build that
+      # stopped declaring it would skip every case and still report success. The
+      # run prints how many of the block's cases ran, how many were gated out,
+      # and the cap they ran against.
+      - name: Shared sequence-growth cases (case counts and cap)
+        run: cargo test --test sequence_growth_tests -- --nocapture
+
   # The same suite against the build users actually link against. `cargo test`
   # on its own only ever asserts on the unoptimized artifact, and this port's
   # correctness arguments are optimizer-visible: the varint reader's unchecked

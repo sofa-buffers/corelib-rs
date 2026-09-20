@@ -94,6 +94,24 @@ judge the declared size there and reject terminally instead of asking for more
 bytes that cannot change the answer. `tests/header_limits_tests.rs` runs the
 block with a minimal receiver standing in for generated code.
 
+### Growth is reported, not counted
+
+The file's `sequence_growth` cases deliver element ids into a wrapper array,
+whose length is *highest present id + 1* — it carries no count on the wire
+(MESSAGE_SPEC §5.1). `tests/sequence_growth_tests.rs` runs them, with the same
+kind of minimal receiver: this crate ships no collector layer, so the growing
+container and its `max_dyn_array_count` cap live above the corelib, and what the
+block pins here is the corelib's half — that every element id is reported
+sparsely and unshifted, that an id is announced *before* its frame is entered so
+a cap can refuse it before the container grows, and that the refusal is terminal.
+
+One half is deliberately **not** asserted: a conformant decoder grows to *at
+least* `id + 1` rather than exactly it, so a sparse array does not cost O(n²)
+copies (ARCHITECTURE §9.5 shape B). That is a property of the container, and the
+container in these tests is the test's own, so asserting it here would measure
+this repository rather than the library. CORELIB_PLAN §7.2 item 8 asks a port to
+say so rather than report the case as passed — this is that statement.
+
 ## Why this design
 
 | Goal | How |
