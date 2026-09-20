@@ -93,6 +93,15 @@ jobs:
       - name: Shared sequence-growth cases (case counts and cap)
         run: cargo test --test sequence_growth_tests -- --nocapture
 
+      # And for `boolean_tolerant` (CORELIB_PLAN §4.4) the argument is sharper
+      # still: only corelib-c-cpp's copy of the shared file carried the block at
+      # first, and a runner reading a stale copy finds no such key, iterates zero
+      # cases and passes. The printed `found` count is what tells the two apart —
+      # it also shows the decoded/rejected split, which is how a build that
+      # gated cases out by `requires` stops looking like a full run.
+      - name: Shared boolean-tolerance cases (case and check counts)
+        run: cargo test --test boolean_tolerant_tests -- --nocapture
+
   # The same suite against the build users actually link against. `cargo test`
   # on its own only ever asserts on the unoptimized artifact, and this port's
   # correctness arguments are optimizer-visible: the varint reader's unchecked

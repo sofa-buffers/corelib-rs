@@ -54,8 +54,12 @@
 //!
 //! `invalid_utf8` is consumed by `tests/utf8_tests.rs`; `header_limits` — where a
 //! ceiling answers at the length or count word (CORELIB_PLAN §6.2.1, §6.3) — by
-//! `tests/header_limits_tests.rs`; and `sequence_growth` (CORELIB_PLAN §7.2 item
-//! 8) by `tests/sequence_growth_tests.rs`.
+//! `tests/header_limits_tests.rs`; `sequence_growth` (CORELIB_PLAN §7.2 item 8)
+//! by `tests/sequence_growth_tests.rs`; and `boolean_tolerant` — a non-canonical
+//! boolean is read as `true` and re-encoded as `1` (CORELIB_PLAN §4.4) — by
+//! `tests/boolean_tolerant_tests.rs`. Those bytes cannot be a vector: they are
+//! hand-authored precisely because no conforming encoder emits them, so there is
+//! no `fields` list to replay here.
 
 mod common;
 
@@ -1015,8 +1019,8 @@ fn unknown_top_level_blocks_are_tolerated() {
     //   * `invalid_utf8`    — run, by `tests/utf8_tests.rs`.
     //   * `header_limits`   — run, by `tests/header_limits_tests.rs`.
     //   * `sequence_growth` — run, by `tests/sequence_growth_tests.rs`.
-    //   * `boolean_tolerant` — CORELIB_PLAN §4.4, not exercised yet; #104. It
-    //     needs only the plain decode API, so it is the cheaper of the two.
+    //   * `boolean_tolerant` — run, by `tests/boolean_tolerant_tests.rs`
+    //     (CORELIB_PLAN §4.4).
     //   * `header_limits_nested` — the ceiling one frame deeper, not exercised
     //     yet; #105. Needs receiver caps, which `header_limits` above already has.
     let driven_here = ["format", "version", "description", "notes", "vectors"];

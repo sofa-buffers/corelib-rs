@@ -112,6 +112,29 @@ container in these tests is the test's own, so asserting it here would measure
 this repository rather than the library. CORELIB_PLAN §7.2 item 8 asks a port to
 say so rather than report the case as passed — this is that statement.
 
+### A boolean is tolerant on decode and canonical on encode
+
+CORELIB_PLAN §4.4: an encoder **must** write `true` as `1`, and a decoder **must**
+read *every* value other than `0` as `true` — `2`, `256` and `2^64-1` alike. Such
+a value is not `INVALID`: unlike an `enum` or a `bitfield`, which carry the width
+their declaration implies (MESSAGE_SPEC §1), a boolean carries no width bound at
+all. It is normalized away instead, and a re-encode emits `1`.
+
+The shared file's `boolean_tolerant` cases are hand-authored for exactly that
+reason — no conforming encoder emits those bytes, so no positive vector can reach
+this half of the rule. `tests/boolean_tolerant_tests.rs` runs them, asserting
+both halves per case: the message decodes to `complete`, the destination holds
+the normalized value, and writing it back through `write_boolean` /
+`write_array_unsigned` reproduces the block's `reencoded_hex` byte for byte. The
+outcome alone would certify a decoder that truncates `256` to `false`, and a
+truthiness check would certify one that stores the raw `2` — the byte-level check
+on the destination and the re-encode are what close those two.
+
+`Visitor::unsigned` is the read surface here: the corelib hands the wire value
+over whole and the `!= 0` test is generated code's, so what these cases pin on
+the corelib's side is that the value arrives unnarrowed and the message is never
+rejected for being non-canonical.
+
 ## Why this design
 
 | Goal | How |
