@@ -202,9 +202,10 @@ struct BooleanField {
 }
 
 impl BooleanField {
-    /// A visitor over a destination of `slots` booleans, each poisoned with the
-    /// complement of the value the case expects there (§8.4: a decoder that
-    /// never writes the destination must not pass by accident).
+    /// A visitor over a destination of one boolean per value the case expects,
+    /// each poisoned with the complement of the value expected there: a decoder
+    /// that never writes the destination must not pass `boolean_tolerant_zero`
+    /// against a `false`-initialized buffer.
     fn poisoned(id: Id, expected: &[bool]) -> Self {
         Self {
             id,
