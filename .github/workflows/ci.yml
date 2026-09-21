@@ -85,6 +85,16 @@ jobs:
       - name: Shared header-ceiling cases (case and check counts)
         run: cargo test --test header_limits_tests -- --nocapture
 
+      # And the nested twin of that block, which needs saying even more loudly:
+      # `header_limits_nested` delivers the identical over-ceiling header one or
+      # two sequence frames deeper, and its cases end with a frame still open —
+      # so a runner that never reaches the ceiling has a second, plausible reason
+      # to answer INCOMPLETE. The run prints the ran/gated split, the deepest
+      # frame chain actually exercised, and what the negative control showed when
+      # each ceiling was lifted.
+      - name: Shared nested header-ceiling cases (case counts and negative control)
+        run: cargo test --test header_limits_nested_tests -- --nocapture
+
       # And the same for `sequence_growth`, for the same reason and one more:
       # its `dynamic_arrays` tag gates on how the port allocates, so a build that
       # stopped declaring it would skip every case and still report success. The
