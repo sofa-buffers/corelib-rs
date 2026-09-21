@@ -169,18 +169,6 @@ pub enum Bound {
     Cap(usize),
 }
 
-impl Bound {
-    /// The limit to compare against, and the verdict for a breach of it.
-    #[inline(always)]
-    fn limit(self) -> Result<(usize, Error)> {
-        match self {
-            Bound::Schema(n) => Ok((n, Error::InvalidMsg)),
-            Bound::Cap(0) => Err(Error::Argument),
-            Bound::Cap(n) => Ok((n, Error::LimitExceeded)),
-        }
-    }
-}
-
 /// The destination of a wrapper array: a sequence of slots that can grow.
 ///
 /// Implemented for `Vec<T>` and, behind the `heapless` feature,
@@ -224,11 +212,17 @@ pub trait SeqVec {
 /// [`place_elem`], [`reserve_elem`] and [`reserve_row`] run it themselves.
 #[inline]
 pub fn check_index(id: Id, bound: Bound) -> Result<()> {
-    let (n, breach) = bound.limit()?;
-    if (id as usize) < n {
-        Ok(())
-    } else {
-        Err(breach)
+    // Spelled as one flat match rather than through a shared (limit, verdict)
+    // helper: the flat form is what LLVM folds BEFORE it decides whether the
+    // generated caller is still small enough to inline, so a constant bound costs
+    // exactly the literal compare it replaces. The helper form folded to the same
+    // instructions but pushed the generated `fixlen_begin` over the inline
+    // threshold -- measured +3% decode Ir on the rust-rs-no-std-dyn bench row.
+    match bound {
+        Bound::Schema(n) if (id as usize) >= n => Err(Error::InvalidMsg),
+        Bound::Cap(0) => Err(Error::Argument),
+        Bound::Cap(n) if (id as usize) >= n => Err(Error::LimitExceeded),
+        _ => Ok(()),
     }
 }
 
@@ -242,11 +236,12 @@ pub fn check_index(id: Id, bound: Bound) -> Result<()> {
 /// count/length header, before the allocation it is meant to prevent").
 #[inline]
 pub fn check_len(len: usize, bound: Bound) -> Result<()> {
-    let (n, breach) = bound.limit()?;
-    if len <= n {
-        Ok(())
-    } else {
-        Err(breach)
+    // Flat for the reason check_index gives.
+    match bound {
+        Bound::Schema(n) if len > n => Err(Error::InvalidMsg),
+        Bound::Cap(0) => Err(Error::Argument),
+        Bound::Cap(n) if len > n => Err(Error::LimitExceeded),
+        _ => Ok(()),
     }
 }
 
@@ -321,7 +316,13 @@ impl<T: Default> SeqVec for Vec<T> {
 
     #[inline]
     fn grow_to(&mut self, len: usize) -> bool {
-        self.resize_with(len, T::default);
+        // A push loop, not `resize_with`: ids arrive in order, so the common
+        // growth is one slot, and resize_with's reserve-then-extend setup cost
+        // more than that one push -- measured +2.6% decode Ir on the
+        // rust-rs-unbounded bench row. Amortised doubling either way.
+        while Vec::len(self) < len {
+            self.push(T::default());
+        }
         true
     }
 
