@@ -13,11 +13,14 @@
 //! sequence headers are fixed arrays sized when the stream is built, and no wire
 //! number sizes anything either of them holds. What uses the heap is the static
 //! helper layer beside the codec — [`PayloadAcc`], which the *generated* layer
-//! drives to reassemble a split payload — and the caller's own destinations.
+//! drives to reassemble a split payload, and [`seq`], which grows a wrapper
+//! array as its elements arrive — and the caller's own destinations.
 //!
-//! Every wire type is always compiled in — there are **no Cargo feature flags
-//! and no build-time configuration**. The scalar value type is always 64-bit
-//! (`u64`/`i64`). The wire format is byte-identical to every other `corelib-*`
+//! Every wire type is always compiled in — there is **no build-time
+//! configuration of the wire format**. The scalar value type is always 64-bit
+//! (`u64`/`i64`). The one Cargo feature, `heapless`, adds no wire code: it
+//! implements [`seq::SeqVec`] for `heapless::Vec`, so generated code that holds
+//! a bounded wrapper array in fixed-capacity storage can use [`seq`] too. The wire format is byte-identical to every other `corelib-*`
 //! port, and the method names mirror the no_std crate so code moves between them
 //! freely.
 //!
@@ -114,6 +117,7 @@ mod error;
 mod istream;
 mod ostream;
 mod payload;
+pub mod seq;
 mod types;
 mod varint;
 

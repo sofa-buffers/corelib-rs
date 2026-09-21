@@ -43,9 +43,20 @@ harness = false
 name = "bench"
 harness = false
 
-# No Cargo feature flags: every wire type is always compiled in and the scalar
-# value type is always 64-bit. This is the high-speed build — it does not trade
-# wire-type granularity or value range for footprint.
+# No wire-format feature flags: every wire type is always compiled in and the
+# scalar value type is always 64-bit. This is the high-speed build — it does not
+# trade wire-type granularity or value range for footprint.
+#
+# The one feature adds a container, not wire code: `heapless` implements
+# `sofab::seq::SeqVec` for `heapless::Vec<T, N>`, so a generated crate that
+# holds a schema-bounded wrapper array in fixed-capacity storage
+# (sofabgen `rust.allow_dynamic: false`) routes it through the same `seq`
+# helpers as a `Vec`. The trait lives here, so the impl has to as well.
+[features]
+heapless = ["dep:heapless"]
+
+[dependencies]
+heapless = { version = "0.8", optional = true, default-features = false }
 
 # ---------------------------------------------------------------------------
 # Speed-optimized release profile (the whole point of this port). The opposite

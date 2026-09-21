@@ -15,23 +15,29 @@
 //! `c-cpp` and Rust `no_std` are named there). This crate is the `std` profile
 //! and is not among them.
 //!
-//! The container is not the corelib's, though: this crate ships no collector
-//! layer — no `Caps`, no `Bounds`, no `StringSeq` — so growth lives in generated
-//! code, and the receiver cap is held above the corelib exactly as it is for
-//! `header_limits`. What the block pins *here* is therefore the half that is the
-//! corelib's: that the decoder reports each element id, sparsely and unshifted,
-//! that it reports an id **before** the element's frame is entered so a cap can
-//! refuse it before the container grows, and that the refusal is terminal.
+//! The container is the corelib's: [`sofab::seq`] is the layer generated code
+//! grows a wrapper array through, so the receiving destination below delegates
+//! every index decision and every extension to [`seq::reserve_elem`] with the
+//! cap passed in as [`Bound::Cap`] — exactly the call a generated visitor makes
+//! for a schema-unbounded array. What the block pins here is therefore both
+//! halves: the codec's, that the decoder reports each element id, sparsely and
+//! unshifted, and **before** the element's frame is entered, so a cap can refuse
+//! it before the container grows; and the helper's, that the refusal happens
+//! before any extension, is LIMIT_EXCEEDED rather than INVALID, and that what
+//! was admitted sits at its own index with the gaps holding the default. The
+//! refusal is made terminal by the destination latching the verdict, as the
+//! generated visitor's sticky flag does.
 //!
-//! # Growth geometry is not asserted here
+//! # Growth geometry
 //!
 //! A conformant decoder grows to *at least* `id + 1` so a sparse array does not
-//! cost O(n²) copies (ARCHITECTURE §9.5 shape B). That is an allocation-shape
-//! property of the container, and the container here is the test's own, so
-//! asserting it would only measure this file. It is stated rather than reported
-//! as passed, which is what CORELIB_PLAN §7.2 item 8 asks for.
+//! cost O(n²) copies (ARCHITECTURE §9.5 shape B). The container is `Vec`, grown
+//! by `seq`'s `resize_with`, so the geometry is `Vec`'s amortised doubling;
+//! `seq_tests.rs` measures it (reallocations over an id-by-id fill) rather than
+//! it being asserted from this block, whose cases are too short to show it.
 
 use serde_json::Value;
+use sofab::seq::{self, Bound};
 use sofab::{decode, Error, IStream, Id, OStream, Status, Unsigned, Visitor};
 
 const VECTORS_JSON: &str = include_str!("../assets/test_vectors.json");
@@ -162,9 +168,10 @@ fn build(case: &Value) -> Vec<u8> {
 // --- the receiving container -------------------------------------------------
 
 /// What one slot of the grown container holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum Slot {
     /// Never delivered — the element default (`""` / `0`).
+    #[default]
     Default,
     Str(String),
     Num(u64),
@@ -172,9 +179,10 @@ enum Slot {
 
 /// A growing wrapper-array destination with a receiver cap on the element index.
 ///
-/// This is the shape generated code has: a container that extends to hold the
-/// highest id it is given, and refuses an index at or above the cap **before**
-/// extending (§6.2.1 — the cap binds the element *index*, ARCHITECTURE §9.5).
+/// This is the shape generated code has: a `Vec` the corelib's [`seq`] layer
+/// extends to hold the highest id it is given, refusing an index at or above
+/// the cap **before** extending (§6.2.1 — the cap binds the element *index*,
+/// ARCHITECTURE §9.5).
 struct Growing {
     field_id: Id,
     cap: usize,
@@ -201,23 +209,27 @@ impl Growing {
         }
     }
 
-    /// Admit an element index, or refuse it.
+    /// Admit an element index, or refuse it — through the corelib's
+    /// [`seq::reserve_elem`], with the cap passed in for this one call.
     ///
     /// Returns `false` when the index is refused, and the container is left
-    /// exactly as it was: the refusal happens before any extension, which is
-    /// what `expect.max_length` measures.
+    /// exactly as it was: `seq` refuses before any extension, which is what
+    /// `expect.max_length` measures. The verdict it answered is latched.
     fn admit(&mut self, index: usize) -> bool {
         if self.verdict.is_some() {
             return false;
         }
-        if index >= self.cap {
+        let Ok(id) = Id::try_from(index) else {
             self.verdict = Some(Error::LimitExceeded);
             return false;
+        };
+        match seq::reserve_elem(&mut self.slots, id, Bound::Cap(self.cap)) {
+            Ok(_) => true,
+            Err(e) => {
+                self.verdict = Some(e);
+                false
+            }
         }
-        if self.slots.len() < index + 1 {
-            self.slots.resize(index + 1, Slot::Default);
-        }
-        true
     }
 }
 
