@@ -84,370 +84,30 @@
 //! control from the other side: with no ceiling configured, the rejections must
 //! *stop* rejecting, which is what shows the verdicts come from the guard and not
 //! from something incidental about the bytes.
+//!
+//! # Where the machinery lives
+//!
+//! [`Receiver`], [`Consumer`] and the ceilings they hold are in
+//! `tests/common/header_limits.rs`, shared verbatim with
+//! `tests/header_limits_nested_tests.rs`. The nested block is this block one or
+//! two sequence frames deeper and must differ in *where the field arrives* and
+//! in nothing else, so the leaf that judges the declared size is one piece of
+//! code for both. Here every case's `frames` chain is empty: the field is at the
+//! top level.
+
+#[path = "common/header_limits.rs"]
+mod support;
 
 use serde_json::Value;
-use sofab::{ArrayKind, Error, FixlenType, IStream, Id, Status, Visitor};
-
-/// The shared vectors, embedded from the verbatim asset copy.
-const VECTORS_JSON: &str = include_str!("../assets/test_vectors.json");
-
-/// This port's **format** ceiling on a declared fixlen length and on an array
-/// count (`INT32_MAX`, §4.6/§4.7). It is the corelib's own and the one ceiling a
-/// receiver cannot lift, so it is what a case is measured against in the
-/// ceilings-lifted control below. The crate's `FIXLEN_MAX`/`ARRAY_MAX` are
-/// internal, so the value is restated here rather than imported.
-const FORMAT_CEILING: u64 = i32::MAX as u64;
-
-// --- the three-valued outcome, plus the policy category ----------------------
-
-/// What a feed sequence answered, in the shared file's spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Outcome {
-    Complete,
-    Incomplete,
-    Invalid,
-    LimitExceeded,
-}
-
-impl Outcome {
-    /// The outcome this port's `Result<Status>` carries (§5.2.1: `INCOMPLETE` is
-    /// not an error and rides the success arm; `INVALID` and the terminal
-    /// `LimitExceeded` ride the error channel §6.3 pairs them with).
-    fn of(result: Result<Status, Error>) -> Self {
-        match result {
-            Ok(Status::Complete) => Outcome::Complete,
-            Ok(Status::Incomplete) => Outcome::Incomplete,
-            Err(Error::InvalidMsg) => Outcome::Invalid,
-            Err(Error::LimitExceeded) => Outcome::LimitExceeded,
-            Err(other) => panic!("decode reported {other:?}, which is not a decode outcome"),
-        }
-    }
-
-    /// Parse an `expect.outcome` string.
-    fn named(name: &str) -> Self {
-        match name {
-            "complete" => Outcome::Complete,
-            "incomplete" => Outcome::Incomplete,
-            "invalid" => Outcome::Invalid,
-            "limit_exceeded" => Outcome::LimitExceeded,
-            other => panic!(
-                "unknown `expect.outcome` `{other}` in the header_limits block; \
-                 decide what this port must answer for it (test_vectors_README.md)",
-            ),
-        }
-    }
-
-    fn is_rejection(self) -> bool {
-        matches!(self, Outcome::Invalid | Outcome::LimitExceeded)
-    }
-}
-
-// --- capability gating -------------------------------------------------------
-
-/// Whether this port satisfies one `requires` tag. An unsatisfied tag means the
-/// case is **skipped**, never rejected.
-fn capability_supported(tag: &str) -> bool {
-    match tag {
-        // Wire constructs: this build has every wire type and the 64-bit value
-        // width compiled in, so every construct in the block is representable.
-        "fixlen" | "array" | "sequence" | "fp32" | "fp64" | "int32" | "int64" => true,
-        // Profile capability, declared here — see the module docs.
-        "receiver_caps" => true,
-        other => panic!(
-            "the shared file requires capability `{other}`, which this port has not \
-             ruled on; decide whether it holds here before the case is run or \
-             skipped (test_vectors_README.md, CORELIB_PLAN §7.2)",
-        ),
-    }
-}
-
-/// The `requires` tags of one case (empty when the key is absent).
-fn requires(case: &Value) -> Vec<&str> {
-    case.get("requires")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default()
-}
-
-// --- the ceilings one case configures ----------------------------------------
-
-/// The ceiling a case asks the port to configure, bound to the field it applies
-/// to. Exactly one of the four is set for a rejection case; all four are `None`
-/// in the ceilings-lifted control.
-#[derive(Debug, Clone, Copy, Default)]
-struct Ceilings {
-    field_id: Id,
-    /// §6.2.1 receiver caps. A breach is `LimitExceeded`: policy, not malformation.
-    max_dyn_string_len: Option<u64>,
-    max_dyn_blob_len: Option<u64>,
-    max_dyn_array_count: Option<u64>,
-    /// A schema `maxlen`. A breach is `InvalidMsg`: MESSAGE_SPEC §7.1 says these
-    /// bytes are not a legal value for this field, whatever the receiver's
-    /// capacity.
-    schema_maxlen: Option<u64>,
-}
-
-impl Ceilings {
-    /// The ceilings the case states. `schema` and `limits` are mutually exclusive
-    /// (§6.2.1 forbids applying a receiver cap to a field the schema bounds), and
-    /// [`the_block_is_present_and_well_formed`] holds the file to that.
-    fn of(case: &Value) -> Self {
-        let limits = &case["limits"];
-        Self {
-            field_id: case["field_id"].as_u64().expect("field_id") as Id,
-            max_dyn_string_len: limits["max_dyn_string_len"].as_u64(),
-            max_dyn_blob_len: limits["max_dyn_blob_len"].as_u64(),
-            max_dyn_array_count: limits["max_dyn_array_count"].as_u64(),
-            schema_maxlen: case["schema"]["maxlen"].as_u64(),
-        }
-    }
-
-    /// The same field with every ceiling removed — the negative control.
-    fn lifted(field_id: Id) -> Self {
-        Self {
-            field_id,
-            ..Self::default()
-        }
-    }
-}
-
-// --- the consumer above the corelib ------------------------------------------
-
-/// The receiving half: generated code's job, reduced to the one decision this
-/// block is about.
-///
-/// It judges the declared size **in the header hook**, which is where the corelib
-/// hands it over — before a payload byte is asked for and therefore before a
-/// message that ends at the word can be mistaken for a truncated one.
-#[derive(Default)]
-struct Receiver {
-    ceilings: Ceilings,
-    /// The verdict this receiver raised, if any.
-    verdict: Option<Error>,
-    /// Every callback the corelib made, header hooks included. A terminal
-    /// rejection must stop this from growing.
-    calls: usize,
-}
-
-impl Receiver {
-    fn new(ceilings: Ceilings) -> Self {
-        Self {
-            ceilings,
-            verdict: None,
-            calls: 0,
-        }
-    }
-
-    /// Measure a declared size against whichever ceiling this field carries.
-    ///
-    /// `cap` is the §6.2.1 receiver cap for the subtype that actually arrived —
-    /// the corelib reports what is *on the wire*, and a receiver measures against
-    /// the cap for that kind or not at all.
-    fn judge(&mut self, id: Id, declared: u64, cap: Option<u64>) {
-        if id != self.ceilings.field_id || self.verdict.is_some() {
-            return;
-        }
-        // The schema bound first: a field the schema bounds carries no receiver
-        // cap at all (§6.2.1), so the two can never both fire.
-        if let Some(maxlen) = self.ceilings.schema_maxlen {
-            if declared > maxlen {
-                self.verdict = Some(Error::InvalidMsg);
-            }
-            return;
-        }
-        if let Some(cap) = cap {
-            if declared > cap {
-                self.verdict = Some(Error::LimitExceeded);
-            }
-        }
-    }
-}
-
-impl Visitor for Receiver {
-    fn fixlen_begin(&mut self, id: Id, subtype: FixlenType, total: usize) {
-        self.calls += 1;
-        // A float's width is fixed by its subtype and bounded by the format, so
-        // no dynamic cap binds it; only the two payload-bearing subtypes are
-        // measured, each against its own cap (§6.2.1 keeps string and blob apart
-        // because a deployment may accept a megabyte of opaque bytes and no such
-        // quantity of text).
-        let cap = match subtype {
-            FixlenType::Str => self.ceilings.max_dyn_string_len,
-            FixlenType::Blob => self.ceilings.max_dyn_blob_len,
-            FixlenType::Fp32 | FixlenType::Fp64 => return,
-        };
-        self.judge(id, total as u64, cap);
-    }
-
-    fn array_begin(&mut self, id: Id, _kind: ArrayKind, count: usize) {
-        self.calls += 1;
-        // A count ahead of its payload is bound exactly as a length is.
-        let cap = self.ceilings.max_dyn_array_count;
-        self.judge(id, count as u64, cap);
-    }
-
-    fn unsigned(&mut self, _id: Id, _value: sofab::Unsigned) {
-        self.calls += 1;
-    }
-    fn signed(&mut self, _id: Id, _value: sofab::Signed) {
-        self.calls += 1;
-    }
-    fn fp32(&mut self, _id: Id, _value: f32) {
-        self.calls += 1;
-    }
-    fn fp64(&mut self, _id: Id, _value: f64) {
-        self.calls += 1;
-    }
-    fn string(&mut self, _id: Id, _total: usize, _offset: usize, _chunk: &[u8]) {
-        self.calls += 1;
-    }
-    fn blob(&mut self, _id: Id, _total: usize, _offset: usize, _chunk: &[u8]) {
-        self.calls += 1;
-    }
-    fn sequence_begin(&mut self, _id: Id) {
-        self.calls += 1;
-    }
-    fn sequence_end(&mut self) {
-        self.calls += 1;
-    }
-}
-
-/// A decoder plus its receiver: the pair a caller actually holds.
-///
-/// Its whole contribution over a bare [`IStream`] is the two things §6.3 asks of
-/// a ceiling — the receiver's verdict *dominates* the corelib's own outcome for
-/// the same bytes, and once raised it is **terminal**: a further feed re-raises
-/// it and consumes nothing.
-struct Consumer {
-    stream: IStream,
-    receiver: Receiver,
-    /// The terminal verdict, once one has been reached.
-    latched: Option<Error>,
-    /// Bytes actually handed to the decoder. A re-raise must not move this.
-    consumed: usize,
-}
-
-impl Consumer {
-    fn new(ceilings: Ceilings) -> Self {
-        Self {
-            stream: IStream::new(),
-            receiver: Receiver::new(ceilings),
-            latched: None,
-            consumed: 0,
-        }
-    }
-
-    fn feed(&mut self, chunk: &[u8]) -> Result<Status, Error> {
-        if let Some(terminal) = self.latched {
-            // Terminal (§6.3): re-raise, and do not touch the bytes.
-            return Err(terminal);
-        }
-        self.consumed += chunk.len();
-        let outcome = self.stream.feed(chunk, &mut self.receiver);
-        if let Some(raised) = self.receiver.verdict {
-            // The ceiling fired inside the header hook. It was decided at the
-            // word, so it overrides the `INCOMPLETE` the corelib reports for a
-            // message whose payload never arrived.
-            self.latched = Some(raised);
-            return Err(raised);
-        }
-        if let Err(malformed) = outcome {
-            self.latched = Some(malformed);
-        }
-        outcome
-    }
-
-    /// Feed a whole case: its `chunks` when it has them, otherwise `serialized`
-    /// in one call. The answer is the first terminal verdict, or the outcome of
-    /// the last chunk when there is none.
-    fn feed_all(&mut self, chunks: &[Vec<u8>]) -> Outcome {
-        let mut last = Outcome::Complete;
-        for chunk in chunks {
-            last = Outcome::of(self.feed(chunk));
-            if last.is_rejection() {
-                return last;
-            }
-        }
-        last
-    }
-}
+use support::{
+    admitted, block, case_chunks, completing_payload, hex_to_bytes, Ceilings, Consumer, Outcome,
+    FORMAT_CEILING,
+};
 
 // --- reading the block -------------------------------------------------------
 
 fn header_limits() -> Vec<Value> {
-    let doc: Value = serde_json::from_str(VECTORS_JSON).expect("parse test_vectors.json");
-    doc["header_limits"]
-        .as_array()
-        .expect(
-            "the shared file carries a `header_limits` block \
-             (corelib-c-cpp#163); refresh assets/test_vectors.json",
-        )
-        .clone()
-}
-
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    assert!(hex.len() % 2 == 0, "odd-length hex string `{hex}`");
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
-        .collect()
-}
-
-/// The bytes a case is fed: `chunks` when present, else `serialized` whole.
-fn case_chunks(case: &Value) -> Vec<Vec<u8>> {
-    match case["chunks"].as_array() {
-        Some(chunks) => chunks
-            .iter()
-            .map(|c| hex_to_bytes(c.as_str().expect("chunk hex")))
-            .collect(),
-        None => vec![hex_to_bytes(
-            case["serialized"].as_str().expect("serialized hex"),
-        )],
-    }
-}
-
-/// The payload that would finish the message a case's header declares — the
-/// bytes that make `INCOMPLETE` mean what §5.2.1 says it means.
-///
-/// Only the shapes this block uses at an admitted size are built: a `string` /
-/// `blob` header at id 0 (its declared bytes) and an unsigned varint array header
-/// at id 0 (its declared elements, one byte each). `None` for anything else, and
-/// the caller then skips this check rather than guessing.
-fn completing_payload(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut pos = 0;
-    let header = read_varint(bytes, &mut pos)?;
-    if header >> 3 != 0 {
-        return None; // not the id-0 field these cases put on the wire
-    }
-    let word = read_varint(bytes, &mut pos)?;
-    match (header & 0x07) as u8 {
-        // fixlen: the length word carries `(len << 3) | subtype`.
-        0x2 => match (word & 0x07) as u8 {
-            0x2 | 0x3 => Some(vec![b'x'; usize::try_from(word >> 3).ok()?]),
-            _ => None,
-        },
-        // unsigned varint array: the count word, then one varint per element.
-        0x3 => Some(vec![0x00; usize::try_from(word).ok()?]),
-        _ => None,
-    }
-}
-
-/// A minimal varint reader for [`completing_payload`], independent of the crate's.
-fn read_varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    loop {
-        let byte = *bytes.get(*pos)?;
-        *pos += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(value);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return None;
-        }
-    }
+    block("header_limits")
 }
 
 // --- the block is well formed ------------------------------------------------
@@ -464,6 +124,15 @@ fn the_block_is_present_and_well_formed() {
         for key in ["group", "description", "field_id", "declared", "serialized"] {
             assert!(!case[key].is_null(), "[{name}] the case has no `{key}`");
         }
+        // The flat block puts every field at the top level; a case that grew a
+        // `frames` chain belongs in `header_limits_nested`, whose runner binds
+        // the ceiling at depth. Reading it here and ignoring it would cap
+        // nothing and answer `incomplete`.
+        assert!(
+            case["frames"].is_null(),
+            "[{name}] carries a `frames` chain; the nested block and its runner \
+             own that axis (tests/header_limits_nested_tests.rs)",
+        );
         let outcome = Outcome::named(case["expect"]["outcome"].as_str().expect("expect.outcome"));
 
         // A case states one ceiling or the other, never both: §6.2.1 forbids
@@ -542,8 +211,7 @@ fn every_header_limits_case_conforms() {
 
     for case in &cases {
         let name = case["name"].as_str().expect("name");
-        let tags = requires(case);
-        if !tags.iter().all(|t| capability_supported(t)) {
+        if !admitted(case) {
             // Unsatisfied `requires` means SKIP in this block, for every tag —
             // never the reduced-build rejection a vector gets.
             gated += 1;
@@ -552,13 +220,14 @@ fn every_header_limits_case_conforms() {
         ran += 1;
 
         let ceilings = Ceilings::of(case);
+        let field_id = ceilings.field_id;
         let chunks = case_chunks(case);
         let expected = Outcome::named(case["expect"]["outcome"].as_str().expect("expect.outcome"));
 
         // (a) feed `serialized` — or `chunks` where present — under the case's
         //     stated ceiling, and (b) assert `expect.outcome`.
         let mut consumer = Consumer::new(ceilings);
-        let got = consumer.feed_all(&chunks);
+        let got = consumer.feed_all(&chunks, name);
         checks += 1;
         assert_eq!(
             got,
@@ -589,13 +258,22 @@ fn every_header_limits_case_conforms() {
                 "[{name}] the terminal verdict consumed bytes / delivered fields \
                  instead of re-raising",
             );
+            // (d) rejected, never clamped (§6.2.1): nothing of the field was
+            //     materialized, checked *after* the further feeds so a late
+            //     materialization is caught too.
+            checks += 1;
+            assert_eq!(
+                consumer.receiver.materialized, 0,
+                "[{name}] the rejected field materialized payload; §6.2.1 rejects, \
+                 it does not clamp",
+            );
         } else {
             // The in-cap control, driven one step further: `INCOMPLETE` claims
             // more bytes can change the verdict (§5.2.1), so the payload the
             // header declares must complete the message under the same ceiling.
             assert_eq!(expected, Outcome::Incomplete);
             let whole = hex_to_bytes(case["serialized"].as_str().unwrap());
-            if let Some(payload) = completing_payload(&whole) {
+            if let Some(payload) = completing_payload(&whole, 0, field_id) {
                 checks += 1;
                 assert_eq!(
                     Outcome::of(consumer.feed(&payload)),
@@ -610,6 +288,11 @@ fn every_header_limits_case_conforms() {
     println!(
         "header_limits: {ran} of {} cases ran ({gated} gated out by `requires`), {checks} checks",
         cases.len(),
+    );
+    assert_eq!(
+        ran + gated,
+        cases.len(),
+        "every case is either run or gated, and named as one or the other",
     );
     assert!(ran > 0, "no header_limits case ran");
 }
@@ -637,7 +320,7 @@ fn the_identical_bytes_pair_keeps_the_two_categories_apart() {
 
     let run = |case: &Value| {
         let mut consumer = Consumer::new(Ceilings::of(case));
-        consumer.feed_all(&case_chunks(case))
+        consumer.feed_all(&case_chunks(case), case["name"].as_str().unwrap_or("?"))
     };
     // A receiver cap: the bytes are well-formed, this receiver declines to hold
     // that much (§6.2.1). A schema bound: the bytes are not a legal value for
@@ -667,15 +350,13 @@ fn lifting_the_ceilings_falls_back_to_incomplete() {
             continue;
         }
         let name = case["name"].as_str().unwrap();
-        let tags = requires(case);
-        if !tags.iter().all(|t| capability_supported(t)) {
+        if !admitted(case) {
             continue;
         }
         let declared = case["declared"].as_u64().expect("declared");
-        let field_id = case["field_id"].as_u64().expect("field_id") as Id;
 
-        let mut consumer = Consumer::new(Ceilings::lifted(field_id));
-        let got = consumer.feed_all(&case_chunks(case));
+        let mut consumer = Consumer::new(Ceilings::lifted(case));
+        let got = consumer.feed_all(&case_chunks(case), name);
 
         if declared > FORMAT_CEILING {
             format_rejected += 1;
