@@ -34,9 +34,10 @@ byte-for-byte, with every other `corelib-*` port.
 
 ### Dependencies
 
-None at runtime — only the standard library. The lone external crates are
-dev-only (`libc` for the benchmark CPU clock, `serde_json` for the test vectors)
-and are not pulled into downstream builds.
+None at runtime by default — only the standard library. The one optional
+dependency is `heapless`, behind the feature of the same name (below). The other
+external crates are dev-only (`libc` for the benchmark CPU clock, `serde_json`
+for the test vectors) and are not pulled into downstream builds.
 
 ### Packaging
 
@@ -53,9 +54,19 @@ use sofab::{OStream, decode};
 
 ### Feature flags
 
-**None — always the full format.** Every wire type is compiled in and the scalar
-value type is always 64-bit; there is no footprint profile and no build option
-that narrows either.
+**Always the full format.** Every wire type is compiled in and the scalar value
+type is always 64-bit; there is no footprint profile and no build option that
+narrows either.
+
+| Feature | Default | Adds |
+|---------|:------:|------|
+| `heapless` | — | `sofab::seq::SeqVec` for `heapless::Vec<T, N>` (no wire code) |
+
+`heapless` exists for generated code that holds a schema-bounded wrapper array
+in fixed-capacity storage (sofabgen `rust.allow_dynamic: false`): the trait the
+`seq` helpers grow a destination through is this crate's, so its impl for a
+foreign container has to live here too. sofabgen turns it on for exactly the
+crates that need it.
 
 One option from the specification is **pinned**: `SOFAB_STRICT_UTF8`
 (CORELIB_PLAN §6.4) is a no-op here, fixed **ON**, and no `utf8_valid` primitive
@@ -94,23 +105,37 @@ judge the declared size there and reject terminally instead of asking for more
 bytes that cannot change the answer. `tests/header_limits_tests.rs` runs the
 block with a minimal receiver standing in for generated code.
 
-### Growth is reported, not counted
+### Growth is reported, and grown through `sofab::seq`
 
 The file's `sequence_growth` cases deliver element ids into a wrapper array,
 whose length is *highest present id + 1* — it carries no count on the wire
-(MESSAGE_SPEC §5.1). `tests/sequence_growth_tests.rs` runs them, with the same
-kind of minimal receiver: this crate ships no collector layer, so the growing
-container and its `max_dyn_array_count` cap live above the corelib, and what the
-block pins here is the corelib's half — that every element id is reported
-sparsely and unshifted, that an id is announced *before* its frame is entered so
-a cap can refuse it before the container grows, and that the refusal is terminal.
+(MESSAGE_SPEC §5.1). `tests/sequence_growth_tests.rs` runs them against the
+crate's own wrapper-array layer, `sofab::seq`, with the `max_dyn_array_count`
+cap passed in per call as `seq::Bound::Cap` — the call generated code makes.
+The block therefore pins both halves: the codec's (every element id is reported
+sparsely and unshifted, and *before* its frame is entered, so a cap can refuse
+it before the container grows) and the helper's (the refusal comes before any
+extension, is `LimitExceeded` rather than `InvalidMsg`, and is terminal).
 
-One half is deliberately **not** asserted: a conformant decoder grows to *at
-least* `id + 1` rather than exactly it, so a sparse array does not cost O(n²)
-copies (ARCHITECTURE §9.5 shape B). That is a property of the container, and the
-container in these tests is the test's own, so asserting it here would measure
-this repository rather than the library. CORELIB_PLAN §7.2 item 8 asks a port to
-say so rather than report the case as passed — this is that statement.
+`sofab::seq` is the support layer generated code calls around a `Visitor`
+callback, never the codec:
+
+- `place_elem` puts a `string` / `blob` element at its id, `reserve_elem` makes
+  the slot a `struct` / `union` / nested element is routed into, and
+  `reserve_row` reserves and empties a matrix row. Each fills a gap with the
+  element default and checks the id **before** it grows anything.
+- `check_index` and `check_len` are the comparisons alone, for the element
+  index and the element `maxlen` at the length word.
+- `Bound::Schema(n)` is the schema's `count` / `maxlen` (a breach is
+  `InvalidMsg`); `Bound::Cap(n)` is the receiver cap for a field the schema
+  leaves open (a breach is `LimitExceeded`). Exactly one is passed; the crate
+  holds no cap of its own.
+- The destination is anything implementing `seq::SeqVec`: `Vec<T>` always,
+  `heapless::Vec<T, N>` with the `heapless` feature.
+
+Growth geometry is asserted too (`tests/seq_tests.rs`): `Vec` grows by its own
+amortised doubling, so a sparse array does not cost O(n²) copies (ARCHITECTURE
+§9.5 shape B).
 
 ### A boolean is tolerant on decode and canonical on encode
 
@@ -548,6 +573,7 @@ path, for any message.
 cargo build --release            # opt-level 3, fat LTO
 cargo test                       # unit + integration + doctests (incl. shared vectors)
 cargo test --release             # the same suite in the shipped configuration
+cargo test --all-features        # + the `heapless` impl of `seq::SeqVec` and its tests
 ./coverage.sh                    # llvm-cov: summary + HTML + lcov.info
 ```
 

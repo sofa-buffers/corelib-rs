@@ -38,7 +38,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
+      # `--all-features` so the `heapless` impl of `seq::SeqVec` is linted too.
+      - run: cargo clippy --all-features --all-targets -- -D warnings
 
       # The Pages workflow (`docs.yml`) builds rustdoc with warnings denied, but
       # only on push to main — so a broken intra-doc link was discovered after
@@ -47,7 +48,7 @@ jobs:
       - name: Rustdoc (deny warnings)
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
+        run: cargo doc --all-features --no-deps
 
   # Build + full test suite against stable compilers only — no beta, no nightly.
   #   stable             = whatever is current on the day the job runs
@@ -68,6 +69,10 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo build --release --verbose
       - run: cargo test --verbose
+      # The one feature, `heapless`, adds the fixed-capacity `seq::SeqVec` impl
+      # and the `seq_tests` suites that run against it. The default run above
+      # keeps proving the crate builds and passes without it.
+      - run: cargo test --all-features --verbose
 
       # State what the shared-vector suite ran. `cargo test` captures stdout for
       # passing tests, so the vector target is replayed with `--nocapture` to put
@@ -129,7 +134,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/rust
-      - run: cargo test --release --verbose
+      - run: cargo test --release --all-features --verbose
 
   # The MSRV declared in Cargo.toml (`rust-version`). Library-only: the dev-
   # dependency tree (serde_json -> zmij) needs 1.71+, so `cargo test` can't run
@@ -145,6 +150,9 @@ jobs:
         with:
           toolchain: "1.70"
       - run: cargo build --release --verbose
+      # And with the `heapless` container impl, which pulls in the one
+      # optional dependency a generated crate may enable.
+      - run: cargo build --release --all-features --verbose
 
   # Same suite on a big-endian host (IBM Z / s390x) under QEMU, proving the
   # little-endian wire format round-trips correctly off little-endian hardware.
@@ -176,7 +184,7 @@ jobs:
 
       - name: Measure coverage
         run: |
-          cargo llvm-cov --lcov --output-path lcov.info
+          cargo llvm-cov --all-features --lcov --output-path lcov.info
           cargo llvm-cov report --summary-only --json --output-path coverage.json
           PCT=$(jq '.data[0].totals.lines.percent' coverage.json)
           printf 'line coverage: %.1f%%\n' "$PCT"

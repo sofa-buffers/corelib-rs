@@ -218,6 +218,30 @@ fn ci_reports_the_shared_vector_counts() {
     );
 }
 
+/// The `heapless` feature carries the fixed-capacity `seq::SeqVec` impl and
+/// the `seq_tests` suites that run against it (generator#587). A plain
+/// `cargo test` compiles neither, so a workflow that never turned it on would
+/// ship the impl untested and still be green — in both profiles.
+#[test]
+fn ci_tests_the_heapless_feature_in_both_profiles() {
+    let with_all = |optimized: bool| {
+        cargo_invocations(CI_YML).into_iter().any(|args| {
+            is_test_run(&args)
+                && is_optimized(&args) == optimized
+                && args.iter().any(|a| a == "--all-features")
+        })
+    };
+    assert!(
+        with_all(false),
+        "no unoptimized `cargo test --all-features`; the heapless seq impl is never tested"
+    );
+    assert!(
+        with_all(true),
+        "no optimized `cargo test --all-features`; the heapless seq impl is never tested \
+         in the profile users link against"
+    );
+}
+
 /// CORELIB_PLAN §13 asks for CI "on push and PR", and corelib-rs#98 restates it
 /// for the vector suite. Both triggers have to be declared: `pull_request` is
 /// what gates a change before it lands, the push leg is what proves main itself

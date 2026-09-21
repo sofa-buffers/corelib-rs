@@ -52,10 +52,14 @@ pub enum Error {
     /// divergence. It is a hard decode error — the message is rejected, never
     /// clamped or truncated — and this crate never sets a default limit.
     ///
-    /// This corelib itself does **not** enforce any limit: the values are
-    /// configured in sofabgen and baked into the generated decode visitor, which
-    /// checks the count/length exposed by the decode callbacks *before* allocating
-    /// and reports a violation as this category. See sofa-buffers/generator#102.
+    /// This corelib itself **holds** no limit: the values are configured in
+    /// sofabgen and baked into the generated decode visitor, which checks the
+    /// count/length exposed by the decode callbacks *before* allocating and
+    /// reports a violation as this category. The codec never returns it. The
+    /// [`crate::seq`] helpers do, but only against a cap the caller passes in
+    /// for that one call ([`crate::seq::Bound::Cap`]) — a comparison, not a
+    /// limit of this crate's own (CORELIB_PLAN §6.2.1). See
+    /// sofa-buffers/generator#102 and #587.
     LimitExceeded,
 }
 
