@@ -16,6 +16,13 @@ guard (tag ↔ manifest, version not already on crates.io) → ci-status (`ci.ym
 must have passed on the exact SHA) → package-smoke → publish (Trusted Publishing/OIDC,
 environment `crates-io`, **no approval gate**) → verify (install from crates.io).
 
+**Tag format: always a lowercase `v` followed by plain semver, e.g. `v1.2.3`** (not
+`1.2.3`, `V1.2.3` or `release-1.2.3`). The workflows don't enforce all of this: the
+`release.yml` guard strips a leading `v` only if it's there, so a bare `1.2.3` would
+still publish, while `version-consistency.yml` only triggers on `v*`. Check the name
+yourself before tagging:
+`[[ "vX.Y.Z" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] && echo ok`.
+
 **A crates.io version cannot be changed or deleted, only yanked.** Once the Release
 is published there's no undo. Ask the user for an explicit OK before step 6
 (pushing the tag) and again before step 8 (the Release).
@@ -93,6 +100,7 @@ exactly this SHA.
 
 ### 5. Final check before tagging
 - `git log -1` is the release merge commit, and `Cargo.toml` says `X.Y.Z`
+- the tag name is `v` + exactly that version (lowercase `v`, e.g. `v1.2.3`; see the format rule above)
 - the version is still free on crates.io:
   `curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: corelib-rs release' https://crates.io/api/v1/crates/sofa-buffers-corelib/X.Y.Z` → `404`
 
