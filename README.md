@@ -668,7 +668,7 @@ format, each built for its target:
 - **[`corelib-rs-no-std`](https://github.com/sofa-buffers/corelib-rs-no-std)** —
   `#![no_std]`, no allocator, `opt-level = "z"` + LTO, size-tuned for bare-metal
   firmware. About **1.4× micropb throughput** at a Cortex-M flash footprint of
-  roughly **6.8 KB vs ~8.5 KB**.
+  roughly **6.9 KB vs ~8.4 KB**.
 
 | | `corelib-rs` (this crate) | `corelib-rs-no-std` |
 |---|---|---|
@@ -677,7 +677,7 @@ format, each built for its target:
 | Release profile | `opt-level = 3`, fat LTO | `opt-level = "z"`, LTO |
 | Optimized for | raw throughput | small `.text` footprint |
 | Configurable format | no — always full | Cargo features trim wire types / value width |
-| Arena reference | ~1.4× prost | ~1.4× micropb; Cortex-M ~6.8 KB vs ~8.5 KB |
+| Arena reference | ~1.4× prost | ~1.4× micropb; Cortex-M ~6.9 KB vs ~8.4 KB |
 
 The public API mirrors between the two, so moving code across is at most a profile
 change. Arena figures are approximate (best-of-5, comparable only within a
