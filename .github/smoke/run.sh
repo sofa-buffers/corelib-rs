@@ -2,8 +2,8 @@
 # Consume the crate the way a stranger would: from outside the repository, as an
 # ordinary dependency, through nothing but its public API.
 #
-#   CRATE=sofa-buffers-corelib .github/smoke/run.sh 'path = "target/package/sofa-buffers-corelib-0.11.0"'
-#   CRATE=sofa-buffers-corelib .github/smoke/run.sh 'version = "=0.11.0"'
+#   CRATE=sofa-buffers-corelib .github/smoke/run.sh 'path = "target/package/sofa-buffers-corelib-0.12.0"'
+#   CRATE=sofa-buffers-corelib .github/smoke/run.sh 'version = "=0.12.0"'
 #
 # The argument is the right-hand side of the dependency line, so the same
 # script covers both halves of a release: the packaged artifact before the

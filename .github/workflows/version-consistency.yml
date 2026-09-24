@@ -4,8 +4,8 @@ name: "Version consistency"
 # Cargo.toml's `package.version` must be exactly that.
 #
 # Tags only, deliberately. Between releases the manifest legitimately runs
-# ahead of the newest tag — today Cargo.toml says 0.11.0 while the newest tag
-# is v0.10.0, because the 0.11 series is API-incompatible with 0.10.x and the
+# ahead of the newest tag — e.g. Cargo.toml said 0.11.0 while the newest tag
+# was v0.10.0, because the 0.11 series is API-incompatible with 0.10.x and the
 # version was bumped when the break landed, not when it ships. Running this on
 # every push and pull request would flag that healthy state as a failure and
 # burn a runner slot per run; on a tag push the comparison is the only thing

@@ -9,8 +9,8 @@ name: Release
 #
 # Every check sits before the upload on purpose: a crates.io version can never
 # be replaced or deleted, only yanked — and a yanked version still serves every
-# lockfile that already references it. There is no second chance to get 0.11.0
-# right.
+# lockfile that already references it. There is no second chance to get a
+# version right.
 #
 # `workflow_dispatch` runs the identical pipeline against an existing tag as a
 # rehearsal and stops short of the publish, so the machinery can be exercised
@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to rehearse against (e.g. v0.11.0). Runs every check, publishes nothing."
+        description: "Existing tag to rehearse against (e.g. v0.12.0). Runs every check, publishes nothing."
         required: true
         type: string
 

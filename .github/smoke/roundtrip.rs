@@ -12,7 +12,7 @@
 //! `assets/test_vectors.json` suite the release gate runs. Keep this a
 //! dependency-free round trip through the public API.
 
-use sofab::{decode, Id, OStream, Signed, Unsigned, Visitor};
+use sofab::{decode, Id, OStream, Signed, Status, Unsigned, Visitor};
 
 #[derive(Default)]
 struct Probe {
@@ -58,7 +58,11 @@ fn main() {
 
     // Decode it back through the push-based visitor.
     let mut probe = Probe::default();
-    decode(message, &mut probe).expect("decode the message just encoded");
+    assert_eq!(
+        decode(message, &mut probe),
+        Ok(Status::Complete),
+        "decode the message just encoded"
+    );
     assert_eq!(probe.a, 42, "field 1 round-tripped");
     assert_eq!(probe.b, -7, "field 2 round-tripped");
     assert_eq!(probe.s, "hi", "field 3 round-tripped");
@@ -66,7 +70,11 @@ fn main() {
     // A default-valued message carries no bytes at all (MESSAGE_SPEC §5.1),
     // and decoding nothing must fire no callback rather than fail.
     let mut empty = Probe::default();
-    decode(&[], &mut empty).expect("the empty message is valid");
+    assert_eq!(
+        decode(&[], &mut empty),
+        Ok(Status::Complete),
+        "the empty message is valid"
+    );
     assert_eq!((empty.a, empty.b, empty.s.as_str()), (0, 0, ""));
 
     println!("smoke ok — {used} bytes: {message:02x?}");
