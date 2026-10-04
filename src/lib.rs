@@ -114,6 +114,7 @@
 #![deny(missing_docs)]
 
 mod error;
+pub mod float_bits;
 mod istream;
 mod ostream;
 mod payload;

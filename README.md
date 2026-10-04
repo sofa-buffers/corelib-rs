@@ -137,6 +137,17 @@ Growth geometry is asserted too (`tests/seq_tests.rs`): `Vec` grows by its own
 amortised doubling, so a sparse array does not cost O(n²) copies (ARCHITECTURE
 §9.5 shape B).
 
+### A float array is compared by bit pattern: `sofab::float_bits`
+
+A generated encoder omits a field equal to its default (MESSAGE_SPEC §2), and
+floats round-trip bit-for-bit (CORELIB_PLAN §4.6), so an `fp32` / `fp64` array
+holding `-0.0` is not the default `[0.0, ...]`. `float_bits::bits_equal(a, b)`
+is true iff the lengths match and every element has the same IEEE-754 bit
+pattern: `+0.0` and `-0.0` differ, a NaN equals another NaN only when the
+patterns (payload included) are identical, and no IEEE `==` is involved. It
+takes two slices, so a field container and a literal default both work
+(`tests/float_bits_tests.rs`).
+
 ### A boolean is tolerant on decode and canonical on encode
 
 CORELIB_PLAN §4.4: an encoder **must** write `true` as `1`, and a decoder **must**
