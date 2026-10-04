@@ -13,26 +13,16 @@
 //! instead of being emitted into every generated crate (generator#587,
 //! ARCHITECTURE §8).
 //!
-//! It is safe code and allocates nothing.
+//! It allocates nothing and mutates nothing; its one `unsafe` block is the
+//! byte view behind the block compare.
 
 /// A float element type whose raw IEEE-754 bit pattern can be compared:
 /// [`f32`] (32-bit pattern) and [`f64`] (64-bit pattern).
 ///
 /// Sealed: the two impls below are the only ones, and the set is not meant to
-/// grow.
-pub trait FloatBits: Copy + sealed::Sealed {
-    /// The unsigned integer holding the bit pattern.
-    type Bits: Copy
-        + Eq
-        + core::ops::BitXor<Output = Self::Bits>
-        + core::ops::BitOr<Output = Self::Bits>;
-
-    /// The all-zero pattern, the identity of the XOR/OR accumulation.
-    const ZERO: Self::Bits;
-
-    /// The raw bit pattern of `self` (`f32::to_bits` / `f64::to_bits`).
-    fn bits(self) -> Self::Bits;
-}
+/// grow. The block compare in [`bits_equal`] relies on both being padding-free
+/// plain-old-data.
+pub trait FloatBits: Copy + sealed::Sealed {}
 
 mod sealed {
     pub trait Sealed {}
@@ -40,23 +30,8 @@ mod sealed {
     impl Sealed for f64 {}
 }
 
-impl FloatBits for f32 {
-    type Bits = u32;
-    const ZERO: u32 = 0;
-    #[inline(always)]
-    fn bits(self) -> u32 {
-        self.to_bits()
-    }
-}
-
-impl FloatBits for f64 {
-    type Bits = u64;
-    const ZERO: u64 = 0;
-    #[inline(always)]
-    fn bits(self) -> u64 {
-        self.to_bits()
-    }
-}
+impl FloatBits for f32 {}
+impl FloatBits for f64 {}
 
 /// `true` iff `a` and `b` have the same length and every pair of elements has
 /// the **same IEEE-754 bit pattern** (32 bits for `f32`, 64 bits for `f64`).
@@ -86,11 +61,21 @@ pub fn bits_equal<T: FloatBits>(a: &[T], b: &[T]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    // One accumulated difference instead of an early exit per element: the
-    // loop has no data-dependent branch, so the compiler can vectorise it.
-    let mut diff = T::ZERO;
-    for (x, y) in a.iter().zip(b) {
-        diff = diff | (x.bits() ^ y.bits());
-    }
-    diff == T::ZERO
+    // One block compare (lowers to `bcmp`/`memcmp`, which early-exits and is
+    // vectorised by libc). Equal bit patterns are exactly equal bytes, whatever
+    // the endianness, so no per-element `to_bits` is needed.
+    //
+    // SAFETY: `f32`/`f64` have no padding and every byte is initialised, so
+    // viewing them as `u8` is valid; `u8` has alignment 1; the byte length
+    // `len * size_of::<T>()` cannot overflow because the source slice already
+    // fits in `isize::MAX` bytes; the borrows keep the memory alive and
+    // unmutated for the duration of the compare.
+    let (x, y) = unsafe {
+        let n = core::mem::size_of_val(a);
+        (
+            core::slice::from_raw_parts(a.as_ptr().cast::<u8>(), n),
+            core::slice::from_raw_parts(b.as_ptr().cast::<u8>(), n),
+        )
+    };
+    x == y
 }
