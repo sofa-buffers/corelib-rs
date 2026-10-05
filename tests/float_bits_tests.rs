@@ -165,6 +165,27 @@ macro_rules! suite {
             }
 
             #[test]
+            fn every_length_and_index_around_the_first_word() {
+                // The helper rejects a first-word mismatch before its block
+                // compare; this walks every index of every short length so a
+                // difference inside, straddling and beyond that first 8 bytes
+                // is seen, for a flipped low bit and for the sign bit alone.
+                for len in 1usize..=40 {
+                    let base: Vec<F> = (0..len).map(|i| i as F + 0.25).collect();
+                    assert!(bits_equal(&base, &base.clone()), "len {len}");
+                    for i in 0..len {
+                        for flip in [1 as B, SIGN] {
+                            let mut v = base.clone();
+                            v[i] = F::from_bits(v[i].to_bits() ^ flip);
+                            assert!(!bits_equal(&base, &v), "len {len} idx {i}");
+                            assert!(!bits_equal(&v, &base), "len {len} idx {i}");
+                        }
+                    }
+                    assert!(!bits_equal(&base, &base[..len - 1]), "len {len}");
+                }
+            }
+
+            #[test]
             fn slices_vectors_and_literals_all_borrow() {
                 let v: Vec<F> = vec![0.0, 1.5];
                 let arr: [F; 2] = [0.0, 1.5];

@@ -77,5 +77,10 @@ pub fn bits_equal<T: FloatBits>(a: &[T], b: &[T]) -> bool {
             core::slice::from_raw_parts(b.as_ptr().cast::<u8>(), n),
         )
     };
+    // A mismatch in the first word is the commonest way for a field to leave its
+    // default; reject it inline so that case never pays for the library call.
+    if x.len() >= 8 && x[..8] != y[..8] {
+        return false;
+    }
     x == y
 }
