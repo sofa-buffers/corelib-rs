@@ -98,9 +98,12 @@
 //! * `Vec<T>` — always in `corelib-rs`; behind the `alloc` feature in
 //!   `corelib-rs-no-std`. Growth is `Vec`'s own amortised doubling, so a sparse
 //!   array does not cost O(n²) copies (ARCHITECTURE §9.5 shape B).
-//! * `heapless::Vec<T, N>` — behind the `heapless` feature in both crates.
-//!   `grow_to` refuses up front when the target length exceeds `N`, so a refusal
-//!   never leaves a partial extension either.
+//! * `heapless::Vec<T, N>` — behind the `heapless` feature (heapless 0.8) and
+//!   the `heapless09` feature (heapless 0.9, any length type `LenT`) in both
+//!   crates. The two majors are distinct types; enable the one the crate's own
+//!   `heapless` dependency names, or both. `grow_to` refuses up front when the
+//!   target length exceeds `N`, so a refusal never leaves a partial extension
+//!   either.
 //! * Anything else — implement [`SeqVec`] for it; the functions are generic.
 //!
 //! # Cost
@@ -171,9 +174,9 @@ pub enum Bound {
 
 /// The destination of a wrapper array: a sequence of slots that can grow.
 ///
-/// Implemented for `Vec<T>` and, behind the `heapless` feature,
-/// `heapless::Vec<T, N>`; see the [module docs](self) for which build carries
-/// which. Implement it for any other container a generated message holds.
+/// Implemented for `Vec<T>` and, behind the `heapless` / `heapless09`
+/// features, `heapless::Vec<T, N>` of heapless 0.8 / 0.9; see the
+/// [module docs](self) for which build carries which. Implement it for any other container a generated message holds.
 pub trait SeqVec {
     /// What one slot holds.
     type Elem;
@@ -368,5 +371,43 @@ impl<T: Default, const N: usize> SeqVec for heapless::Vec<T, N> {
     #[inline]
     fn clear(&mut self) {
         heapless::Vec::clear(self);
+    }
+}
+
+// heapless 0.9: the same impl, behind its own feature over a renamed
+// dependency so it can sit next to 0.8. 0.9's `Vec` carries a length-type
+// parameter (`Vec<T, N, LenT = usize>`); the impl is generic over it, so
+// whichever length type the destination picked is covered.
+#[cfg(feature = "heapless09")]
+impl<T: Default, LenT: heapless09::LenType, const N: usize> SeqVec for heapless09::Vec<T, N, LenT> {
+    type Elem = T;
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    #[inline]
+    fn grow_to(&mut self, len: usize) -> bool {
+        // Refuse up front, so a full container never grows part of the way.
+        if len > N {
+            return false;
+        }
+        while self.as_slice().len() < len {
+            if self.push(T::default()).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline]
+    fn slot_mut(&mut self, i: usize) -> Option<&mut T> {
+        self.as_mut_slice().get_mut(i)
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        heapless09::Vec::<T, N, LenT>::clear(self);
     }
 }

@@ -18,9 +18,11 @@
 //!
 //! Every wire type is always compiled in — there is **no build-time
 //! configuration of the wire format**. The scalar value type is always 64-bit
-//! (`u64`/`i64`). The one Cargo feature, `heapless`, adds no wire code: it
-//! implements [`seq::SeqVec`] for `heapless::Vec`, so generated code that holds
-//! a bounded wrapper array in fixed-capacity storage can use [`seq`] too. The wire format is byte-identical to every other `corelib-*`
+//! (`u64`/`i64`). The two Cargo features, `heapless` (heapless 0.8) and
+//! `heapless09` (heapless 0.9, needs rustc 1.87), add no wire code: each
+//! implements [`seq::SeqVec`] for its major's `heapless::Vec`, so generated code
+//! that holds a bounded wrapper array in fixed-capacity storage can use [`seq`]
+//! too. The wire format is byte-identical to every other `corelib-*`
 //! port, and the method names mirror the no_std crate so code moves between them
 //! freely.
 //!
