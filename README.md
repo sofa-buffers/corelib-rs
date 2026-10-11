@@ -30,12 +30,15 @@ byte-for-byte, with every other `corelib-*` port.
 ### Requirements
 
 **Rust 1.70 or newer**, edition 2021. Builds on `std` only — use
-`corelib-rs-no-std` for embedded / `no_std`.
+`corelib-rs-no-std` for embedded / `no_std`. The optional `heapless09` feature
+needs **Rust 1.87 or newer** (heapless 0.9's own minimum); every build without it
+keeps the 1.70 floor.
 
 ### Dependencies
 
 None at runtime by default — only the standard library. The one optional
-dependency is `heapless`, behind the feature of the same name (below). The other
+dependency is `heapless`, in two majors behind two features: 0.8 behind
+`heapless`, 0.9 behind `heapless09` (below). The other
 external crates are dev-only (`libc` for the benchmark CPU clock, `serde_json`
 for the test vectors) and are not pulled into downstream builds.
 
@@ -60,13 +63,17 @@ narrows either.
 
 | Feature | Default | Adds |
 |---------|:------:|------|
-| `heapless` | — | `sofab::seq::SeqVec` for `heapless::Vec<T, N>` (no wire code) |
+| `heapless` | — | `sofab::seq::SeqVec` for heapless 0.8's `heapless::Vec<T, N>` (no wire code) |
+| `heapless09` | — | `sofab::seq::SeqVec` for heapless 0.9's `heapless::Vec<T, N, LenT>` (no wire code; needs Rust 1.87) |
 
-`heapless` exists for generated code that holds a schema-bounded wrapper array
-in fixed-capacity storage (sofabgen `rust.allow_dynamic: false`): the trait the
-`seq` helpers grow a destination through is this crate's, so its impl for a
-foreign container has to live here too. sofabgen turns it on for exactly the
-crates that need it.
+`heapless` and `heapless09` exist for generated code that holds a schema-bounded
+wrapper array in fixed-capacity storage (sofabgen `rust.allow_dynamic: false`):
+the trait the `seq` helpers grow a destination through is this crate's, so its
+impl for a foreign container has to live here too. A `heapless::Vec` of 0.8 and
+one of 0.9 are different types, so enable the feature that matches the major
+your crate depends on (sofabgen's `rust.heapless` option picks it); both can be
+on at once. sofabgen turns the right one on for exactly the crates that need
+it.
 
 One option from the specification is **pinned**: `SOFAB_STRICT_UTF8`
 (CORELIB_PLAN §6.4) is a no-op here, fixed **ON**, and no `utf8_valid` primitive
@@ -131,7 +138,8 @@ callback, never the codec:
   leaves open (a breach is `LimitExceeded`). Exactly one is passed; the crate
   holds no cap of its own.
 - The destination is anything implementing `seq::SeqVec`: `Vec<T>` always,
-  `heapless::Vec<T, N>` with the `heapless` feature.
+  `heapless::Vec<T, N>` with the `heapless` (0.8) or `heapless09` (0.9)
+  feature.
 
 Growth geometry is asserted too (`tests/seq_tests.rs`): `Vec` grows by its own
 amortised doubling, so a sparse array does not cost O(n²) copies (ARCHITECTURE
@@ -584,7 +592,7 @@ path, for any message.
 cargo build --release            # opt-level 3, fat LTO
 cargo test                       # unit + integration + doctests (incl. shared vectors)
 cargo test --release             # the same suite in the shipped configuration
-cargo test --all-features        # + the `heapless` impl of `seq::SeqVec` and its tests
+cargo test --all-features        # + the heapless 0.8 / 0.9 impls of `seq::SeqVec` and their tests
 ./coverage.sh                    # llvm-cov: summary + HTML + lcov.info
 ```
 
@@ -595,7 +603,8 @@ tests live in `tests/` and replay the shared vectors from
 
 CI runs the same commands plus fmt + clippy (`-D warnings`), on **stable** and the
 three most recent pinned stable releases, a library-only build at the declared
-**MSRV 1.70**, and the suite on a **big-endian** s390x host under QEMU.
+**MSRV 1.70** (every feature but `heapless09`), the `heapless09` build and suite
+at its **1.87** floor, and the suite on a **big-endian** s390x host under QEMU.
 
 ## Benchmarks
 

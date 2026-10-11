@@ -264,3 +264,12 @@ fn a_heapless_vec_borrows_as_a_slice() {
     assert!(!bits_equal(&v[..], &[0.0, 1.5]));
     assert!(bits_equal(&v[..], &[-0.0, 1.5]));
 }
+
+#[cfg(feature = "heapless09")]
+#[test]
+fn a_heapless09_vec_borrows_as_a_slice() {
+    let mut v: heapless09::Vec<f32, 4> = heapless09::Vec::new();
+    v.extend_from_slice(&[-0.0, 1.5]).unwrap();
+    assert!(!bits_equal(&v[..], &[0.0, 1.5]));
+    assert!(bits_equal(&v[..], &[-0.0, 1.5]));
+}

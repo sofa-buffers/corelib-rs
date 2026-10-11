@@ -383,82 +383,103 @@ mod vec_specific {
 }
 
 // --- heapless::Vec<T, N> -----------------------------------------------------
+//
+// Two majors of heapless, one suite: `heapless` is 0.8, `heapless09` is 0.9
+// (a renamed dependency). Each feature carries its own `SeqVec` impl, so each
+// gets the full set of tests; both may be on at once.
+
+macro_rules! heapless_suites {
+    ($hl:ident, $u32s:ident, $rows:ident, $specific:ident) => {
+        container_suite!($u32s, $hl::Vec<u32, 8>);
+
+        row_suite!(
+            $rows,
+            $hl::Vec<$hl::Vec<u32, 4>, 4>,
+            |r: &mut $hl::Vec<u32, 4>, v| r.push(v).unwrap()
+        );
+
+        mod $specific {
+            use sofab::seq::{self, Bound, SeqVec};
+            use sofab::Error;
+
+            #[test]
+            fn a_full_container_refuses_with_argument_and_grows_by_nothing() {
+                // Storage shorter than the bound it is checked against — the
+                // destination is too short for the message, never a truncated array.
+                let mut c: $hl::Vec<u32, 3> = $hl::Vec::new();
+                seq::place_elem(&mut c, 1, Bound::Schema(8), 11).unwrap();
+                assert_eq!(
+                    seq::place_elem(&mut c, 5, Bound::Schema(8), 15),
+                    Err(Error::Argument)
+                );
+                assert_eq!(&c[..], &[0, 11], "no partial extension toward id 5");
+                assert_eq!(
+                    seq::reserve_elem(&mut c, 3, Bound::Cap(8)).map(|_| ()),
+                    Err(Error::Argument)
+                );
+                assert_eq!(c.len(), 2);
+                // The last slot still fits.
+                seq::place_elem(&mut c, 2, Bound::Schema(8), 12).unwrap();
+                assert_eq!(&c[..], &[0, 11, 12]);
+            }
+
+            #[test]
+            fn grow_to_refuses_past_capacity_up_front() {
+                let mut c: $hl::Vec<u32, 2> = $hl::Vec::new();
+                assert!(!c.grow_to(3));
+                assert!(c.is_empty());
+                assert!(c.grow_to(2));
+                assert_eq!(&c[..], &[0, 0]);
+            }
+
+            #[test]
+            fn fixed_string_elements_are_reserved_then_written_in_place() {
+                // What generated code does with `heapless::String<N>` elements: reserve
+                // the slot, then write the payload into it.
+                let mut c: $hl::Vec<$hl::String<8>, 4> = $hl::Vec::new();
+                let s = seq::reserve_elem(&mut c, 2, Bound::Schema(4)).unwrap();
+                s.clear();
+                s.push_str("hi").unwrap();
+                assert_eq!(c.len(), 3);
+                assert_eq!(c[0], "");
+                assert_eq!(c[2], "hi");
+                assert_eq!(
+                    seq::reserve_elem(&mut c, 4, Bound::Schema(4)).map(|_| ()),
+                    Err(Error::InvalidMsg)
+                );
+                assert_eq!(c.len(), 3);
+            }
+
+            #[test]
+            fn an_element_payload_over_maxlen_is_refused_at_the_length_word() {
+                // `array<string, count: 4, maxlen: 8>`: the length word announces 9
+                // bytes. The verdict comes before any slot is reserved or any byte
+                // accumulated, so the container is untouched.
+                let c: $hl::Vec<$hl::String<8>, 4> = $hl::Vec::new();
+                let (id, total) = (1u32, 9usize);
+                assert_eq!(seq::check_index(id, Bound::Schema(4)), Ok(()));
+                assert_eq!(
+                    seq::check_len(total, Bound::Schema(8)),
+                    Err(Error::InvalidMsg)
+                );
+                assert!(c.is_empty());
+            }
+        }
+    };
+}
 
 #[cfg(feature = "heapless")]
-container_suite!(heapless_u32, heapless::Vec<u32, 8>);
+heapless_suites!(heapless, heapless_u32, heapless_rows, heapless_specific);
 
-#[cfg(feature = "heapless")]
-row_suite!(
-    heapless_rows,
-    heapless::Vec<heapless::Vec<u32, 4>, 4>,
-    |r: &mut heapless::Vec<u32, 4>, v| r.push(v).unwrap()
+#[cfg(feature = "heapless09")]
+heapless_suites!(
+    heapless09,
+    heapless09_u32,
+    heapless09_rows,
+    heapless09_specific
 );
 
-#[cfg(feature = "heapless")]
-mod heapless_specific {
-    use sofab::seq::{self, Bound, SeqVec};
-    use sofab::Error;
-
-    #[test]
-    fn a_full_container_refuses_with_argument_and_grows_by_nothing() {
-        // Storage shorter than the bound it is checked against — the
-        // destination is too short for the message, never a truncated array.
-        let mut c: heapless::Vec<u32, 3> = heapless::Vec::new();
-        seq::place_elem(&mut c, 1, Bound::Schema(8), 11).unwrap();
-        assert_eq!(
-            seq::place_elem(&mut c, 5, Bound::Schema(8), 15),
-            Err(Error::Argument)
-        );
-        assert_eq!(&c[..], &[0, 11], "no partial extension toward id 5");
-        assert_eq!(
-            seq::reserve_elem(&mut c, 3, Bound::Cap(8)).map(|_| ()),
-            Err(Error::Argument)
-        );
-        assert_eq!(c.len(), 2);
-        // The last slot still fits.
-        seq::place_elem(&mut c, 2, Bound::Schema(8), 12).unwrap();
-        assert_eq!(&c[..], &[0, 11, 12]);
-    }
-
-    #[test]
-    fn grow_to_refuses_past_capacity_up_front() {
-        let mut c: heapless::Vec<u32, 2> = heapless::Vec::new();
-        assert!(!c.grow_to(3));
-        assert!(c.is_empty());
-        assert!(c.grow_to(2));
-        assert_eq!(&c[..], &[0, 0]);
-    }
-
-    #[test]
-    fn fixed_string_elements_are_reserved_then_written_in_place() {
-        // What generated code does with `heapless::String<N>` elements: reserve
-        // the slot, then write the payload into it.
-        let mut c: heapless::Vec<heapless::String<8>, 4> = heapless::Vec::new();
-        let s = seq::reserve_elem(&mut c, 2, Bound::Schema(4)).unwrap();
-        s.clear();
-        s.push_str("hi").unwrap();
-        assert_eq!(c.len(), 3);
-        assert_eq!(c[0], "");
-        assert_eq!(c[2], "hi");
-        assert_eq!(
-            seq::reserve_elem(&mut c, 4, Bound::Schema(4)).map(|_| ()),
-            Err(Error::InvalidMsg)
-        );
-        assert_eq!(c.len(), 3);
-    }
-
-    #[test]
-    fn an_element_payload_over_maxlen_is_refused_at_the_length_word() {
-        // `array<string, count: 4, maxlen: 8>`: the length word announces 9
-        // bytes. The verdict comes before any slot is reserved or any byte
-        // accumulated, so the container is untouched.
-        let c: heapless::Vec<heapless::String<8>, 4> = heapless::Vec::new();
-        let (id, total) = (1u32, 9usize);
-        assert_eq!(seq::check_index(id, Bound::Schema(4)), Ok(()));
-        assert_eq!(
-            seq::check_len(total, Bound::Schema(8)),
-            Err(Error::InvalidMsg)
-        );
-        assert!(c.is_empty());
-    }
-}
+// heapless 0.9 adds a length-type parameter, `Vec<T, N, LenT = usize>`. The
+// impl is generic over it, so a narrower length type is a destination too.
+#[cfg(feature = "heapless09")]
+container_suite!(heapless09_u8_len, heapless09::Vec<u32, 8, u8>);

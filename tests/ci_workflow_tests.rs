@@ -90,6 +90,29 @@ fn top_level_block<'a>(yml: &'a str, key: &str) -> Vec<&'a str> {
     out
 }
 
+/// The lines of one job (`  <id>:` under `jobs:`), the key line excluded.
+///
+/// Stops at the next line indented two columns or less — the next job, or the
+/// comment block that introduces it.
+fn job_block<'a>(yml: &'a str, id: &str) -> Vec<&'a str> {
+    let header = format!("{id}:");
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in top_level_block(yml, "jobs") {
+        if !line.trim().is_empty() && indent(line) <= 2 {
+            if inside {
+                break;
+            }
+            inside = indent(line) == 2 && line.trim_end().trim_start() == header;
+            continue;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    out
+}
+
 /// Every `cargo …` command line in the workflow, as argument token lists
 /// (the `cargo` token itself dropped).
 fn cargo_invocations(yml: &str) -> Vec<Vec<String>> {
@@ -320,4 +343,36 @@ impl StartsWithTokens for Vec<String> {
     fn starts_with_tokens(&self, prefix: &[&str]) -> bool {
         prefix.len() <= self.len() && prefix.iter().zip(self).all(|(a, b)| a == b)
     }
+}
+
+/// The MSRV job proves the 1.70 floor (`rust-version`) for what users build.
+/// `heapless09` pulls in heapless 0.9, whose own floor is 1.87, so the one
+/// thing that job must not do is enable it — `--all-features` included — or
+/// it fails for a reason the MSRV promise never covered. The feature is then
+/// owed a job at its own floor.
+#[test]
+fn heapless09_stays_out_of_the_msrv_job_and_has_its_own_floor() {
+    // Comments may name the feature; only the job's YAML counts.
+    let code = |id: &str| -> String {
+        job_block(CI_YML, id)
+            .into_iter()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let body = code("msrv");
+    assert!(!body.is_empty(), "no `msrv` job");
+    assert!(
+        body.contains("toolchain: \"1.70\""),
+        "the msrv job is not on 1.70"
+    );
+    assert!(
+        !body.contains("--all-features") && !body.contains("heapless09"),
+        "the 1.70 job enables heapless09 (needs 1.87)"
+    );
+    let body = code("heapless09-floor");
+    assert!(
+        body.contains("toolchain: \"1.87\"") && body.contains("--features heapless09"),
+        "no job builds `heapless09` at its 1.87 floor"
+    );
 }

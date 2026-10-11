@@ -38,7 +38,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      # `--all-features` so the `heapless` impl of `seq::SeqVec` is linted too.
+      # `--all-features` so the heapless impls of `seq::SeqVec` are linted too.
       - run: cargo clippy --all-features --all-targets -- -D warnings
 
       # The Pages workflow (`docs.yml`) builds rustdoc with warnings denied, but
@@ -69,8 +69,9 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo build --release --verbose
       - run: cargo test --verbose
-      # The one feature, `heapless`, adds the fixed-capacity `seq::SeqVec` impl
-      # and the `seq_tests` suites that run against it. The default run above
+      # The two features, `heapless` (0.8) and `heapless09` (0.9), add the
+      # fixed-capacity `seq::SeqVec` impls and the `seq_tests` suites that run
+      # against them. The default run above
       # keeps proving the crate builds and passes without it.
       - run: cargo test --all-features --verbose
 
@@ -150,9 +151,29 @@ jobs:
         with:
           toolchain: "1.70"
       - run: cargo build --release --verbose
-      # And with the `heapless` container impl, which pulls in the one
-      # optional dependency a generated crate may enable.
-      - run: cargo build --release --all-features --verbose
+      # And with the `heapless` container impl (heapless 0.8), the optional
+      # dependency a generated crate enables by default. Not `--all-features`:
+      # `heapless09` pulls in heapless 0.9, whose own floor is 1.87 — that
+      # feature is the one documented exception to the MSRV and has its own
+      # job below.
+      - run: cargo build --release --features heapless --verbose
+
+  # The floor of the `heapless09` feature: heapless 0.9 declares
+  # `rust-version = "1.87"`, so the feature promises 1.87 and is built and
+  # tested there. The `test` matrix covers it on every newer toolchain through
+  # `--all-features`.
+  heapless09-floor:
+    name: Test (heapless09, 1.87)
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/rust
+        with:
+          toolchain: "1.87"
+      - run: cargo build --release --features heapless09 --verbose
+      - run: cargo test --features heapless09 --verbose
 
   # Same suite on a big-endian host (IBM Z / s390x) under QEMU, proving the
   # little-endian wire format round-trips correctly off little-endian hardware.
