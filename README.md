@@ -131,6 +131,17 @@ callback, never the codec:
   the slot a `struct` / `union` / nested element is routed into, and
   `reserve_row` reserves and empties a matrix row. Each fills a gap with the
   element default and checks the id **before** it grows anything.
+- `reuse_leaf`, `reuse_elem` and `reuse_row` are the same three for a
+  destination that already holds an earlier decode. With a live count kept
+  next to the container, existing slots are reset in place (by a caller hook,
+  or `SeqVec::clear` for a row) and keep their heap capacity; only slots past
+  the length are pushed. `reuse_leaf` and `reuse_row` replace a repeated id,
+  `reuse_elem` merges into it. The bound check, verdicts and gap rule are
+  `reserve_elem`'s. The caller zeroes the live count before the decode and at
+  each occurrence of the wrapper, and calls `SeqVec::truncate(live)` **after**
+  the decode whatever it returned — an omitted array, a cut-off input and an
+  error never reach `sequence_end`. A steady-state decode then allocates
+  nothing (`tests/allocation_tests.rs`, `tests/seq_reuse_protocol_tests.rs`).
 - `check_index` and `check_len` are the comparisons alone, for the element
   index and the element `maxlen` at the length word.
 - `Bound::Schema(n)` is the schema's `count` / `maxlen` (a breach is

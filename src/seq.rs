@@ -18,7 +18,8 @@
 //! # Three reservations, one shape
 //!
 //! Every wrapper array a schema can declare reaches this module through one of
-//! three calls, which differ only in what a slot holds:
+//! three calls — or, decoding into a reused destination, their `reuse_*` twins —
+//! which differ only in what a slot holds:
 //!
 //! * [`place_elem`] puts a decoded `string` / `blob` element at the index its id
 //!   names;
@@ -28,6 +29,10 @@
 //!   element's own fields there;
 //! * [`reserve_row`] does the same for a matrix row and empties it, because the
 //!   array wrapper *replaces* (MESSAGE_SPEC §7.4).
+//!
+//! [`reuse_leaf`], [`reuse_elem`] and [`reuse_row`] are the same three for a
+//! destination that already holds an earlier decode; see
+//! [Decoding into a reused destination](#decoding-into-a-reused-destination).
 //!
 //! [`check_index`] and [`check_len`] are the comparisons on their own, for the
 //! places that decide before a slot exists: the length word of a `string` /
@@ -80,6 +85,68 @@
 //! (§6.2.1). A cap of `0` states no cap at all — a declared cap is at least 1 —
 //! so `Bound::Cap(0)` is a caller defect and answers [`Error::Argument`], never
 //! [`Error::LimitExceeded`] against a ceiling nobody configured.
+//!
+//! # Decoding into a reused destination
+//!
+//! [`reserve_elem`] assumes the container starts empty: a slot past the
+//! current length is pushed fresh, so a decode into a destination that is
+//! emptied first re-allocates every element, and every `String` / `Vec` it
+//! holds directly. The `reuse_*` twins keep that storage instead. They work on
+//! a **live count** the caller keeps next to the container — how many slots
+//! this decode has made so far:
+//!
+//! * a slot below `live` belongs to this decode, and is treated as the
+//!   `reserve_*` twin treats an existing slot: [`reuse_elem`] hands it back as
+//!   it is (a re-opened element merges), [`reuse_leaf`] and [`reuse_row`] reset
+//!   it (a repeated id replaces, MESSAGE_SPEC §7.4);
+//! * a slot from `live` to the id that already exists still holds an earlier
+//!   decode's value, and is **reset in place** — by the caller's hook, which
+//!   leaves it equal to the element default while keeping its heap capacity
+//!   (`String::clear`, a struct's capacity-keeping `reset`, …), or for a row by
+//!   [`SeqVec::clear`];
+//! * only a slot past the container's length is pushed, as by `reserve_elem`.
+//!
+//! After any of them `live` is at least `id + 1`. The bound check and the gap
+//! rule are those of [`reserve_elem`] — the same [`check_index`] first, the same
+//! verdicts, a gap slot equal to the element default — so a reused destination
+//! decodes to the value a fresh one would, **provided the caller keeps the
+//! protocol**:
+//!
+//! 1. **Before the decode**, set every reused array's live count to `0` — part
+//!    of resetting the destination, which happens before the decode and never
+//!    from a callback (see the crate docs on absence). Leave the slots alone:
+//!    they are the storage to reuse.
+//! 2. **At each occurrence of the array's wrapper**, set its live count to `0`
+//!    again, so a repeated array field replaces the earlier occurrence.
+//! 3. **After the decode, whatever it returned** — `Complete`, `Incomplete` or
+//!    an error — call [`SeqVec::truncate`] with each reused array's live count.
+//!    An array whose wrapper never arrived (an empty array is omitted whole,
+//!    MESSAGE_SPEC §2) has live `0` and empties; one with a non-empty declared
+//!    default is then restored to it, as a fresh destination would hold it.
+//!    Truncating only at `sequence_end` is not enough: an omitted wrapper,
+//!    a cut-off input and an error never reach it, and slots at and past `live`
+//!    still hold the earlier message.
+//!
+//! The reuse is one level deep. [`reuse_row`] empties the rows it reuses, as
+//! [`reserve_row`] does, so a row's own `String`s are dropped; a reset hook that
+//! empties a nested array does the same. Keeping those too needs a live count
+//! per nested array, which is the caller's to keep.
+//!
+//! ```
+//! use sofab::seq::{self, Bound, SeqVec};
+//!
+//! // An earlier decode left three strings.
+//! let mut out = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+//! let mut live = 0; // 1. before the decode (and 2. at the wrapper)
+//! // This message carries ids 0 and 1; id 0 was an elided default, so only
+//! // id 1 arrives. Slot 0 is reset as a gap, slot 1 reset and refilled, in place.
+//! let s = seq::reuse_leaf(&mut out, &mut live, 1, Bound::Cap(8), String::clear).unwrap();
+//! s.push_str("b");
+//! // A repeated id 1 replaces rather than appends.
+//! seq::reuse_leaf(&mut out, &mut live, 1, Bound::Cap(8), String::clear).unwrap().push_str("B");
+//! SeqVec::truncate(&mut out, live); // 3. after the decode
+//! assert_eq!(out, ["", "B"]);
+//! ```
 //!
 //! # The destination: [`SeqVec`]
 //!
@@ -137,7 +204,7 @@
 //!     fn slot_mut(&mut self, i: usize) -> Option<&mut u8> {
 //!         self.slots[..self.len].get_mut(i)
 //!     }
-//!     fn clear(&mut self) { self.len = 0; }
+//!     fn truncate(&mut self, len: usize) { self.len = self.len.min(len); }
 //! }
 //!
 //! let mut out = Four::default();
@@ -197,11 +264,24 @@ pub trait SeqVec {
     /// must have grown by nothing. A growable container returns `true`.
     fn grow_to(&mut self, len: usize) -> bool;
 
-    /// The slot at `i`, if there is one.
+    /// The slot at `i`, if there is one. Must be `Some` for every `i` below
+    /// [`len`](SeqVec::len): the reservations rely on it, and an error from
+    /// them leaves the container unchanged only because it holds.
     fn slot_mut(&mut self, i: usize) -> Option<&mut Self::Elem>;
 
-    /// Remove every slot.
-    fn clear(&mut self);
+    /// Shorten to `len` slots, dropping the rest; no-op when `len` is not
+    /// below the current length. A growable container keeps its capacity.
+    ///
+    /// Called with the live count after a decode into a reused destination, so
+    /// a shorter array does not keep the tail an earlier decode left; see
+    /// [Decoding into a reused destination](self#decoding-into-a-reused-destination).
+    fn truncate(&mut self, len: usize);
+
+    /// Remove every slot: `truncate(0)` unless the container has a faster way.
+    #[inline]
+    fn clear(&mut self) {
+        self.truncate(0);
+    }
 }
 
 /// Check an element id against the bound on the array's index.
@@ -212,7 +292,7 @@ pub trait SeqVec {
 ///
 /// Use it where the decision comes before a slot exists: at a `string` / `blob`
 /// element's length word, and at a matrix row's id ahead of its element count.
-/// [`place_elem`], [`reserve_elem`] and [`reserve_row`] run it themselves.
+/// Every reservation in this module runs it itself.
 #[inline]
 pub fn check_index(id: Id, bound: Bound) -> Result<()> {
     // Spelled as one flat match rather than through a shared (limit, verdict)
@@ -309,6 +389,148 @@ where
     Ok(row)
 }
 
+/// [`reserve_elem`] for a destination that already holds an earlier decode:
+/// reuse the storage of the slots that exist instead of pushing fresh ones.
+///
+/// `live` is the number of slots this decode has made so far; the caller
+/// zeroes it before the decode and at each occurrence of the wrapper, and
+/// truncates to it after the decode — see the
+/// [protocol](self#decoding-into-a-reused-destination). A slot below `live` is
+/// handed back as it is, so a re-opened `struct` / `union` element merges
+/// (MESSAGE_SPEC §7.4). Each existing slot from `live` to `id` is passed to
+/// `reset`, which must leave it equal to the element default; it may keep the
+/// slot's heap capacity, which is the point. Slots past the length are pushed
+/// as element defaults. On success `live` is at least `id + 1`.
+///
+/// For a `string` / `blob` element, whose repeated id replaces, use
+/// [`reuse_leaf`].
+///
+/// # Errors
+///
+/// As [`reserve_elem`]. The bound is checked and the container grown before
+/// any slot is reset, so on an error neither `out` nor `live` has changed —
+/// the earlier decode's slots are still there, and the caller truncates after
+/// the decode on an error as on success.
+#[inline]
+pub fn reuse_elem<'a, C: SeqVec + ?Sized>(
+    out: &'a mut C,
+    live: &mut usize,
+    id: Id,
+    bound: Bound,
+    reset: impl FnMut(&mut C::Elem),
+) -> Result<&'a mut C::Elem> {
+    reuse_slot::<C, false>(out, live, id, bound, reset)
+}
+
+/// The leaf twin of [`reuse_elem`], for a `string` / `blob` element written
+/// into the slot it hands back: the slot is always reset, so a repeated id
+/// replaces the earlier value (MESSAGE_SPEC §7.4), as [`place_elem`] does.
+///
+/// Write the payload with `push_str` / `extend_from_slice` into the slot; with
+/// `String::clear` / `Vec::clear` as `reset` it keeps its buffer.
+///
+/// # Errors
+///
+/// As [`reuse_elem`].
+#[inline]
+pub fn reuse_leaf<'a, C: SeqVec + ?Sized>(
+    out: &'a mut C,
+    live: &mut usize,
+    id: Id,
+    bound: Bound,
+    reset: impl FnMut(&mut C::Elem),
+) -> Result<&'a mut C::Elem> {
+    reuse_slot::<C, true>(out, live, id, bound, reset)
+}
+
+/// [`reserve_row`] for a destination that already holds an earlier decode:
+/// reserve a matrix row as [`reuse_leaf`] does, with [`SeqVec::clear`] as the
+/// reset, and hand it back empty.
+///
+/// The row reserved and every gap row an earlier decode left are emptied in
+/// place, so a growable row keeps its capacity; a row past the length is
+/// pushed as the row default. That is the same value only because a row's
+/// default is empty — the case for every row a schema declares; a row type
+/// whose `Default` is not empty does not decode to what [`reserve_row`] gives.
+/// The row's own elements are not reused: see the
+/// [module docs](self#decoding-into-a-reused-destination).
+///
+/// # Errors
+///
+/// As [`reuse_elem`].
+#[inline]
+pub fn reuse_row<'a, C: SeqVec + ?Sized>(
+    out: &'a mut C,
+    live: &mut usize,
+    id: Id,
+    bound: Bound,
+) -> Result<&'a mut C::Elem>
+where
+    C::Elem: SeqVec,
+{
+    reuse_slot::<C, true>(out, live, id, bound, SeqVec::clear)
+}
+
+/// The body of the `reuse_*` functions. `REPLACE` resets a slot this decode
+/// already made (a leaf or a row) instead of handing it back to merge into.
+///
+/// The grow-and-refuse guard is `reserve_elem`'s, repeated rather than shared:
+/// reserve_elem's inlining is measured, and the verdicts are pinned equal by
+/// the tests instead.
+#[inline]
+fn reuse_slot<'a, C: SeqVec + ?Sized, const REPLACE: bool>(
+    out: &'a mut C,
+    live: &mut usize,
+    id: Id,
+    bound: Bound,
+    mut reset: impl FnMut(&mut C::Elem),
+) -> Result<&'a mut C::Elem> {
+    check_index(id, bound)?;
+    let i = id as usize;
+    let len = out.len();
+    debug_assert!(
+        *live <= len,
+        "live count {} past the container's {} slots: not zeroed before the decode?",
+        *live,
+        len
+    );
+    // The steady state, ids in order into a slot an earlier decode left, ahead
+    // of everything else. Measured on 1000 strings + rows into a reused
+    // destination: -23% Ir against reaching it through the general path below,
+    // at +8% on an array with a gap every 4th id (dense arrays are the common
+    // case; a gap is an element equal to its default).
+    if i == *live && i < len {
+        let slot = out.slot_mut(i).ok_or(Error::Argument)?;
+        reset(slot);
+        *live = i + 1;
+        return Ok(slot);
+    }
+    if i < *live {
+        let slot = out.slot_mut(i).ok_or(Error::Argument)?;
+        if REPLACE {
+            reset(slot);
+        }
+        return Ok(slot);
+    }
+    // Grow before resetting, so a refused growth resets nothing. The slots
+    // grow_to adds are fresh defaults; only the ones that were already there
+    // hold an earlier decode.
+    if len <= i && !out.grow_to(i + 1) {
+        return Err(Error::Argument);
+    }
+    // The gap slots an earlier decode left, then the reserved one outside the
+    // loop, so it is looked up once.
+    for j in *live..len.min(i) {
+        reset(out.slot_mut(j).ok_or(Error::Argument)?);
+    }
+    let slot = out.slot_mut(i).ok_or(Error::Argument)?;
+    if i < len {
+        reset(slot);
+    }
+    *live = i + 1;
+    Ok(slot)
+}
+
 impl<T: Default> SeqVec for Vec<T> {
     type Elem = T;
 
@@ -337,6 +559,11 @@ impl<T: Default> SeqVec for Vec<T> {
     #[inline]
     fn clear(&mut self) {
         Vec::clear(self);
+    }
+
+    #[inline]
+    fn truncate(&mut self, len: usize) {
+        Vec::truncate(self, len);
     }
 }
 
@@ -369,8 +596,8 @@ impl<T: Default, const N: usize> SeqVec for heapless::Vec<T, N> {
     }
 
     #[inline]
-    fn clear(&mut self) {
-        heapless::Vec::clear(self);
+    fn truncate(&mut self, len: usize) {
+        heapless::Vec::truncate(self, len);
     }
 }
 
@@ -407,7 +634,7 @@ impl<T: Default, LenT: heapless09::LenType, const N: usize> SeqVec for heapless0
     }
 
     #[inline]
-    fn clear(&mut self) {
-        heapless09::Vec::<T, N, LenT>::clear(self);
+    fn truncate(&mut self, len: usize) {
+        heapless09::Vec::<T, N, LenT>::truncate(self, len);
     }
 }

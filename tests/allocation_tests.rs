@@ -399,3 +399,57 @@ fn a_reused_decoder_allocates_nothing_on_any_message() {
     });
     assert_eq!((calls, bytes), (0, 0), "a reused decoder allocated");
 }
+
+// ---------------------------------------------------------------------------
+// sofab::seq reuse: a reused destination allocates nothing (#117)
+// ---------------------------------------------------------------------------
+
+/// The point of `seq::reuse_leaf` / `seq::reuse_row`: once a destination has
+/// held a message, decoding a same-shaped or smaller one into it again takes
+/// no allocation — not for the outer array, not for the strings or rows in it,
+/// and not for the truncation that drops a longer predecessor's tail.
+#[test]
+fn a_reused_seq_destination_allocates_nothing_in_the_steady_state() {
+    use sofab::seq::{self, Bound, SeqVec};
+
+    let mut strings: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<u32>> = Vec::new();
+    let fill = |strings: &mut Vec<String>, rows: &mut Vec<Vec<u32>>, n: u32| {
+        let (mut s_live, mut r_live) = (0, 0);
+        for id in (0..n).filter(|id| id % 3 != 1) {
+            seq::reuse_leaf(strings, &mut s_live, id, Bound::Cap(64), String::clear)
+                .unwrap()
+                .push_str("a string longer than any small-string buffer");
+            let row = seq::reuse_row(rows, &mut r_live, id, Bound::Schema(64)).unwrap();
+            row.extend_from_slice(&[id; 16]);
+        }
+        SeqVec::truncate(strings, s_live);
+        SeqVec::truncate(rows, r_live);
+    };
+    fill(&mut strings, &mut rows, 32);
+    let (calls, bytes, ()) = measure(|| {
+        // The same size again, then ever shorter, down to an omitted array.
+        // (Growing back after a shorter message re-allocates what truncate
+        // dropped; that is the documented cost, not the steady state.)
+        for n in [32, 32, 31, 5, 0] {
+            fill(&mut strings, &mut rows, n);
+        }
+    });
+    assert_eq!((calls, bytes), (0, 0), "a reused destination allocated");
+    assert!(strings.is_empty() && rows.is_empty());
+}
+
+/// The counter does see the fresh-destination path, so the zero above is not
+/// vacuous.
+#[test]
+fn a_fresh_seq_destination_allocates_per_element() {
+    use sofab::seq::{self, Bound};
+
+    let (calls, _, ()) = measure(|| {
+        let mut strings: Vec<String> = Vec::new();
+        for id in 0..8 {
+            seq::place_elem(&mut strings, id, Bound::Cap(64), "x".repeat(40)).unwrap();
+        }
+    });
+    assert!(calls >= 8, "only {calls} allocations for 8 fresh strings");
+}

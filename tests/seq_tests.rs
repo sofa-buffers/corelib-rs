@@ -16,6 +16,20 @@
 
 use sofab::seq::{self, Bound};
 use sofab::Error;
+use std::cell::Cell;
+
+/// The reset hook of a `u32` element: back to its default.
+fn zero(x: &mut u32) {
+    *x = 0;
+}
+
+/// [`zero`], counting its calls into `n`.
+fn counting(n: &Cell<usize>) -> impl Fn(&mut u32) + Copy + '_ {
+    move |x| {
+        n.set(n.get() + 1);
+        zero(x);
+    }
+}
 
 // --- the comparisons on their own --------------------------------------------
 
@@ -103,8 +117,10 @@ fn the_verdict_follows_the_bound_kind_never_the_number() {
 macro_rules! container_suite {
     ($name:ident, $ty:ty) => {
         mod $name {
+            use super::{counting, zero};
             use sofab::seq::{self, Bound, SeqVec};
             use sofab::Error;
+            use std::cell::Cell;
 
             type C = $ty;
 
@@ -231,6 +247,176 @@ macro_rules! container_suite {
                 assert_eq!(contents(&c), [40, 42]);
             }
 
+            // --- reuse: a destination holding an earlier decode ---------
+
+            /// A destination an earlier decode left as `[90, 91, 92, 93]`.
+            fn earlier() -> C {
+                let mut c = C::default();
+                for id in 0..4 {
+                    seq::place_elem(&mut c, id, Bound::Schema(8), 90 + id).unwrap();
+                }
+                c
+            }
+
+            #[test]
+            fn reuse_resets_existing_slots_and_truncate_drops_the_old_tail() {
+                let mut c = earlier();
+                let mut live = 0;
+                *seq::reuse_elem(&mut c, &mut live, 0, Bound::Schema(8), zero).unwrap() += 10;
+                assert_eq!(live, 1);
+                // Id 1 is an elided default: slot 1 is reset as a gap, not kept as 91.
+                *seq::reuse_elem(&mut c, &mut live, 2, Bound::Schema(8), zero).unwrap() += 12;
+                assert_eq!(live, 3);
+                SeqVec::truncate(&mut c, live);
+                assert_eq!(contents(&c), [10, 0, 12]);
+            }
+
+            #[test]
+            fn reuse_decodes_to_what_a_fresh_destination_holds() {
+                // The same deliveries, into an empty and into a used destination.
+                let ids: [(u32, u32); 4] = [(5, 15), (1, 11), (5, 25), (3, 13)];
+                let mut fresh = C::default();
+                for (id, v) in ids {
+                    *seq::reserve_elem(&mut fresh, id, Bound::Cap(8)).unwrap() += v;
+                }
+                let mut used = earlier();
+                let mut live = 0;
+                for (id, v) in ids {
+                    *seq::reuse_elem(&mut used, &mut live, id, Bound::Cap(8), zero).unwrap() += v;
+                }
+                SeqVec::truncate(&mut used, live);
+                assert_eq!(contents(&used), contents(&fresh));
+                assert_eq!(contents(&used), [0, 11, 0, 13, 0, 40]);
+            }
+
+            #[test]
+            fn reuse_merges_a_reopened_element_and_resets_each_slot_once() {
+                let mut c = earlier();
+                let mut live = 0;
+                let resets = Cell::new(0);
+                let count = counting(&resets);
+                *seq::reuse_elem(&mut c, &mut live, 1, Bound::Schema(8), count).unwrap() = 7;
+                // Re-opened below `live`: merged, not reset.
+                *seq::reuse_elem(&mut c, &mut live, 1, Bound::Schema(8), count).unwrap() += 1;
+                *seq::reuse_elem(&mut c, &mut live, 0, Bound::Schema(8), count).unwrap() += 3;
+                assert_eq!(resets.get(), 2, "slots 0 and 1, once each");
+                assert_eq!(live, 2);
+                SeqVec::truncate(&mut c, live);
+                assert_eq!(contents(&c), [3, 8]);
+            }
+
+            #[test]
+            fn reuse_pushes_past_the_old_length_and_resets_only_what_existed() {
+                let mut c = earlier();
+                let mut live = 0;
+                let resets = Cell::new(0);
+                let slot =
+                    seq::reuse_elem(&mut c, &mut live, 6, Bound::Schema(8), counting(&resets))
+                        .unwrap();
+                *slot = 16;
+                assert_eq!(
+                    resets.get(),
+                    4,
+                    "the four old slots; 4..=6 were pushed fresh"
+                );
+                assert_eq!(live, 7);
+                assert_eq!(contents(&c), [0, 0, 0, 0, 0, 0, 16]);
+            }
+
+            #[test]
+            fn a_rejected_reuse_changes_neither_the_destination_nor_live() {
+                let mut c = earlier();
+                let mut live = 1;
+                let resets = Cell::new(0);
+                let count = counting(&resets);
+                assert_eq!(
+                    seq::reuse_elem(&mut c, &mut live, 5, Bound::Schema(5), count).map(|_| ()),
+                    Err(Error::InvalidMsg)
+                );
+                assert_eq!(
+                    seq::reuse_elem(&mut c, &mut live, 4, Bound::Cap(4), count).map(|_| ()),
+                    Err(Error::LimitExceeded)
+                );
+                assert_eq!(
+                    seq::reuse_elem(&mut c, &mut live, 0, Bound::Cap(0), count).map(|_| ()),
+                    Err(Error::Argument)
+                );
+                assert_eq!(resets.get(), 0);
+                assert_eq!(live, 1);
+                assert_eq!(contents(&c), [90, 91, 92, 93]);
+                // A lower id after the rejection still lands.
+                *seq::reuse_elem(&mut c, &mut live, 2, Bound::Schema(5), count).unwrap() = 2;
+                assert_eq!(live, 3);
+            }
+
+            #[test]
+            fn reuse_leaf_replaces_a_repeated_id_instead_of_merging() {
+                // §7.4: last occurrence wins for a string / blob element.
+                let mut c = earlier();
+                let mut live = 0;
+                let resets = Cell::new(0);
+                *seq::reuse_leaf(&mut c, &mut live, 1, Bound::Schema(8), counting(&resets))
+                    .unwrap() += 5;
+                *seq::reuse_leaf(&mut c, &mut live, 1, Bound::Schema(8), counting(&resets))
+                    .unwrap() += 6;
+                assert_eq!(resets.get(), 3, "gap 0, slot 1, slot 1 again");
+                SeqVec::truncate(&mut c, live);
+                assert_eq!(contents(&c), [0, 6]);
+            }
+
+            #[test]
+            fn the_steady_state_resets_each_slot_in_order_once() {
+                let mut c = earlier();
+                let mut live = 0;
+                let resets = Cell::new(0);
+                for id in 0..6 {
+                    *seq::reuse_leaf(&mut c, &mut live, id, Bound::Cap(8), counting(&resets))
+                        .unwrap() += id;
+                }
+                assert_eq!(resets.get(), 4, "the four old slots; 4 and 5 pushed");
+                assert_eq!(contents(&c), [0, 1, 2, 3, 4, 5]);
+            }
+
+            #[test]
+            fn reuse_gives_the_verdicts_reserve_elem_gives() {
+                let cases = [
+                    (0, Bound::Schema(0)),
+                    (3, Bound::Schema(3)),
+                    (u32::MAX, Bound::Schema(8)),
+                    (4, Bound::Cap(4)),
+                    (u32::MAX, Bound::Cap(8)),
+                    (0, Bound::Cap(0)),
+                    (7, Bound::Cap(8)),
+                    (2, Bound::Schema(8)),
+                ];
+                for (id, bound) in cases {
+                    let want = seq::reserve_elem(&mut earlier(), id, bound).map(|_| ());
+                    let mut live = 0;
+                    assert_eq!(
+                        seq::reuse_elem(&mut earlier(), &mut live, id, bound, zero).map(|_| ()),
+                        want,
+                        "reuse_elem, id {id}, {bound:?}"
+                    );
+                    let mut live = 0;
+                    assert_eq!(
+                        seq::reuse_leaf(&mut earlier(), &mut live, id, bound, zero).map(|_| ()),
+                        want,
+                        "reuse_leaf, id {id}, {bound:?}"
+                    );
+                }
+            }
+
+            #[test]
+            fn truncate_shortens_and_never_grows() {
+                let mut c = earlier();
+                SeqVec::truncate(&mut c, 9);
+                assert_eq!(contents(&c), [90, 91, 92, 93]);
+                SeqVec::truncate(&mut c, 2);
+                assert_eq!(contents(&c), [90, 91]);
+                SeqVec::truncate(&mut c, 0);
+                assert!(c.is_empty());
+            }
+
             #[test]
             fn clear_empties_the_container() {
                 let mut c = C::default();
@@ -248,7 +434,7 @@ macro_rules! container_suite {
 macro_rules! row_suite {
     ($name:ident, $ty:ty, $push:expr) => {
         mod $name {
-            use sofab::seq::{self, Bound};
+            use sofab::seq::{self, Bound, SeqVec};
             use sofab::Error;
 
             type C = $ty;
@@ -289,6 +475,66 @@ macro_rules! row_suite {
                 );
                 assert_eq!(c.len(), 1);
                 assert_eq!(&c[0][..], &[5], "a refused row leaves the others alone");
+            }
+
+            /// Rows an earlier decode left: `[[1], [2, 2], [3, 3, 3]]`.
+            fn earlier() -> C {
+                let mut c = C::default();
+                for id in 0..3u32 {
+                    let row = seq::reserve_row(&mut c, id, Bound::Schema(4)).unwrap();
+                    for _ in 0..=id {
+                        $push(row, id + 1);
+                    }
+                }
+                c
+            }
+
+            #[test]
+            fn reuse_row_empties_gap_rows_and_the_reserved_row() {
+                let mut c = earlier();
+                let mut live = 0;
+                let row = seq::reuse_row(&mut c, &mut live, 1, Bound::Schema(4)).unwrap();
+                assert!(row.is_empty());
+                $push(row, 7);
+                assert_eq!(live, 2);
+                SeqVec::truncate(&mut c, live);
+                assert_eq!(c.len(), 2);
+                assert!(c[0].is_empty(), "gap row 0 no longer holds the old [1]");
+                assert_eq!(&c[1][..], &[7]);
+            }
+
+            #[test]
+            fn reuse_row_replaces_a_repeated_row_and_pushes_new_ones() {
+                let mut c = earlier();
+                let mut live = 0;
+                $push(
+                    seq::reuse_row(&mut c, &mut live, 0, Bound::Cap(8)).unwrap(),
+                    4,
+                );
+                let row = seq::reuse_row(&mut c, &mut live, 0, Bound::Cap(8)).unwrap();
+                assert!(row.is_empty(), "the row wrapper replaces (§7.4)");
+                $push(row, 5);
+                $push(
+                    seq::reuse_row(&mut c, &mut live, 3, Bound::Cap(8)).unwrap(),
+                    6,
+                );
+                SeqVec::truncate(&mut c, live);
+                assert_eq!(c.len(), 4);
+                assert_eq!(&c[0][..], &[5]);
+                assert!(c[1].is_empty() && c[2].is_empty());
+                assert_eq!(&c[3][..], &[6]);
+            }
+
+            #[test]
+            fn a_rejected_reuse_row_changes_nothing() {
+                let mut c = earlier();
+                let mut live = 1;
+                assert_eq!(
+                    seq::reuse_row(&mut c, &mut live, 4, Bound::Schema(4)).map(|_| ()),
+                    Err(Error::InvalidMsg)
+                );
+                assert_eq!(live, 1);
+                assert_eq!(&c[2][..], &[3, 3, 3]);
             }
         }
     };
@@ -361,6 +607,79 @@ mod vec_specific {
     }
 
     #[test]
+    fn reused_string_elements_keep_their_heap_storage() {
+        // The point of reuse_elem (#117): a steady-state decode into the same
+        // destination writes into the strings already there.
+        let mut c: Vec<String> = vec!["x".repeat(64), "y".repeat(64), "z".repeat(64)];
+        let ptrs: Vec<*const u8> = c.iter().map(|s| s.as_ptr()).collect();
+        let outer = c.as_ptr();
+        let mut live = 0;
+        for (id, v) in [(0u32, "a"), (2, "c")] {
+            seq::reuse_leaf(&mut c, &mut live, id, Bound::Cap(8), String::clear)
+                .unwrap()
+                .push_str(v);
+        }
+        c.truncate(live);
+        assert_eq!(c, ["a", "", "c"]);
+        assert_eq!(c.as_ptr(), outer, "no new element storage");
+        for (s, p) in c.iter().zip(ptrs) {
+            assert_eq!(s.as_ptr(), p, "the string kept its buffer");
+            assert!(s.capacity() >= 64);
+        }
+    }
+
+    #[test]
+    fn reused_struct_elements_are_reset_by_the_callers_hook() {
+        let mut c = vec![
+            Elem {
+                a: 1,
+                b: "old".into(),
+            },
+            Elem {
+                a: 2,
+                b: "old".into(),
+            },
+        ];
+        let reset = |e: &mut Elem| {
+            e.a = 0;
+            e.b.clear();
+        };
+        let mut live = 0;
+        seq::reuse_elem(&mut c, &mut live, 1, Bound::Schema(4), reset)
+            .unwrap()
+            .a = 7;
+        seq::reuse_elem(&mut c, &mut live, 1, Bound::Schema(4), reset)
+            .unwrap()
+            .b
+            .push('x');
+        c.truncate(live);
+        assert_eq!(
+            c,
+            [
+                Elem::default(),
+                Elem {
+                    a: 7,
+                    b: "x".into()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn reused_rows_keep_their_heap_storage() {
+        let mut rows: Vec<Vec<u32>> = vec![vec![1; 32], vec![2; 32]];
+        let ptrs: Vec<*const u32> = rows.iter().map(|r| r.as_ptr()).collect();
+        let mut live = 0;
+        seq::reuse_row(&mut rows, &mut live, 1, Bound::Schema(2))
+            .unwrap()
+            .push(9);
+        rows.truncate(live);
+        assert_eq!(rows, [vec![], vec![9]]);
+        assert_eq!(rows[0].as_ptr(), ptrs[0]);
+        assert_eq!(rows[1].as_ptr(), ptrs[1]);
+    }
+
+    #[test]
     fn a_sparse_array_grows_geometrically_not_one_slot_at_a_time() {
         // ARCHITECTURE §9.5 shape B: growth to id + 1 on every element must not
         // cost a reallocation per element.
@@ -399,8 +718,10 @@ macro_rules! heapless_suites {
         );
 
         mod $specific {
+            use super::counting;
             use sofab::seq::{self, Bound, SeqVec};
             use sofab::Error;
+            use std::cell::Cell;
 
             #[test]
             fn a_full_container_refuses_with_argument_and_grows_by_nothing() {
@@ -421,6 +742,26 @@ macro_rules! heapless_suites {
                 // The last slot still fits.
                 seq::place_elem(&mut c, 2, Bound::Schema(8), 12).unwrap();
                 assert_eq!(&c[..], &[0, 11, 12]);
+            }
+
+            #[test]
+            fn a_full_container_refuses_reuse_without_resetting_anything() {
+                let mut c: $hl::Vec<u32, 3> = $hl::Vec::new();
+                c.push(81).unwrap();
+                c.push(82).unwrap();
+                let mut live = 0;
+                let resets = Cell::new(0);
+                for reuse in [seq::reuse_elem::<_>, seq::reuse_leaf::<_>] {
+                    assert_eq!(
+                        reuse(&mut c, &mut live, 3, Bound::Schema(8), counting(&resets))
+                            .map(|_| ()),
+                        Err(Error::Argument),
+                        "the verdict reserve_elem gives a full container"
+                    );
+                }
+                assert_eq!(resets.get(), 0, "refused before any slot was reset");
+                assert_eq!(live, 0);
+                assert_eq!(&c[..], &[81, 82]);
             }
 
             #[test]
