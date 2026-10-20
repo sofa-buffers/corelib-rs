@@ -1,11 +1,10 @@
 [package]
 name = "sofa-buffers-corelib"
-# 0.12.0, not 0.11.x: under Cargo's 0.x semantics a 0.11.x release must stay
-# API-compatible with 0.11.0, and this series is not — `IStream::feed` and
-# `decode` return `Result<Status>` instead of `Result<()>`, and
-# `Error::Incomplete` is gone (INCOMPLETE is an outcome, not an error —
-# CORELIB_PLAN §5.2.1, §6.3). `sofab::seq` and the `heapless` feature are new.
-version = "0.12.0"
+# 0.13.0, not 0.12.x: under Cargo's 0.x semantics a 0.12.x release must stay
+# API-compatible with 0.12.0, and this one is not — the `sofab::seq::SeqVec`
+# trait gains a required `truncate(&mut self, len)` (`clear` becomes a provided
+# method defaulting to `truncate(0)`), so a third-party `SeqVec` impl must add it.
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.70"
 license = "MIT"
